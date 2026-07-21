@@ -1,0 +1,43 @@
+PSF SPU Player license information
+==================================
+
+PSF SPU Player is distributed as a combined work under GNU GPL version 2 or,
+at your option, any later version (GPL-2.0-or-later).
+
+Copyright (C) 2026 brr890
+
+The complete license is in LICENSE_GPL2.txt. The package also includes or links
+components from the following projects, which retain their copyright and
+license terms:
+
+- Audacious PSF plugin/framework: BSD 2-Clause and per-file terms
+- Audio Overload SDK PSF code: BSD 3-Clause
+- PeOPS / PeOPS2 SPU code: GNU GPL version 2 or later
+- GCC runtime libraries: GNU GPL version 3 with GCC Runtime Library Exception
+- libwinpthread: MIT/BSD terms
+- zlib: zlib License
+
+License files
+-------------
+
+- COPYING_AUDACIOUS.txt
+- LICENSE_AUDIO_OVERLOAD.txt
+- LICENSE_PEOPS.txt
+- LICENSE_PEOPS2.txt
+- LICENSE_GCC_RUNTIME_GPL3.txt
+- LICENSE_GCC_RUNTIME_EXCEPTION.txt
+- LICENSE_LIBWINPTHREAD.txt
+- LICENSE_ZLIB.txt
+
+Source code requirement
+-----------------------
+
+When this binary package is published or redistributed, equivalent access to
+the complete corresponding source code for this exact version must also be
+provided. This includes PSF SPU Player source, modified PeOPS/PeOPS2 and PSF
+core source, interface files, and the scripts needed to build the application.
+For a GitHub Release, publish the binary from the same tagged commit as the
+source archive.
+
+No PSF/PSF2 music files, game assets, or BIOS files are included or licensed by
+this package.
