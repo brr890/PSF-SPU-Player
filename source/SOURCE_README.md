@@ -1,6 +1,6 @@
 # PSF SPU Player Production Source
 
-This folder contains the source required to build PSF SPU Player Ver 1.47.
+This folder contains the source required to build PSF SPU Player Ver 1.48.
 
 Included:
 
@@ -38,4 +38,3 @@ The resulting 32-bit executable runs on Windows 10 32-bit and through WOW64 on
 Windows 10 64-bit. GCC runtime code, zlib, and the logger are statically linked.
 
 See `LICENSE`, `THIRD_PARTY_NOTICES.md`, and `licenses/` for license terms.
-

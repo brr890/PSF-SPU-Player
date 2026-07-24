@@ -538,21 +538,21 @@ static int psf2log_peops2_effective_pmod_source(int ch)
  return psf2log_peops2_effective_pmod_target(ch+1);
 }
 
-unsigned long   dwNoiseVal=1;                          // global noise generator
+u32             dwNoiseVal=1;                         // global noise generator
 
 unsigned short  spuCtrl2[2];                           // some vars to store psx reg infos
 unsigned short  spuStat2[2];
-unsigned long   spuIrq2[2];
-unsigned long   spuAddr2[2];                           // address into spu mem
-unsigned long   spuRvbAddr2[2];
-unsigned long   spuRvbAEnd2[2];
+u32             spuIrq2[2];
+u32             spuAddr2[2];                          // address into spu mem
+u32             spuRvbAddr2[2];
+u32             spuRvbAEnd2[2];
 int             bEndThread=0;                          // thread handlers
 int             bThreadEnded=0;
 int             bSpuInit=0;
 int             bSPUIsOpen=0;
 
-unsigned long dwNewChannel2[2];                        // flags for faster testing, if new channel starts
-unsigned long dwEndChannel2[2];
+u32 dwNewChannel2[2];                                  // flags for faster testing, if new channel starts
+u32 dwEndChannel2[2];
 
 // UNUSED IN PS2 YET
 void (CALLBACK *irqCallback)(void)=0;                  // func of main emu, called on spu irq
@@ -1045,7 +1045,7 @@ GOON: ;
           {//------------------------------------------//
            if(iUseInterpolation==3)                    // cubic interpolation
             {
-             long xd;
+             s32 xd;
              xd = ((s_chan[ch].spos) >> 1)+1;
              gpos = s_chan[ch].SB[28];
 

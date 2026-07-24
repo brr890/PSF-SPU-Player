@@ -39,7 +39,8 @@
 #define PLAYER_SEEK_RENDER_FRAMES 65536u
 #define PLAYER_SAMPLE_RATE 44100u
 #define PLAYER_WM_WORKER_UPDATE (WM_APP + 1u)
-#define PLAYER_AUDIO_BUFFERS 8u
+#define PLAYER_AUDIO_BUFFERS 16u
+#define PLAYER_AUDIO_PREBUFFER_BUFFERS 8u
 #define PLAYER_MAX_OUTPUT_FRAMES PLAYER_RENDER_FRAMES
 #define KEY_ON_FLASH_SAMPLES (PLAYER_SAMPLE_RATE / 8u)
 #define VOICE_DISPLAY_HOLD_SAMPLES ((PLAYER_SAMPLE_RATE * 100u) / 1000u)
@@ -273,6 +274,11 @@ typedef struct PlayerState {
     int16_t *audio_buffers[PLAYER_AUDIO_BUFFERS];
     WAVEHDR audio_headers[PLAYER_AUDIO_BUFFERS];
     int audio_in_use[PLAYER_AUDIO_BUFFERS];
+    unsigned audio_queued_buffers;
+    unsigned audio_queue_low_water;
+    int audio_started;
+    uint64_t audio_chunks_queued;
+    uint64_t audio_underruns;
     int16_t last_output_l;
     int16_t last_output_r;
     int has_last_output;
@@ -1163,6 +1169,13 @@ static void toggle_pause_playback(HWND hwnd, PlayerState *state)
 
     paused = !get_paused(state);
     set_paused(state, paused);
+    if (state->wave != NULL && state->audio_started) {
+        if (paused) {
+            waveOutPause(state->wave);
+        } else {
+            waveOutRestart(state->wave);
+        }
+    }
     set_status(state, paused ? "Paused" : "Playing direct");
     update_pause_button_label(state);
     if (!paused) {
@@ -8530,9 +8543,14 @@ static void cleanup_audio_queue(PlayerState *state)
 
         ZeroMemory(&state->audio_headers[i], sizeof(state->audio_headers[i]));
     }
+    state->audio_queued_buffers = 0;
+    state->audio_queue_low_water = PLAYER_AUDIO_BUFFERS;
+    state->audio_started = 0;
+    state->audio_chunks_queued = 0;
 }
 
 static void copy_scaled_pcm_with_declick(PlayerState *state, int16_t *out_pcm, const int16_t *in_pcm, uint32_t frames);
+static void reap_audio_queue(PlayerState *state);
 
 static int init_audio_queue(PlayerState *state)
 {
@@ -8551,7 +8569,33 @@ static int init_audio_queue(PlayerState *state)
         }
     }
 
+    state->audio_queued_buffers = 0;
+    state->audio_queue_low_water = PLAYER_AUDIO_BUFFERS;
+    state->audio_started = 0;
+    state->audio_chunks_queued = 0;
+    state->audio_underruns = 0;
+    if (waveOutPause(state->wave) != MMSYSERR_NOERROR) {
+        cleanup_audio_queue(state);
+        return 0;
+    }
+
     return 1;
+}
+
+static int restart_audio_prebuffer(PlayerState *state)
+{
+    if (state == NULL || state->wave == NULL) {
+        return 0;
+    }
+
+    waveOutReset(state->wave);
+    reap_audio_queue(state);
+    state->audio_queued_buffers = 0;
+    state->audio_queue_low_water = PLAYER_AUDIO_BUFFERS;
+    state->audio_started = 0;
+    state->audio_chunks_queued = 0;
+    state->has_last_output = 0;
+    return waveOutPause(state->wave) == MMSYSERR_NOERROR;
 }
 
 static void reap_audio_queue(PlayerState *state)
@@ -8567,6 +8611,9 @@ static void reap_audio_queue(PlayerState *state)
             (state->audio_headers[i].dwFlags & WHDR_DONE) != 0) {
             waveOutUnprepareHeader(state->wave, &state->audio_headers[i], sizeof(state->audio_headers[i]));
             state->audio_in_use[i] = 0;
+            if (state->audio_queued_buffers > 0) {
+                state->audio_queued_buffers--;
+            }
             ZeroMemory(&state->audio_headers[i], sizeof(state->audio_headers[i]));
         }
     }
@@ -8589,6 +8636,17 @@ static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t 
 
         for (i = 0; i < PLAYER_AUDIO_BUFFERS; ++i) {
             if (!state->audio_in_use[i]) {
+                if (state->audio_started) {
+                    if (state->audio_queued_buffers < state->audio_queue_low_water) {
+                        state->audio_queue_low_water = state->audio_queued_buffers;
+                    }
+                    if (state->audio_queued_buffers == 0) {
+                        state->audio_underruns++;
+                        player_log("audio queue underrun count=%llu sample=%llu",
+                            (unsigned long long)state->audio_underruns,
+                            (unsigned long long)spu2log_audacious_get_sample_pos());
+                    }
+                }
                 copy_scaled_pcm_with_declick(state, state->audio_buffers[i], pcm, frames);
                 ZeroMemory(&state->audio_headers[i], sizeof(state->audio_headers[i]));
                 state->audio_headers[i].lpData = (LPSTR)state->audio_buffers[i];
@@ -8607,6 +8665,27 @@ static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t 
                 }
 
                 state->audio_in_use[i] = 1;
+                state->audio_queued_buffers++;
+                state->audio_chunks_queued++;
+                if (!state->audio_started &&
+                    state->audio_queued_buffers >= PLAYER_AUDIO_PREBUFFER_BUFFERS) {
+                    result = waveOutRestart(state->wave);
+                    if (result != MMSYSERR_NOERROR) {
+                        return 0;
+                    }
+                    state->audio_started = 1;
+                    player_log("audio prebuffer ready buffers=%u frames=%u",
+                        state->audio_queued_buffers,
+                        state->audio_queued_buffers * PLAYER_RENDER_FRAMES);
+                }
+                if ((state->audio_chunks_queued % 600u) == 0u) {
+                    player_log("audio queue chunks=%llu queued=%u low=%u underruns=%llu",
+                        (unsigned long long)state->audio_chunks_queued,
+                        state->audio_queued_buffers,
+                        state->audio_queue_low_water,
+                        (unsigned long long)state->audio_underruns);
+                    state->audio_queue_low_water = state->audio_queued_buffers;
+                }
                 return 1;
             }
         }
@@ -9551,7 +9630,7 @@ static DWORD WINAPI preview_standalone_thread_proc(void *user)
         !open_waveout(&state->preview_wave)) {
         return 0;
     }
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     for (i = 0; i < PREVIEW_AUDIO_BUFFERS; ++i) {
         state->preview_audio_buffers[i] =
             (int16_t *)calloc(PREVIEW_AUDIO_FRAMES * 2u, sizeof(*state->preview_audio_buffers[i]));
@@ -9815,10 +9894,11 @@ static DWORD WINAPI playback_thread_proc(void *user)
                     (unsigned long long)current_sample,
                     (unsigned long long)target_sample);
                 if (state->wave != NULL) {
-                    waveOutReset(state->wave);
-                    reap_audio_queue(state);
+                    if (!restart_audio_prebuffer(state)) {
+                        set_status(state, "Seek audio reset failed");
+                        break;
+                    }
                 }
-                state->has_last_output = 0;
                 do {
                     if (target_sample <= current_sample) {
                         if (!reopen_core_for_seek(state)) {

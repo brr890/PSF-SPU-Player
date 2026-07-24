@@ -41,13 +41,13 @@
 // ADSR func
 ////////////////////////////////////////////////////////////////////////
 
-unsigned long RateTable[160];
+u32 RateTable[160];
 
 static void InitADSR(void)                                    // INIT ADSR
 {
- unsigned long r,rs,rd;int i;
+ u32 r,rs,rd;int i;
 
- memset(RateTable,0,sizeof(unsigned long)*160);        // build the rate table according to Neill's rules (see at bottom of file)
+ memset(RateTable,0,sizeof(RateTable));                // build the rate table according to Neill's rules (see at bottom of file)
 
  r=3;rs=1;rd=0;
 
@@ -446,7 +446,7 @@ OLD adsr mixing according to james' rules... has to be called
 every one millisecond
 
 
- long v,v2,lT,l1,l2,l3;
+ s32 v,v2,lT,l1,l2,l3;
 
  if(s_chan[ch].bStop)                                  // psx wants to stop? -> release phase
   {

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(psf_spu_player VERSION 1.47 LANGUAGES C CXX)
+project(psf_spu_player VERSION 1.48 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -138,4 +138,3 @@ target_link_libraries(psf_spu_player PRIVATE
 if(MINGW)
     target_link_options(psf_spu_player PRIVATE -static)
 endif()
-

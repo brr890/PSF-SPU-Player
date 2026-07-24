@@ -93,19 +93,19 @@ static inline u16 BFLIP16(u16 x)
 typedef struct
 {
  int            AttackModeExp;
- long           AttackTime;
- long           DecayTime;
- long           SustainLevel;
+ s32            AttackTime;
+ s32            DecayTime;
+ s32            SustainLevel;
  int            SustainModeExp;
- long           SustainModeDec;
- long           SustainTime;
+ s32            SustainModeDec;
+ s32            SustainTime;
  int            ReleaseModeExp;
- unsigned long  ReleaseVal;
- long           ReleaseTime;
- long           ReleaseStartTime;
- long           ReleaseVol;
- long           lTime;
- long           lVolume;
+ u32            ReleaseVal;
+ s32            ReleaseTime;
+ s32            ReleaseStartTime;
+ s32            ReleaseVol;
+ s32            lTime;
+ s32            lVolume;
 } ADSRInfo2;
 
 typedef struct
@@ -121,9 +121,9 @@ typedef struct
  int            ReleaseModeExp;
  int            ReleaseRate;
  int            EnvelopeVol;
- long           lVolume;
- long           lDummy1;
- long           lDummy2;
+ s32            lVolume;
+ s32            lDummy1;
+ s32            lDummy2;
 } ADSRInfoEx2;
 
 ///////////////////////////////////////////////////////////
@@ -278,13 +278,13 @@ extern int        iDisStereo;
 extern SPUCHAN2 s_chan[];
 extern REVERBInfo2 rvb[];
 
-extern unsigned long dwNoiseVal;
+extern u32 dwNoiseVal;
 extern unsigned short spuCtrl2[];
 extern unsigned short spuStat2[];
-extern unsigned long  spuIrq2[];
-extern unsigned long  spuAddr2[];
-extern unsigned long   spuRvbAddr2[];
-extern unsigned long   spuRvbAEnd2[];
+extern u32  spuIrq2[];
+extern u32  spuAddr2[];
+extern u32  spuRvbAddr2[];
+extern u32  spuRvbAEnd2[];
 
 extern int      bEndThread;
 extern int      bThreadEnded;
@@ -294,8 +294,8 @@ extern int      SSumR[];
 extern int      SSumL[];
 extern int      iCycle;
 extern short *  pS;
-extern unsigned long dwNewChannel2[];
-extern unsigned long dwEndChannel2[];
+extern u32 dwNewChannel2[];
+extern u32 dwEndChannel2[];
 
 extern int iSpuAsyncWait;
 
@@ -327,8 +327,8 @@ extern char * pConfigFile;
 #ifndef _IN_DSOUND
 
 #ifdef _WINDOWS
-extern unsigned long LastWrite;
-extern unsigned long LastPlay;
+extern u32 LastWrite;
+extern u32 LastPlay;
 #endif
 
 #endif
@@ -353,13 +353,13 @@ extern int iDoRecord;
 
 extern xa_decode_t   * xapGlobal;
 
-extern unsigned long * XAFeed;
-extern unsigned long * XAPlay;
-extern unsigned long * XAStart;
-extern unsigned long * XAEnd;
+extern u32 * XAFeed;
+extern u32 * XAPlay;
+extern u32 * XAStart;
+extern u32 * XAEnd;
 
-extern unsigned long   XARepeat;
-extern unsigned long   XALastVal;
+extern u32 XARepeat;
+extern u32 XALastVal;
 
 extern int           iLeftXAVol;
 extern int           iRightXAVol;

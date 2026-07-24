@@ -1654,7 +1654,7 @@ int mips_execute( int cycles )
   			break;
 		}
 		mips_ICount--;
-	} while( mips_ICount > 0 || mipscpu.delayr == REGPC );
+	} while( mips_ICount > 0 );
 
 	return cycles - mips_ICount;
 }
