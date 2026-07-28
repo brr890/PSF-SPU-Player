@@ -29,6 +29,7 @@ void psf2log_set_imported_reverb_enabled(int enabled);
 void psf2log_set_imported_main_enabled(int enabled);
 void psf2log_set_imported_text_log_enabled(int enabled);
 void psf2log_set_imported_voice_mute_masks(uint32_t core0_mask, uint32_t core1_mask);
+void psf2log_set_imported_voice_mute_masks_immediate(uint32_t core0_mask, uint32_t core1_mask);
 void psf2log_set_imported_timbre_solo(int enabled, const uint32_t *starts, const uint32_t *loops, const uint32_t *flags, uint32_t count);
 void psf2log_set_imported_voice_reverb_masks(uint32_t core0_on, uint32_t core1_on, uint32_t core0_off, uint32_t core1_off);
 void psf2log_set_imported_voice_noise_masks(uint32_t core0_on, uint32_t core1_on, uint32_t core0_off, uint32_t core1_off);
