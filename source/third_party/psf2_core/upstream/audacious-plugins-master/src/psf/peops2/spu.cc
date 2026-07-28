@@ -204,6 +204,20 @@ extern "C" void psf2log_peops2_set_mute_masks(unsigned int core0_mask, unsigned 
   }
 }
 
+extern "C" void psf2log_peops2_set_mute_masks_immediate(unsigned int core0_mask, unsigned int core1_mask)
+{
+ unsigned int masks[2]={core0_mask&0x00ffffffu,core1_mask&0x00ffffffu};
+ int ch;
+
+ psf2log_peops2_init_mute_gains();
+ for(ch=0;ch<MAXCHAN;ch++)
+  {
+   int muted=(masks[ch/24]&(1u<<(ch%24)))?1:0;
+   s_chan[ch].iMute=muted;
+   psf2log_peops2_mute_gain[ch]=muted?0:4096;
+  }
+}
+
 extern "C" void psf2log_peops2_set_timbre_solo(int enabled, const unsigned int *starts, const unsigned int *loops, const unsigned int *flags, unsigned int count)
 {
  unsigned int ch,i;
@@ -320,8 +334,12 @@ extern "C" void psf2log_peops2_set_pmod_override_masks(unsigned int core0_on, un
 extern "C" void psf2log_peops2_set_adsr_force_masks(unsigned int core0_mask, unsigned int core1_mask)
 {
  unsigned int ch;
+ unsigned int old_masks[2]={psf2log_peops2_adsr_force_masks[0],psf2log_peops2_adsr_force_masks[1]};
+ unsigned int released_masks[2];
  psf2log_peops2_adsr_force_masks[0]=core0_mask&0x00ffffffu;
  psf2log_peops2_adsr_force_masks[1]=core1_mask&0x00ffffffu;
+ released_masks[0]=old_masks[0]&~psf2log_peops2_adsr_force_masks[0];
+ released_masks[1]=old_masks[1]&~psf2log_peops2_adsr_force_masks[1];
  for(ch=0;ch<MAXCHAN;ch++)
   {
    unsigned int core=ch/24u;
@@ -332,6 +350,18 @@ extern "C" void psf2log_peops2_set_adsr_force_masks(unsigned int core0_mask, uns
      s_chan[ch].ADSRX.lVolume=s_chan[ch].ADSRX.EnvelopeVol>>21;
      s_chan[ch].ADSRX.State=2;
      s_chan[ch].bStop=0;
+    }
+   else if(core<2 && (released_masks[core]&(1u<<voice))!=0)
+    {
+     if(s_chan[ch].bOn || s_chan[ch].bNew)
+      s_chan[ch].bStop=1;
+     else
+      {
+       s_chan[ch].ADSRX.EnvelopeVol=0;
+       s_chan[ch].ADSRX.lVolume=0;
+       s_chan[ch].ADSRX.State=0;
+       s_chan[ch].bStop=0;
+      }
     }
   }
 }

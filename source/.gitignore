@@ -1,0 +1,12 @@
+/build/
+*.ini
+*.log
+*.spu
+*.spu2
+*.psf
+*.minipsf
+*.psf2
+*.minipsf2
+*.psflib
+*.psf2lib
+
