@@ -230,6 +230,18 @@ extern "C" void psf2log_peops_set_mute_mask(unsigned int mask)
  psf2log_ps1_mute_mask=mask;
 }
 
+extern "C" void psf2log_peops_set_mute_mask_immediate(unsigned int mask)
+{
+ unsigned int ch;
+
+ psf2log_ps1_init_mute_gains();
+ psf2log_ps1_mute_mask=mask&0x00ffffffu;
+ for(ch=0;ch<MAXCHAN;ch++)
+  {
+   psf2log_ps1_mute_gain[ch]=(psf2log_ps1_mute_mask&(1u<<ch))?0:4096;
+  }
+}
+
 extern "C" void psf2log_peops_set_timbre_solo(int enabled, const unsigned int *starts, const unsigned int *loops, const unsigned int *flags, unsigned int count)
 {
  unsigned int ch,i;
@@ -350,7 +362,10 @@ extern "C" void psf2log_peops_set_pmod_override_masks(unsigned int force_on_mask
 extern "C" void psf2log_peops_set_adsr_force_mask(unsigned int mask)
 {
  unsigned int ch;
+ unsigned int old_mask=psf2log_ps1_adsr_force_mask;
+ unsigned int released_mask;
  psf2log_ps1_adsr_force_mask=mask&0x00ffffffu;
+ released_mask=old_mask&~psf2log_ps1_adsr_force_mask;
  for(ch=0;ch<MAXCHAN;ch++)
   {
    if((psf2log_ps1_adsr_force_mask&(1u<<ch))!=0)
@@ -359,6 +374,18 @@ extern "C" void psf2log_peops_set_adsr_force_mask(unsigned int mask)
      s_chan[ch].ADSRX.lVolume=s_chan[ch].ADSRX.EnvelopeVol>>21;
      s_chan[ch].ADSRX.State=2;
      s_chan[ch].bStop=0;
+    }
+   else if((released_mask&(1u<<ch))!=0)
+    {
+     if(s_chan[ch].bOn || s_chan[ch].bNew)
+      s_chan[ch].bStop=1;
+     else
+      {
+       s_chan[ch].ADSRX.EnvelopeVol=0;
+       s_chan[ch].ADSRX.lVolume=0;
+       s_chan[ch].ADSRX.State=0;
+       s_chan[ch].bStop=0;
+      }
     }
   }
 }
