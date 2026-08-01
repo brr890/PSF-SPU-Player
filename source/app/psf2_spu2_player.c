@@ -41,9 +41,10 @@
 #define PLAYER_WM_WORKER_UPDATE (WM_APP + 1u)
 #define PLAYER_AUDIO_BUFFERS 16u
 #define PLAYER_AUDIO_PREBUFFER_BUFFERS 8u
+#define VOICE_EVENT_DISPLAY_BUFFERS 3u
 #define PLAYER_MAX_OUTPUT_FRAMES PLAYER_RENDER_FRAMES
 #define PLAYER_STARTUP_FADE_FRAMES 128u
-#define KEY_ON_FLASH_SAMPLES (PLAYER_SAMPLE_RATE / 8u)
+#define PLAYER_TRACK_SWITCH_FADE_FRAMES 256u
 #define VOICE_DISPLAY_HOLD_SAMPLES ((PLAYER_SAMPLE_RATE * 100u) / 1000u)
 #define TIMBRE_SOLO_MAX_KEYS 64u
 #define TIMBRE_GROUP_MAX_SAMPLE_GAP 0x0800u
@@ -173,8 +174,16 @@
 #define CORE0_X 8
 #define CORE1_X (CORE0_X + CORE_PANEL_WIDTH)
 #define SPU2_CORE_STRIDE 0x0400u
+#define PS1_SPU_BASE 0x1f801c00u
+#define PS1_SPU_END 0x1f801dffu
+#define PS1_REG_KON 0x0188u
+#define PS1_REG_KON_HI 0x018au
+#define PS1_REG_KOFF 0x018cu
+#define PS1_REG_KOFF_HI 0x018eu
 #define SPU2_REG_KON 0x01a0u
 #define SPU2_REG_KON_HI 0x01a2u
+#define SPU2_REG_KOFF 0x01a4u
+#define SPU2_REG_KOFF_HI 0x01a6u
 #define CUSTOM_COLOR_INDEX 8
 #define CUSTOM_COLOR_COUNT 16
 #define IDC_COLOR_CODE 3001
@@ -267,7 +276,8 @@ typedef struct PreviewVoice {
 
 typedef struct AudioDisplaySnapshot {
     Spu2LogLiveState live;
-    uint64_t key_on_flash_until[2][24];
+    uint8_t key_on_events[2][24];
+    uint8_t release_events[2][24];
     uint64_t voice_display_hold_until[2][24];
     Spu2LogVoiceSnapshot voice_display_hold[2][24];
     uint64_t sequence;
@@ -296,6 +306,7 @@ typedef struct PlayerState {
     int16_t last_output_l;
     int16_t last_output_r;
     int has_last_output;
+    volatile LONG graceful_stop_requested;
     HANDLE thread;
     HANDLE stop_event;
     CRITICAL_SECTION lock;
@@ -352,7 +363,9 @@ typedef struct PlayerState {
     COLORREF custom_colors[CUSTOM_COLOR_COUNT];
     uint64_t total_samples;
     uint64_t last_ps1_voice_diag_sample;
-    uint64_t key_on_flash_until[2][24];
+    uint8_t key_on_event_buffers[2][24];
+    uint8_t release_event_buffers[2][24];
+    uint8_t release_event_latched[2][24];
     uint64_t voice_display_hold_until[2][24];
     Spu2LogVoiceSnapshot voice_display_hold[2][24];
     uint32_t voice_mute_mask[2];
@@ -1228,7 +1241,9 @@ static void reset_live_display(PlayerState *state)
         }
     }
     state->sequence += 1;
-    ZeroMemory(state->key_on_flash_until, sizeof(state->key_on_flash_until));
+    ZeroMemory(state->key_on_event_buffers, sizeof(state->key_on_event_buffers));
+    ZeroMemory(state->release_event_buffers, sizeof(state->release_event_buffers));
+    ZeroMemory(state->release_event_latched, sizeof(state->release_event_latched));
     ZeroMemory(state->voice_display_hold_until, sizeof(state->voice_display_hold_until));
     ZeroMemory(state->voice_display_hold, sizeof(state->voice_display_hold));
     ZeroMemory(state->default_adsr1, sizeof(state->default_adsr1));
@@ -1292,7 +1307,9 @@ static void reset_stopped_display(PlayerState *state)
         }
     }
     state->sequence += 1;
-    ZeroMemory(state->key_on_flash_until, sizeof(state->key_on_flash_until));
+    ZeroMemory(state->key_on_event_buffers, sizeof(state->key_on_event_buffers));
+    ZeroMemory(state->release_event_buffers, sizeof(state->release_event_buffers));
+    ZeroMemory(state->release_event_latched, sizeof(state->release_event_latched));
     ZeroMemory(state->voice_display_hold_until, sizeof(state->voice_display_hold_until));
     ZeroMemory(state->voice_display_hold, sizeof(state->voice_display_hold));
     ZeroMemory(state->debug_saved_adsr1, sizeof(state->debug_saved_adsr1));
@@ -2616,22 +2633,6 @@ static int timbre_solo_has_key_locked(const PlayerState *state, uint32_t key)
     return 0;
 }
 
-static int timbre_solo_has_start_locked(const PlayerState *state, uint32_t ssa)
-{
-    unsigned i;
-
-    if (state == NULL || ssa == 0 || !state->timbre_solo_enabled) {
-        return 0;
-    }
-    ssa &= 0x000fffffu;
-    for (i = 0; i < state->timbre_solo_key_count; ++i) {
-        if (state->timbre_solo_ssa[i] == ssa) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static int timbre_solo_add_key_locked(PlayerState *state, uint32_t key, uint32_t ssa, uint32_t lsa, uint32_t flags)
 {
     if (state == NULL || key == 0 || timbre_solo_has_key_locked(state, key)) {
@@ -3355,7 +3356,11 @@ static void timbre_list_regroup_locked(PlayerState *state)
     free(items);
 }
 
-static void effective_voice_mute_masks_locked(const PlayerState *state, uint32_t *core0_mask, uint32_t *core1_mask)
+static void effective_voice_mute_masks_locked(
+    const PlayerState *state,
+    const Spu2LogLiveState *live,
+    uint32_t *core0_mask,
+    uint32_t *core1_mask)
 {
     uint32_t masks[2];
     unsigned core;
@@ -3366,10 +3371,10 @@ static void effective_voice_mute_masks_locked(const PlayerState *state, uint32_t
     if (state->timbre_solo_enabled && state->timbre_solo_key_count > 0) {
         for (core = 0; core < 2; ++core) {
             for (voice = 0; voice < 24; ++voice) {
-                const Spu2LogVoiceSnapshot *snapshot = &state->live.voices[core][voice];
+                const Spu2LogVoiceSnapshot *snapshot = &live->voices[core][voice];
                 uint32_t bit = 1u << voice;
 
-                if (timbre_solo_has_start_locked(state, snapshot->ssa)) {
+                if (timbre_solo_has_key_locked(state, voice_timbre_key(snapshot))) {
                     masks[core] &= ~bit;
                 } else {
                     masks[core] |= bit;
@@ -3401,7 +3406,7 @@ static void apply_voice_mute_masks_mode(PlayerState *state, int immediate)
         core0_mask = state->voice_mute_mask[0] & 0x00ffffffu;
         core1_mask = state->voice_mute_mask[1] & 0x00ffffffu;
     } else {
-        effective_voice_mute_masks_locked(state, &core0_mask, &core1_mask);
+        effective_voice_mute_masks_locked(state, &state->live, &core0_mask, &core1_mask);
     }
     if (timbre_enabled) {
         unsigned i;
@@ -4516,6 +4521,10 @@ static void sync_timbre_solo_from_listbox(HWND hwnd, PlayerState *state)
             continue;
         }
         if (sample == TIMBRE_LIST_GROUP_ROW) {
+            if (state->timbre_list_key_count[index] > 1 &&
+                state->timbre_list_expanded[index]) {
+                continue;
+            }
             first_sample = 0;
             sample_limit = state->timbre_list_key_count[index];
         } else if (sample < state->timbre_list_key_count[index]) {
@@ -6854,7 +6863,13 @@ static void append_flags(char *buffer, size_t size, uint32_t flags)
     }
 }
 
-static void format_voice_mode_columns(char *buffer, size_t size, uint32_t flags, int key_on_pulse, uint8_t psf_version)
+static void format_voice_mode_columns(
+    char *buffer,
+    size_t size,
+    uint32_t flags,
+    int key_on_pulse,
+    int release_pulse,
+    uint8_t psf_version)
 {
     char modulation = (flags & SPU2LOG_VOICE_PMOD) ? (psf_version == 0x01u ? 'F' : 'P') : '.';
 
@@ -6862,7 +6877,7 @@ static void format_voice_mode_columns(char *buffer, size_t size, uint32_t flags,
         size,
         "%c %c %c %c",
         key_on_pulse ? 'K' : '.',
-        (flags & SPU2LOG_VOICE_RELEASE) ? 'R' : '.',
+        release_pulse ? 'R' : '.',
         (flags & SPU2LOG_VOICE_NOISE) ? 'N' : '.',
         modulation);
 }
@@ -6987,7 +7002,7 @@ static uint32_t smooth_gauge_value(uint32_t current, uint32_t target, uint32_t m
     }
 
     delta = current - target;
-    step = (delta + 1u) / 2u;
+    step = (delta + 2u) / 3u;
     return current - (step != 0 ? step : 1u);
 }
 
@@ -8173,17 +8188,6 @@ static int ps1_voice_has_display_state(const Spu2LogVoiceSnapshot *voice)
         voice->nax != 0;
 }
 
-static int is_voice_sounding_for_key_pulse(const Spu2LogVoiceSnapshot *voice)
-{
-    if (voice == NULL) {
-        return 0;
-    }
-
-    return voice->active &&
-        voice->adsr_phase != SPU2LOG_ADSR_OFF &&
-        voice->adsr_phase != SPU2LOG_ADSR_RELEASE;
-}
-
 static int is_voice_really_sounding(const Spu2LogVoiceSnapshot *voice)
 {
     if (voice == NULL) {
@@ -8243,6 +8247,11 @@ static void adsr_phase_counts(
     for (voice = 0; voice < 24; ++voice) {
         const Spu2LogVoiceSnapshot *snapshot = &state->voices[core][voice];
 
+        if (snapshot->active && snapshot->adsr_phase == SPU2LOG_ADSR_RELEASE) {
+            *release += 1;
+            continue;
+        }
+
         if (!is_voice_active(snapshot)) {
             continue;
         }
@@ -8256,9 +8265,6 @@ static void adsr_phase_counts(
             break;
         case SPU2LOG_ADSR_SUSTAIN:
             *sustain += 1;
-            break;
-        case SPU2LOG_ADSR_RELEASE:
-            *release += 1;
             break;
         default:
             break;
@@ -8302,22 +8308,60 @@ static Spu2LogResult player_spu2_write16(
 {
     PlayerState *state = (PlayerState *)user;
     uint8_t core;
+    uint32_t normalized_address;
     uint32_t core_offset;
     uint32_t mask;
     uint8_t voice;
+    int key_on_write = 0;
+    int key_off_write = 0;
+    int ps1_register_space = 0;
 
     if (state == NULL) {
         return SPU2LOG_ERROR_INVALID_ARGUMENT;
     }
 
-    core = (uint8_t)((address / SPU2_CORE_STRIDE) & 1u);
-    core_offset = address % SPU2_CORE_STRIDE;
-    if (core_offset == SPU2_REG_KON) {
-        mask = (uint32_t)value;
-    } else if (core_offset == SPU2_REG_KON_HI) {
-        mask = ((uint32_t)value) << 16;
+    normalized_address = address & 0x1fffffffu;
+    if (normalized_address >= PS1_SPU_BASE && normalized_address <= PS1_SPU_END) {
+        ps1_register_space = 1;
+        core = 0;
+        core_offset = normalized_address - PS1_SPU_BASE;
     } else {
-        return SPU2LOG_OK;
+        core = (uint8_t)((normalized_address / SPU2_CORE_STRIDE) & 1u);
+        core_offset = normalized_address % SPU2_CORE_STRIDE;
+    }
+
+    if (ps1_register_space) {
+        if (core_offset == PS1_REG_KON) {
+            mask = (uint32_t)value;
+            key_on_write = 1;
+        } else if (core_offset == PS1_REG_KON_HI) {
+            mask = ((uint32_t)value) << 16;
+            key_on_write = 1;
+        } else if (core_offset == PS1_REG_KOFF) {
+            mask = (uint32_t)value;
+            key_off_write = 1;
+        } else if (core_offset == PS1_REG_KOFF_HI) {
+            mask = ((uint32_t)value) << 16;
+            key_off_write = 1;
+        } else {
+            return SPU2LOG_OK;
+        }
+    } else {
+        if (core_offset == SPU2_REG_KON) {
+            mask = (uint32_t)value;
+            key_on_write = 1;
+        } else if (core_offset == SPU2_REG_KON_HI) {
+            mask = ((uint32_t)value) << 16;
+            key_on_write = 1;
+        } else if (core_offset == SPU2_REG_KOFF) {
+            mask = (uint32_t)value;
+            key_off_write = 1;
+        } else if (core_offset == SPU2_REG_KOFF_HI) {
+            mask = ((uint32_t)value) << 16;
+            key_off_write = 1;
+        } else {
+            return SPU2LOG_OK;
+        }
     }
 
     mask &= 0x00ffffffu;
@@ -8331,17 +8375,26 @@ static Spu2LogResult player_spu2_write16(
         unlock_state(state);
         return SPU2LOG_OK;
     }
-    if (((core_offset == SPU2_REG_KON && value == 0xffffu) ||
-            (core_offset == SPU2_REG_KON_HI && (value & 0x00ffu) == 0x00ffu)) &&
+    if (key_on_write &&
+        (((core_offset == SPU2_REG_KON || core_offset == PS1_REG_KON) && value == 0xffffu) ||
+            ((core_offset == SPU2_REG_KON_HI || core_offset == PS1_REG_KON_HI) &&
+                (value & 0x00ffu) == 0x00ffu)) &&
         active_voice_count(&state->live, core) == 0) {
         state->live.last_sample_pos = sample_pos;
         unlock_state(state);
         return SPU2LOG_OK;
     }
     for (voice = 0; voice < 24; ++voice) {
-        if ((mask & (1u << voice)) != 0 &&
-            !is_voice_sounding_for_key_pulse(&state->live.voices[core][voice])) {
-            state->key_on_flash_until[core][voice] = sample_pos + KEY_ON_FLASH_SAMPLES;
+        if (key_on_write && (mask & (1u << voice)) != 0) {
+            state->key_on_event_buffers[core][voice] = VOICE_EVENT_DISPLAY_BUFFERS;
+            state->release_event_latched[core][voice] = 0;
+        }
+        if (key_off_write &&
+            (mask & (1u << voice)) != 0 &&
+            state->live.voices[core][voice].active &&
+            !state->release_event_latched[core][voice]) {
+            state->release_event_buffers[core][voice] = VOICE_EVENT_DISPLAY_BUFFERS;
+            state->release_event_latched[core][voice] = 1;
         }
     }
     state->live.last_sample_pos = sample_pos;
@@ -8402,15 +8455,18 @@ static Spu2LogResult player_voice_snapshot(
             merged.flags |= SPU2LOG_VOICE_RELEASE;
         }
     }
-    if (state->psf_version != 0x01u &&
-        merged.envx == 0 &&
-        (!merged.active || (merged.flags & SPU2LOG_VOICE_RELEASE) != 0)) {
+    if (state->psf_version != 0x01u && merged.envx == 0) {
         uint8_t core = merged.core;
         uint8_t voice = merged.voice;
         memset(&merged, 0, sizeof(merged));
         merged.core = core;
         merged.voice = voice;
         merged.adsr_phase = SPU2LOG_ADSR_OFF;
+        memset(&state->voice_display_hold[core][voice], 0,
+            sizeof(state->voice_display_hold[core][voice]));
+        state->voice_display_hold[core][voice].core = core;
+        state->voice_display_hold[core][voice].voice = voice;
+        state->voice_display_hold_until[core][voice] = 0;
     }
     if ((state->voice_adsr_force_mask[merged.core] & (1u << merged.voice)) != 0) {
         merged.envx = 0x7fffu;
@@ -8427,10 +8483,6 @@ static Spu2LogResult player_voice_snapshot(
     }
     if ((state->voice_volume_lock_mask[1][merged.core] & (1u << merged.voice)) != 0) {
         merged.vol_r = state->voice_volume_lock_value[1][merged.core][merged.voice];
-    }
-    if (!is_voice_sounding_for_key_pulse(&state->live.voices[merged.core][merged.voice]) &&
-        (merged.flags & SPU2LOG_VOICE_KEY_ON) != 0) {
-        state->key_on_flash_until[merged.core][merged.voice] = sample_pos + KEY_ON_FLASH_SAMPLES;
     }
     if (should_hold_voice_for_display(&merged)) {
         state->voice_display_hold[merged.core][merged.voice] = merged;
@@ -8597,6 +8649,8 @@ static void reset_audio_display_tracking(PlayerState *state)
 static void capture_audio_display_snapshot(PlayerState *state, unsigned index, uint64_t sequence)
 {
     AudioDisplaySnapshot *snapshot;
+    unsigned core;
+    unsigned voice;
 
     if (state == NULL || index >= PLAYER_AUDIO_BUFFERS) {
         return;
@@ -8604,9 +8658,22 @@ static void capture_audio_display_snapshot(PlayerState *state, unsigned index, u
     snapshot = &state->audio_display_snapshots[index];
     lock_state(state);
     snapshot->live = state->live;
-    memcpy(snapshot->key_on_flash_until,
-        state->key_on_flash_until,
-        sizeof(snapshot->key_on_flash_until));
+    memcpy(snapshot->key_on_events,
+        state->key_on_event_buffers,
+        sizeof(snapshot->key_on_events));
+    memcpy(snapshot->release_events,
+        state->release_event_buffers,
+        sizeof(snapshot->release_events));
+    for (core = 0; core < 2; ++core) {
+        for (voice = 0; voice < 24; ++voice) {
+            if (state->key_on_event_buffers[core][voice] > 0) {
+                --state->key_on_event_buffers[core][voice];
+            }
+            if (state->release_event_buffers[core][voice] > 0) {
+                --state->release_event_buffers[core][voice];
+            }
+        }
+    }
     memcpy(snapshot->voice_display_hold_until,
         state->voice_display_hold_until,
         sizeof(snapshot->voice_display_hold_until));
@@ -9955,6 +10022,25 @@ static DWORD WINAPI playback_thread_proc(void *user)
         Psf2CoreBridgeResult result;
         uint32_t rendered = 0;
 
+        if (InterlockedCompareExchange(&state->graceful_stop_requested, 0, 0) != 0) {
+            ZeroMemory(state->pcm, PLAYER_TRACK_SWITCH_FADE_FRAMES * 2u * sizeof(*state->pcm));
+            state->frame_audio_transition = 1;
+            if (queue_waveout_chunk(state, state->pcm, PLAYER_TRACK_SWITCH_FADE_FRAMES)) {
+                if (!state->audio_started && state->wave != NULL &&
+                    waveOutRestart(state->wave) == MMSYSERR_NOERROR) {
+                    state->audio_started = 1;
+                }
+                while (WaitForSingleObject(state->stop_event, 0) == WAIT_TIMEOUT) {
+                    reap_audio_queue(state);
+                    if (state->audio_queued_buffers == 0) {
+                        break;
+                    }
+                    Sleep(1);
+                }
+            }
+            break;
+        }
+
         if (get_paused(state)) {
             Sleep(10);
             continue;
@@ -10128,8 +10214,10 @@ static DWORD WINAPI playback_thread_proc(void *user)
     return 0;
 }
 
-static void stop_playback(PlayerState *state)
+static void stop_playback_internal(PlayerState *state, int graceful)
 {
+    int thread_closed = 0;
+
     if (state == NULL) {
         return;
     }
@@ -10154,15 +10242,28 @@ static void stop_playback(PlayerState *state)
     state->seek_target_sample = 0;
     update_pause_button_label(state);
 
-    state->has_last_output = 0;
-
-    if (state->stop_event != NULL) {
-        SetEvent(state->stop_event);
+    if (graceful && state->thread != NULL && state->stop_event != NULL &&
+        WaitForSingleObject(state->stop_event, 0) == WAIT_TIMEOUT) {
+        if (state->wave != NULL && state->audio_started) {
+            waveOutRestart(state->wave);
+        }
+        InterlockedExchange(&state->graceful_stop_requested, 1);
+        if (WaitForSingleObject(state->thread, 1000) == WAIT_OBJECT_0) {
+            CloseHandle(state->thread);
+            state->thread = NULL;
+            thread_closed = 1;
+        }
     }
-    psf2log_abort_imported_render();
 
-    if (state->wave != NULL) {
-        waveOutReset(state->wave);
+    if (!thread_closed) {
+        if (state->stop_event != NULL) {
+            SetEvent(state->stop_event);
+        }
+        psf2log_abort_imported_render();
+
+        if (state->wave != NULL) {
+            waveOutReset(state->wave);
+        }
     }
 
     if (state->thread != NULL) {
@@ -10184,6 +10285,9 @@ static void stop_playback(PlayerState *state)
         state->stop_event = NULL;
     }
 
+    InterlockedExchange(&state->graceful_stop_requested, 0);
+    state->has_last_output = 0;
+
     cleanup_audio_queue(state);
 
     if (state->wave != NULL) {
@@ -10203,6 +10307,16 @@ static void stop_playback(PlayerState *state)
 
     update_time_label(state);
     player_log("stop playback end");
+}
+
+static void stop_playback(PlayerState *state)
+{
+    stop_playback_internal(state, 0);
+}
+
+static void stop_playback_for_track_switch(PlayerState *state)
+{
+    stop_playback_internal(state, 1);
 }
 
 static void copy_first_command_arg(char *out_path, size_t out_size, const char *cmd_line)
@@ -11415,6 +11529,24 @@ static int timbre_find_group_row(HWND listbox, unsigned group)
     return -1;
 }
 
+static void timbre_set_visible_group_selection(HWND listbox, unsigned group, int selected)
+{
+    int row;
+    int count;
+
+    if (listbox == NULL) {
+        return;
+    }
+    count = (int)SendMessageA(listbox, LB_GETCOUNT, 0, 0);
+    for (row = 0; row < count; ++row) {
+        LRESULT item_data = SendMessageA(listbox, LB_GETITEMDATA, (WPARAM)row, 0);
+
+        if (item_data != LB_ERR && HIWORD((DWORD_PTR)item_data) == group) {
+            SendMessageA(listbox, LB_SETSEL, selected ? TRUE : FALSE, (LPARAM)row);
+        }
+    }
+}
+
 static int timbre_set_caret_group_expanded(PlayerState *state, int expanded)
 {
     HWND listbox;
@@ -11551,6 +11683,12 @@ static LRESULT CALLBACK timbre_listbox_wnd_proc(HWND hwnd, UINT msg, WPARAM wpar
                     LB_SETSEL,
                     state->timbre_drag_select_value ? TRUE : FALSE,
                     (LPARAM)row);
+                if (sample == TIMBRE_LIST_GROUP_ROW) {
+                    timbre_set_visible_group_selection(
+                        hwnd,
+                        group,
+                        state->timbre_drag_select_value);
+                }
                 SendMessageA(hwnd, LB_SETCARETINDEX, (WPARAM)row, FALSE);
                 SetCapture(hwnd);
                 sync_timbre_solo_from_listbox(
@@ -12526,7 +12664,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     snprintf(open_path, sizeof(open_path), "%s", path != NULL ? path : "");
     path_changed = (open_path[0] != '\0' && lstrcmpiA(previous_path, open_path) != 0);
 
-    stop_playback(state);
+    stop_playback_for_track_switch(state);
     player_log("start playback after stop");
     reset_live_display(state);
     lock_state(state);
@@ -12799,7 +12937,7 @@ static void frame_advance_tick(HWND hwnd, PlayerState *state, int delta_ticks)
     state->sequence += 1;
     unlock_state(state);
     set_status(state, "Frame advance");
-    InvalidateRect(hwnd, NULL, TRUE);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void render_playback_tick(HWND hwnd, PlayerState *state)
@@ -12813,13 +12951,14 @@ static void render_playback_tick(HWND hwnd, PlayerState *state)
         return;
     }
     update_scrollbar(hwnd, state);
-    InvalidateRect(hwnd, NULL, TRUE);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void paint_core_panel(
     HDC hdc,
     const Spu2LogLiveState *live,
-    const uint64_t key_on_flash_until[2][24],
+    const uint8_t key_on_events[2][24],
+    const uint8_t release_events[2][24],
     const uint32_t voice_mute_mask[2],
     const uint32_t voice_reverb_force_on_mask[2],
     const uint32_t voice_reverb_force_off_mask[2],
@@ -12862,7 +13001,13 @@ static void paint_core_panel(
     COLORREF lr_left_color = lr_left_color_from_index(lr_color_index, lr_custom_color);
     COLORREF lr_right_color = lr_right_color_from_index(lr_color_index, lr_custom_color);
 
-    adsr_phase_counts(live, core, &attack_count, &decay_count, &sustain_count, &release_count);
+    adsr_phase_counts(
+        live,
+        core,
+        &attack_count,
+        &decay_count,
+        &sustain_count,
+        &release_count);
     if (show_core_label) {
         snprintf(line, sizeof(line),
             "Core %u  active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%uHz)",
@@ -12907,11 +13052,11 @@ static void paint_core_panel(
         char voice_detail[96];
         char pitch_text[8];
         int row_y = y;
-        int active = is_voice_active(v);
-        int adsr_off = v->adsr_phase == SPU2LOG_ADSR_OFF;
+        int ps2_env_off = psf_version != 0x01u && v->envx == 0;
+        int active = ps2_env_off ? 0 : is_voice_active(v);
         int hide_voice_detail = 0;
         int muted = (voice_mute_mask[core] & (1u << voice)) != 0;
-        uint32_t flags = effective_voice_flags(
+        uint32_t flags = ps2_env_off ? 0 : effective_voice_flags(
             v->flags,
             voice_reverb_force_on_mask[core],
             voice_reverb_force_off_mask[core],
@@ -12920,15 +13065,15 @@ static void paint_core_panel(
             voice_pmod_force_on_mask[core],
             voice_pmod_force_off_mask[core],
             voice);
-        int key_on_pulse = key_on_flash_until[core][voice] != 0 &&
-            live->last_sample_pos <= key_on_flash_until[core][voice];
+        int key_on_pulse = !ps2_env_off && key_on_events[core][voice] != 0;
+        int release_pulse = !ps2_env_off && release_events[core][voice] != 0;
         COLORREF old_text_color;
 
         if (hide_inactive && !active) {
             continue;
         }
 
-        format_voice_mode_columns(modes, sizeof(modes), flags, key_on_pulse, psf_version);
+        format_voice_mode_columns(modes, sizeof(modes), flags, key_on_pulse, release_pulse, psf_version);
         format_adsr_rate_columns(rates, sizeof(rates), v->adsr1, v->adsr2);
         if (hide_voice_detail) {
             snprintf(line, sizeof(line), "%02u", voice);
@@ -12988,7 +13133,8 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
     HFONT font;
     HFONT old_font;
     Spu2LogLiveState live;
-    uint64_t key_on_flash_until[2][24];
+    uint8_t key_on_events[2][24];
+    uint8_t release_events[2][24];
     uint32_t voice_mute_mask[2];
     uint32_t voice_reverb_force_on_mask[2];
     uint32_t voice_reverb_force_off_mask[2];
@@ -13050,13 +13196,32 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
     }
     update_gauge_display_values(state, &live, state->psf_version);
     if (use_audible_display) {
-        memcpy(key_on_flash_until,
-            state->audible_display_snapshot.key_on_flash_until,
-            sizeof(key_on_flash_until));
+        memcpy(key_on_events,
+            state->audible_display_snapshot.key_on_events,
+            sizeof(key_on_events));
+        memcpy(release_events,
+            state->audible_display_snapshot.release_events,
+            sizeof(release_events));
     } else {
-        memcpy(key_on_flash_until, state->key_on_flash_until, sizeof(key_on_flash_until));
+        memcpy(key_on_events, state->key_on_event_buffers, sizeof(key_on_events));
+        memcpy(release_events, state->release_event_buffers, sizeof(release_events));
+        if (state->frame_advance || !state->playing) {
+            unsigned event_core;
+            unsigned event_voice;
+
+            for (event_core = 0; event_core < 2; ++event_core) {
+                for (event_voice = 0; event_voice < 24; ++event_voice) {
+                    if (state->key_on_event_buffers[event_core][event_voice] > 0) {
+                        --state->key_on_event_buffers[event_core][event_voice];
+                    }
+                    if (state->release_event_buffers[event_core][event_voice] > 0) {
+                        --state->release_event_buffers[event_core][event_voice];
+                    }
+                }
+            }
+        }
     }
-    effective_voice_mute_masks_locked(state, &voice_mute_mask[0], &voice_mute_mask[1]);
+    effective_voice_mute_masks_locked(state, &live, &voice_mute_mask[0], &voice_mute_mask[1]);
     memcpy(voice_reverb_force_on_mask, state->voice_reverb_force_on_mask, sizeof(voice_reverb_force_on_mask));
     memcpy(voice_reverb_force_off_mask, state->voice_reverb_force_off_mask, sizeof(voice_reverb_force_off_mask));
     memcpy(voice_noise_force_on_mask, state->voice_noise_force_on_mask, sizeof(voice_noise_force_on_mask));
@@ -13095,9 +13260,9 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, active_text_color);
 
-    paint_core_panel(hdc, &live, key_on_flash_until, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE0_X, y, line_height, psf_version != 0x01u, psf_version, stopped_display, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color);
+    paint_core_panel(hdc, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE0_X, y, line_height, psf_version != 0x01u, psf_version, stopped_display, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color);
     if (psf_version != 0x01u) {
-        paint_core_panel(hdc, &live, key_on_flash_until, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, 1, psf_version, stopped_display, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color);
+        paint_core_panel(hdc, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, 1, psf_version, stopped_display, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color);
     }
 
     SelectObject(hdc, old_font);

@@ -122,8 +122,8 @@ typedef struct
  int            ReleaseRate;
  int            EnvelopeVol;
  s32            lVolume;
- s32            lDummy1;
- s32            lDummy2;
+ u32            Counter;
+ u32            ClockCounter;
 } ADSRInfoEx2;
 
 ///////////////////////////////////////////////////////////

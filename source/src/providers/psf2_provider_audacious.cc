@@ -415,6 +415,58 @@ Index<char> ao_get_lib(char *filename)
     return output;
 }
 
+static uint16_t audacious_filter_psf2_key_event_value(
+    const AudaciousPsf2Core *core,
+    uint32_t address,
+    uint16_t value)
+{
+    uint32_t offset;
+    uint32_t core_offset;
+    unsigned core_index;
+    unsigned first_voice;
+    unsigned voice_count;
+    unsigned bit_index;
+    int key_on;
+    uint16_t filtered = 0;
+
+    if (core == nullptr || core->mode != AUDACIOUS_PSF_MODE_PSF2) {
+        return value;
+    }
+
+    offset = address & 0x7ffu;
+    core_offset = offset & 0x3ffu;
+    core_index = (offset >> 10) & 1u;
+    if (core_offset == 0x1a0u || core_offset == 0x1a4u) {
+        first_voice = 0;
+        voice_count = 16;
+    } else if (core_offset == 0x1a2u || core_offset == 0x1a6u) {
+        first_voice = 16;
+        voice_count = 8;
+    } else {
+        return value;
+    }
+    key_on = core_offset == 0x1a0u || core_offset == 0x1a2u;
+
+    for (bit_index = 0; bit_index < voice_count; ++bit_index) {
+        unsigned voice = first_voice + bit_index;
+        const SPUCHAN2 *channel;
+        int active;
+
+        if ((value & (uint16_t)(1u << bit_index)) == 0) {
+            continue;
+        }
+        channel = &s_chan[(core_index * 24u) + voice];
+        active = channel->bOn || channel->bNew || channel->ADSRX.EnvelopeVol > 0 ||
+            (g_adsr_force_masks[core_index] & (1u << voice)) != 0;
+        if ((key_on && channel->bNew && channel->pStart != nullptr) ||
+            (!key_on && channel->bStop && active)) {
+            filtered |= (uint16_t)(1u << bit_index);
+        }
+    }
+
+    return filtered;
+}
+
 static void audacious_spu2_write16(
     void *user,
     uint64_t sample_pos,
@@ -424,8 +476,10 @@ static void audacious_spu2_write16(
     AudaciousPsf2Core *core = (AudaciousPsf2Core *)user;
 
     if (core != nullptr && core->callbacks.spu2_write16 != nullptr) {
+        uint16_t event_value = audacious_filter_psf2_key_event_value(core, address, value);
+
         core->spu2_write_count += 1;
-        (void)core->callbacks.spu2_write16(core->callbacks.user, sample_pos, address, value);
+        (void)core->callbacks.spu2_write16(core->callbacks.user, sample_pos, address, event_value);
         if (g_fast_timbre_scan && value != 0) {
             if (core->mode == AUDACIOUS_PSF_MODE_PSF1 &&
                 (address == 0x1f801d88u || address == 0x1f801d8au)) {

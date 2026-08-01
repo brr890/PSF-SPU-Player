@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(psf_spu_player VERSION 1.48 LANGUAGES C CXX)
+project(psf_spu_player VERSION 1.50 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)

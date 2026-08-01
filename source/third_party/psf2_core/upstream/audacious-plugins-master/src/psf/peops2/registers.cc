@@ -1143,8 +1143,9 @@ void SoundOff(int start,int end,unsigned short val)    // SOUND OFF PSX COMMAND
  int ch;
  for(ch=start;ch<end;ch++,val>>=1)                     // loop channels
   {
-   if(val&1)                                           // && s_chan[i].bOn)  mmm...
+   if((val&1) && !s_chan[ch].bStop)                    // && s_chan[i].bOn)  mmm...
     {
+     s_chan[ch].ADSRX.Counter=0;
      s_chan[ch].bStop=1;
     }
   }
