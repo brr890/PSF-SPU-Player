@@ -878,6 +878,22 @@ extern "C" void psf2log_emit_imported_snapshot(Psf2CoreBridge *bridge)
     audacious_emit_internal_snapshots(core);
 }
 
+extern "C" void psf2log_rebase_imported_sample_position(
+    Psf2CoreBridge *bridge,
+    uint64_t sample_pos)
+{
+    AudaciousPsf2Core *core = (AudaciousPsf2Core *)bridge;
+
+    if (core == nullptr) {
+        return;
+    }
+    core->sample_pos = sample_pos;
+    core->next_snapshot_sample =
+        ((sample_pos / AUDACIOUS_SNAPSHOT_INTERVAL_FRAMES) + 1u) *
+        AUDACIOUS_SNAPSHOT_INTERVAL_FRAMES;
+    spu2log_audacious_set_sample_pos(sample_pos);
+}
+
 extern "C" Psf2CoreBridgeResult psf2log_scan_imported_timbres(
     Psf2CoreBridge *bridge,
     uint32_t sequence_frames,

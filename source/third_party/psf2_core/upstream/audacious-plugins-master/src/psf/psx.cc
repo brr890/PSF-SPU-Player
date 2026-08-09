@@ -772,8 +772,10 @@ int mips_execute( int cycles )
 		case OP_ADDIU:
 			if (INS_RT( mipscpu.op ) == 0)
 			{
-				psx_iop_call(mipscpu.pc, INS_IMMEDIATE(mipscpu.op));
-				mips_advance_pc();
+				if (psx_iop_call(mipscpu.pc, INS_IMMEDIATE(mipscpu.op)))
+				{
+					mips_advance_pc();
+				}
 			}
 			else
 			{

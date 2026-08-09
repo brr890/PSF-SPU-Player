@@ -20,7 +20,7 @@ Copyright (c) 2007-2008 R. Belmont and Richard Bannister.
 
 The PSF loader, PSF engines, and PSX/IOP hardware code imported through the
 Audacious PSF plugin are distributed under a BSD 3-Clause license. See
-`licenses/LICENSE_AUDIO_OVERLOAD.txt` and the notices in the
+`dist/PSF SPU Player/licenses/LICENSE_AUDIO_OVERLOAD.txt` and the notices in the
 individual source files.
 
 ## Audacious
@@ -38,14 +38,15 @@ PeOPS components identified above.
 Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler.
 
 zlib is distributed under the zlib License. See
-`licenses/LICENSE_ZLIB.txt`.
+`dist/PSF SPU Player/licenses/LICENSE_ZLIB.txt`.
 
 ## MinGW-w64 Runtime Libraries
 
 The Windows player statically links eligible GCC runtime code and
 `libwinpthread`. The GCC runtime libraries are covered by GNU GPL version 3 plus
 the GCC Runtime Library Exception, version 3.1. `libwinpthread` is covered by
-permissive MIT and BSD terms. See the corresponding files under `licenses`.
+permissive MIT and BSD terms. See the corresponding files under
+`dist/PSF SPU Player/licenses`.
 
 ## Binary Releases
 

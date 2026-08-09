@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(psf_spu_player VERSION 1.50 LANGUAGES C CXX)
+project(psf_spu_player VERSION 1.51 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -137,4 +137,11 @@ target_link_libraries(psf_spu_player PRIVATE
 
 if(MINGW)
     target_link_options(psf_spu_player PRIVATE -static)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_STRIP)
+        add_custom_command(TARGET psf_spu_player POST_BUILD
+            COMMAND ${CMAKE_STRIP} --strip-all $<TARGET_FILE:psf_spu_player>
+            COMMENT "Removing non-runtime debug and symbol data"
+            VERBATIM
+        )
+    endif()
 endif()

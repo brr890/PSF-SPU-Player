@@ -45,6 +45,7 @@
 #include "../peops2/registers.h"
 #include "../peops2/regs.h"
 #include "../peops2/reverb.h"
+#include "spu2log_audacious_hooks.h"
 
 extern "C" int psf2log_peops2_get_pitch_lock_value(unsigned int ch, unsigned int *out_value);
 extern "C" int psf2log_peops2_get_volume_lock_value(unsigned int core, unsigned int voice, unsigned int side, unsigned int *out_value);

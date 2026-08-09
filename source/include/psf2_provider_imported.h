@@ -13,6 +13,7 @@ void psf2log_set_imported_frame_advance_mode(int enabled);
 void psf2log_step_imported_frame_advance(uint32_t ticks);
 void psf2log_set_imported_adsr_freeze(int enabled);
 void psf2log_emit_imported_snapshot(Psf2CoreBridge *core);
+void psf2log_rebase_imported_sample_position(Psf2CoreBridge *core, uint64_t sample_pos);
 Psf2CoreBridgeResult psf2log_scan_imported_timbres(
     Psf2CoreBridge *core,
     uint32_t sequence_frames,

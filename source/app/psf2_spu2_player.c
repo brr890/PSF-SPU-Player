@@ -41,6 +41,7 @@
 #define PLAYER_WM_WORKER_UPDATE (WM_APP + 1u)
 #define PLAYER_AUDIO_BUFFERS 16u
 #define PLAYER_AUDIO_PREBUFFER_BUFFERS 8u
+#define PLAYER_STARTUP_SILENCE_BUFFERS 6u
 #define VOICE_EVENT_DISPLAY_BUFFERS 3u
 #define PLAYER_MAX_OUTPUT_FRAMES PLAYER_RENDER_FRAMES
 #define PLAYER_STARTUP_FADE_FRAMES 128u
@@ -325,6 +326,9 @@ typedef struct PlayerState {
     int playing;
     int paused;
     int seek_discarding;
+    int startup_silence_trim;
+    int ps2_startup_origin_valid;
+    uint64_t ps2_startup_origin_sample;
     int timbre_prescanning;
     int timbre_list_locked;
     int seek_request;
@@ -506,7 +510,7 @@ static COLORREF player_background_color(const PlayerState *state);
 static COLORREF player_text_color(const PlayerState *state);
 static COLORREF player_inactive_text_color(const PlayerState *state);
 static COLORREF player_muted_text_color(const PlayerState *state);
-static int reopen_core_for_seek(PlayerState *state);
+static int reopen_core_for_seek(PlayerState *state, uint64_t *out_sample_pos);
 static void start_playback(HWND hwnd, PlayerState *state, const char *path);
 static void show_playlist_window(HWND hwnd, PlayerState *state);
 static void playlist_play_index(HWND hwnd, PlayerState *state, int index);
@@ -8370,6 +8374,10 @@ static Spu2LogResult player_spu2_write16(
     }
 
     lock_state(state);
+    if (state->startup_silence_trim) {
+        unlock_state(state);
+        return SPU2LOG_OK;
+    }
     if (state->seek_discarding || state->timbre_prescanning) {
         state->live.last_sample_pos = sample_pos;
         unlock_state(state);
@@ -8419,7 +8427,17 @@ static Spu2LogResult player_voice_snapshot(
     merged = *snapshot;
     merged.flags = (merged.flags & ~0x3f00u) | ((((snapshot->flags & 0x3f00u) >> 8) & NOISE_CLOCK_MAX) << 8);
     lock_state(state);
+    if (state->startup_silence_trim) {
+        unlock_state(state);
+        return SPU2LOG_OK;
+    }
     if (state->timbre_prescanning) {
+        if (state->psf_version == 0x02u && !state->ps2_startup_origin_valid &&
+            merged.active && merged.ssa != 0 &&
+            (merged.adsr1 != 0 || merged.adsr2 != 0)) {
+            state->ps2_startup_origin_sample = sample_pos;
+            state->ps2_startup_origin_valid = 1;
+        }
         update_timbre_list = timbre_list_add_voice_locked(state, &merged);
         unlock_state(state);
         if (update_timbre_list && state->timbre_hwnd != NULL) {
@@ -8584,6 +8602,10 @@ static Spu2LogResult player_core_snapshot(
 
     merged = *snapshot;
     lock_state(state);
+    if (state->startup_silence_trim) {
+        unlock_state(state);
+        return SPU2LOG_OK;
+    }
     if (state->seek_discarding || state->timbre_prescanning) {
         state->live.last_sample_pos = sample_pos;
         unlock_state(state);
@@ -8913,6 +8935,140 @@ static int16_t clamp_i32_to_i16(int value)
         return -32768;
     }
     return (int16_t)value;
+}
+
+static uint32_t first_nonzero_pcm_frame(const int16_t *pcm, uint32_t frames)
+{
+    uint32_t frame;
+
+    if (pcm == NULL) {
+        return frames;
+    }
+    for (frame = 0; frame < frames; ++frame) {
+        if (pcm[frame * 2u] != 0 || pcm[frame * 2u + 1u] != 0) {
+            return frame;
+        }
+    }
+    return frames;
+}
+
+static uint32_t first_ps2_song_frame(
+    PlayerState *state,
+    const int16_t *pcm,
+    uint32_t frames,
+    uint64_t block_end_sample)
+{
+    uint64_t origin_sample = 0;
+    uint64_t block_start_sample;
+    int use_origin = 0;
+
+    if (state != NULL) {
+        lock_state(state);
+        use_origin = state->timbre_solo_enabled && state->ps2_startup_origin_valid;
+        origin_sample = state->ps2_startup_origin_sample;
+        unlock_state(state);
+    }
+    if (!use_origin || block_end_sample < frames) {
+        return first_nonzero_pcm_frame(pcm, frames);
+    }
+
+    block_start_sample = block_end_sample - frames;
+    if (origin_sample >= block_end_sample) {
+        return frames;
+    }
+    if (origin_sample <= block_start_sample) {
+        return 0;
+    }
+    return (uint32_t)(origin_sample - block_start_sample);
+}
+
+static void remember_ps2_startup_origin(
+    PlayerState *state,
+    uint64_t block_end_sample,
+    uint32_t rendered,
+    uint32_t first_song_frame)
+{
+    if (state == NULL || first_song_frame >= rendered || block_end_sample < rendered) {
+        return;
+    }
+    lock_state(state);
+    if (!state->ps2_startup_origin_valid) {
+        state->ps2_startup_origin_sample =
+            block_end_sample - rendered + first_song_frame;
+        state->ps2_startup_origin_valid = 1;
+    }
+    unlock_state(state);
+}
+
+static int advance_ps2_core_to_audible_start(PlayerState *state, uint64_t *out_sample_pos)
+{
+    uint64_t trimmed_frames = 0;
+
+    if (out_sample_pos != NULL) {
+        *out_sample_pos = 0;
+    }
+    if (state == NULL || state->psf_version != 0x02 || state->provider == NULL ||
+        state->core == NULL || state->pcm == NULL) {
+        return 1;
+    }
+
+    lock_state(state);
+    state->startup_silence_trim = 1;
+    unlock_state(state);
+    for (;;) {
+        Psf2CoreBridgeResult result;
+        uint32_t rendered = 0;
+        uint32_t first_nonzero;
+        uint64_t block_end_sample;
+
+        if (state->stop_event != NULL &&
+            WaitForSingleObject(state->stop_event, 0) != WAIT_TIMEOUT) {
+            break;
+        }
+        result = state->provider->render(
+            state->core,
+            state->pcm,
+            PLAYER_RENDER_FRAMES,
+            &rendered);
+        if (result != PSF2_CORE_BRIDGE_OK || rendered == 0) {
+            break;
+        }
+        block_end_sample = spu2log_audacious_get_sample_pos();
+        first_nonzero = first_ps2_song_frame(
+            state,
+            state->pcm,
+            rendered,
+            block_end_sample);
+        if (first_nonzero == rendered) {
+            trimmed_frames += rendered;
+            continue;
+        }
+
+        trimmed_frames += first_nonzero;
+        remember_ps2_startup_origin(
+            state,
+            block_end_sample,
+            rendered,
+            first_nonzero);
+        lock_state(state);
+        state->startup_silence_trim = 0;
+        unlock_state(state);
+        psf2log_rebase_imported_sample_position(state->core, rendered - first_nonzero);
+        reset_live_display(state);
+        psf2log_emit_imported_snapshot(state->core);
+        if (out_sample_pos != NULL) {
+            *out_sample_pos = rendered - first_nonzero;
+        }
+        player_log("PS2 seek origin trimmed frames=%llu seconds=%.3f",
+            (unsigned long long)trimmed_frames,
+            (double)trimmed_frames / (double)PLAYER_SAMPLE_RATE);
+        return 1;
+    }
+
+    lock_state(state);
+    state->startup_silence_trim = 0;
+    unlock_state(state);
+    return 0;
 }
 
 static uint32_t preview_adsr_rate(int index)
@@ -10015,6 +10171,7 @@ static DWORD WINAPI playback_thread_proc(void *user)
     PlayerState *state = (PlayerState *)user;
     uint32_t debug_render_count = 0;
     uint32_t silent_render_count = 0;
+    uint64_t startup_trimmed_frames = 0;
 
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     player_log("playback thread begin");
@@ -10140,12 +10297,11 @@ static DWORD WINAPI playback_thread_proc(void *user)
                 }
                 do {
                     if (target_sample <= current_sample) {
-                        if (!reopen_core_for_seek(state)) {
+                        if (!reopen_core_for_seek(state, &current_sample)) {
                             seek_result = 0;
                             set_status(state, "Seek failed");
                             break;
                         }
-                        current_sample = 0;
                     }
 
                     seek_result = fast_forward_core(state, target_sample - current_sample, current_sample);
@@ -10199,6 +10355,87 @@ static DWORD WINAPI playback_thread_proc(void *user)
                 (unsigned long long)spu2log_audacious_get_spu2_write16_count());
         }
 
+        if (state->startup_silence_trim) {
+            uint64_t block_end_sample = spu2log_audacious_get_sample_pos();
+            uint32_t first_nonzero = first_ps2_song_frame(
+                state,
+                state->pcm,
+                rendered,
+                block_end_sample);
+
+            if (first_nonzero == rendered) {
+                startup_trimmed_frames += rendered;
+                continue;
+            }
+            startup_trimmed_frames += first_nonzero;
+            remember_ps2_startup_origin(
+                state,
+                block_end_sample,
+                rendered,
+                first_nonzero);
+            state->startup_silence_trim = 0;
+            psf2log_rebase_imported_sample_position(
+                state->core,
+                rendered - first_nonzero);
+            reset_live_display(state);
+            player_log("PS2 startup silence trimmed frames=%llu seconds=%.3f",
+                (unsigned long long)startup_trimmed_frames,
+                (double)startup_trimmed_frames / (double)PLAYER_SAMPLE_RATE);
+            if (first_nonzero != 0) {
+                memmove(state->pcm,
+                    state->pcm + first_nonzero * 2u,
+                    (rendered - first_nonzero) * 2u * sizeof(*state->pcm));
+                rendered -= first_nonzero;
+            }
+            {
+                int16_t startup_silence[PLAYER_RENDER_FRAMES * 2u];
+                int16_t startup_packet[PLAYER_RENDER_FRAMES * 2u];
+                uint32_t silence_frames = PLAYER_RENDER_FRAMES - rendered;
+                unsigned silence_buffer;
+                int startup_queue_failed = 0;
+
+                /* Keep every retained song sample, but avoid handing waveOut
+                   a very short first buffer when the onset falls near the end
+                   of PeOPS2's 735-frame block. */
+                ZeroMemory(startup_silence, sizeof(startup_silence));
+                ZeroMemory(startup_packet, sizeof(startup_packet));
+                memcpy(startup_packet + silence_frames * 2u,
+                    state->pcm,
+                    rendered * 2u * sizeof(*state->pcm));
+                state->has_last_output = 0;
+                for (silence_buffer = 0;
+                     silence_buffer < PLAYER_STARTUP_SILENCE_BUFFERS;
+                     ++silence_buffer) {
+                    if (!queue_waveout_chunk(
+                            state,
+                            startup_silence,
+                            PLAYER_RENDER_FRAMES)) {
+                        startup_queue_failed = 1;
+                        break;
+                    }
+                }
+                if (startup_queue_failed) {
+                    player_log("playback thread startup silence queue failed");
+                    set_status(state, "Stopped: waveOut write failed");
+                    break;
+                }
+                psf2log_emit_imported_snapshot(state->core);
+                state->last_output_l = startup_packet[0];
+                state->last_output_r = startup_packet[1];
+                state->has_last_output = 1;
+                state->frame_audio_transition = 0;
+                if (!queue_waveout_chunk(
+                        state,
+                        startup_packet,
+                        PLAYER_RENDER_FRAMES)) {
+                    player_log("playback thread startup packet queue failed");
+                    set_status(state, "Stopped: waveOut write failed");
+                    break;
+                }
+            }
+            continue;
+        }
+
         if (!queue_waveout_chunk(state, state->pcm, rendered)) {
             player_log("playback thread waveOut queue failed");
             set_status(state, "Stopped: waveOut write failed");
@@ -10240,6 +10477,7 @@ static void stop_playback_internal(PlayerState *state, int graceful)
     apply_effective_speed_percent(state);
     state->seek_request = 0;
     state->seek_target_sample = 0;
+    state->startup_silence_trim = 0;
     update_pause_button_label(state);
 
     if (graceful && state->thread != NULL && state->stop_event != NULL &&
@@ -10316,7 +10554,10 @@ static void stop_playback(PlayerState *state)
 
 static void stop_playback_for_track_switch(PlayerState *state)
 {
-    stop_playback_internal(state, 1);
+    /* Discard queued audio from the previous song immediately. Draining the
+       old queue here can make its final note sound after the new song has
+       already been selected. The new stream has its own startup fade-in. */
+    stop_playback_internal(state, 0);
 }
 
 static void copy_first_command_arg(char *out_path, size_t out_size, const char *cmd_line)
@@ -12440,7 +12681,7 @@ static int fast_forward_core(PlayerState *state, uint64_t frames_to_skip, uint64
     return fast_forward_core_ex(state, frames_to_skip, base_sample, 1);
 }
 
-static int reopen_core_for_seek(PlayerState *state)
+static int reopen_core_for_seek(PlayerState *state, uint64_t *out_sample_pos)
 {
     Psf2CoreCallbacks callbacks;
     Psf2CoreBridgeResult result;
@@ -12448,6 +12689,9 @@ static int reopen_core_for_seek(PlayerState *state)
 
     if (state == NULL || state->provider == NULL) {
         return 0;
+    }
+    if (out_sample_pos != NULL) {
+        *out_sample_pos = 0;
     }
 
     lock_state(state);
@@ -12484,6 +12728,9 @@ static int reopen_core_for_seek(PlayerState *state)
     apply_voice_adsr_force_masks(state);
     clear_imported_voice_pitch_locks();
     clear_imported_voice_volume_locks();
+    if (!advance_ps2_core_to_audible_start(state, out_sample_pos)) {
+        return 0;
+    }
     return 1;
 }
 
@@ -12653,6 +12900,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     char game[128];
     char title[128];
     char window_title[512];
+    uint64_t seek_base_sample = 0;
     int path_changed;
 
     player_log("start playback begin path=%s start_sample=%llu",
@@ -12696,9 +12944,12 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
         reset_timbre_solo_locked(state);
         preview_free_samples_locked(state);
         reset_timbre_list_locked(state);
+        state->ps2_startup_origin_valid = 0;
+        state->ps2_startup_origin_sample = 0;
     }
     state->last_ps1_voice_diag_sample = 0;
     state->psf_version = normalize_saved_psf_version(read_psf_version(path));
+    state->startup_silence_trim = 0;
     state->total_samples = read_psf_length_samples(path);
     unlock_state(state);
     save_last_psf_version(state->psf_version);
@@ -12793,7 +13044,20 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     apply_voice_pmod_masks(state);
     apply_voice_adsr_force_masks(state);
 
-    if (start_sample > 0 && !fast_forward_core(state, start_sample, 0)) {
+    if (start_sample == 0 && state->psf_version == 0x02) {
+        lock_state(state);
+        state->startup_silence_trim = 1;
+        unlock_state(state);
+    }
+    if (start_sample > 0 && state->psf_version == 0x02 &&
+        !advance_ps2_core_to_audible_start(state, &seek_base_sample)) {
+        set_status(state, "Seek failed");
+        stop_playback(state);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return;
+    }
+    if (start_sample > seek_base_sample &&
+        !fast_forward_core(state, start_sample - seek_base_sample, seek_base_sample)) {
         set_status(state, "Seek failed");
         stop_playback(state);
         InvalidateRect(hwnd, NULL, FALSE);

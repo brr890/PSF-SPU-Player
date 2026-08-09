@@ -129,6 +129,7 @@ enum
 	TS_WAITDELAY,		// waiting on a time delay
 	TS_SLEEPING,		// sleeping
 	TS_CREATED,		// newly created, hasn't run yet
+	TS_DORMANT,		// exited and available to be started again
 
 	TS_MAXSTATE
 };
@@ -144,6 +145,7 @@ typedef struct
 	uint32_t refCon;		// user value passed in at CreateThread time
 
 	uint32_t waitparm;	// what we're waiting on if in one the TS_WAIT* states
+	int resume_advance;	// advance past an HLE call when this thread is restored
 
 	uint32_t save_regs[37];	// CPU registers belonging to this thread
 } Thread;
@@ -164,7 +166,7 @@ static size_t psf2log_bounded_strlen(const char *text, size_t max_len)
 }
 
 #if DEBUG_THREADING
-static char *_ThreadStateNames[TS_MAXSTATE] = { "RUNNING", "READY", "WAITEVFLAG", "WAITSEMA", "WAITDELAY", "SLEEPING", "CREATED" };
+static char *_ThreadStateNames[TS_MAXSTATE] = { "RUNNING", "READY", "WAITEVFLAG", "WAITSEMA", "WAITDELAY", "SLEEPING", "CREATED", "DORMANT" };
 #endif
 
 #if DEBUG_HLE_IOP
@@ -198,6 +200,8 @@ typedef struct
 static Counter root_cnts[4];	// 4 of the bastards
 
 #define CLOCK_DIV	(8)	// 33 MHz / this = what we run the R3000 at to keep the CPU usage not insane
+#define PS2_IOP_TICKS_PER_OUTPUT_SAMPLE (836u)
+#define PS2_SPU_DMA_COMPLETION_SAMPLES (1u)
 
 // counter modes
 #define RC_EN		(0x0001)	// halt
@@ -266,8 +270,10 @@ static void FreezeThread(int32_t iThread, int flag)
 	threads[iThread].save_regs[36] = mipsinfo.i;
 
 
-	// if a thread is freezing itself due to a IOP syscall, we must save the RA as the PC
-	// to come back to or else the syscall will recurse
+	// An HLE-blocked thread is saved at its return address, so it must resume
+	// there without advancing another instruction. Only a newly started thread
+	// uses resume_advance to consume the routine - 4 startup compensation.
+	threads[iThread].resume_advance = 0;
 	if (flag)
 	{
 		mips_get_info(CPUINFO_INT_REGISTER + MIPS_R31, &mipsinfo);
@@ -303,15 +309,16 @@ static void ThawThread(int32_t iThread)
 
 	// the first time a thread is put on the CPU,
 	// some special setup is required
-	if (threads[iThread].iState == TS_CREATED)
+	if (threads[iThread].iState == TS_CREATED || threads[iThread].iState == TS_DORMANT)
 	{
 		// PC = starting routine
-		threads[iThread].save_regs[34] = threads[iThread].routine-4;	// compensate for weird delay slot effects
+		threads[iThread].save_regs[34] = threads[iThread].routine - 4;
 		// SP = thread's stack area
 		threads[iThread].save_regs[29] = (threads[iThread].stackloc + threads[iThread].stacksize) - 16;
 		threads[iThread].save_regs[29] |= 0x80000000;
 
 		threads[iThread].save_regs[35] = threads[iThread].save_regs[36] = 0;
+		threads[iThread].resume_advance = 1;
 
 		#if DEBUG_THREADING
 //		printf("IOP: Initial setup for thread %d => PC %x SP %x\n", iThread, threads[iThread].save_regs[34]+4, threads[iThread].save_regs[29]);
@@ -347,6 +354,23 @@ static void ThawThread(int32_t iThread)
 	mips_set_info(CPUINFO_INT_REGISTER + MIPS_DELAYR, &mipsinfo);
 
 	threads[iThread].iState = TS_RUNNING;
+}
+
+static void ps2_reschedule(void);
+
+static void ps2_exit_current_thread(void)
+{
+	int32_t exited_thread = iCurThread;
+
+	if (exited_thread < 0 || exited_thread >= iNumThreads)
+	{
+		return;
+	}
+
+	memset(threads[exited_thread].save_regs, 0, sizeof(threads[exited_thread].save_regs));
+	threads[exited_thread].iState = TS_DORMANT;
+	iCurThread = -1;
+	ps2_reschedule();
 }
 
 // find a new thread to run
@@ -645,7 +669,8 @@ static void ps2_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 		SPU2readDMA4Mem(madr&0x1fffff, bcr);
 	}
 
-	dma4_delay = 80;
+	// The HLE transfer above is synchronous; report completion on the next sample.
+	dma4_delay = PS2_SPU_DMA_COMPLETION_SAMPLES;
 }
 
 static void ps2_dma7(uint32_t madr, uint32_t bcr, uint32_t chcr)
@@ -667,7 +692,7 @@ static void ps2_dma7(uint32_t madr, uint32_t bcr, uint32_t chcr)
 //		SPU2readDMA7Mem(madr&0x1fffff, bcr);
 	}
 
-	dma7_delay = 80;
+	dma7_delay = PS2_SPU_DMA_COMPLETION_SAMPLES;
 }
 
 static void psx_hw_write(offs_t offset, uint32_t data, uint32_t mem_mask)
@@ -1978,9 +2003,9 @@ void psx_hw_runcounters(void)
 		{
 			if (threads[i].iState == TS_WAITDELAY)
 			{
-				if (threads[i].waitparm > CLOCK_DIV)
+				if (threads[i].waitparm > PS2_IOP_TICKS_PER_OUTPUT_SAMPLE)
 				{
-					threads[i].waitparm -= CLOCK_DIV;
+					threads[i].waitparm -= PS2_IOP_TICKS_PER_OUTPUT_SAMPLE;
 				}
 				else	// time's up
 				{
@@ -2223,13 +2248,29 @@ static void iop_sprintf(char *out, char *fmt, uint32_t pstart)
 }
 
 // PS2 IOP callbacks
-void psx_iop_call(uint32_t pc, uint32_t callnum)
+static int ps2_iop_call_should_advance(int32_t calling_thread)
+{
+	if (iCurThread == calling_thread)
+	{
+		threads[iCurThread].resume_advance = 0;
+		return 1;
+	}
+	if (iCurThread >= 0 && threads[iCurThread].resume_advance)
+	{
+		threads[iCurThread].resume_advance = 0;
+		return 1;
+	}
+	return 0;
+}
+
+int psx_iop_call(uint32_t pc, uint32_t callnum)
 {
 	uint32_t scan;
 	char *mname, *str1, name[9], out[512];
 	uint32_t a0, a1, a2, a3;
 	union cpuinfo mipsinfo;
 	int i;
+	const int32_t calling_thread = iCurThread;
 
 //	printf("IOP call @ %08x\n", pc);
 
@@ -2252,7 +2293,7 @@ void psx_iop_call(uint32_t pc, uint32_t callnum)
 	if (psx_ram[scan] != LE32(0x41e00000))
 	{
 		printf("FATAL ERROR: couldn't find IOP link signature\n");
-		return;
+		return ps2_iop_call_should_advance(calling_thread);
 	}
 
 	scan += 3;	// skip zero and version
@@ -2378,6 +2419,11 @@ void psx_iop_call(uint32_t pc, uint32_t callnum)
 				FreezeThread(iCurThread, 1);
 				ThawThread(a0);
 				iCurThread = a0;
+				break;
+
+			case 8:	// ExitThread
+			case 9:	// ExitDeleteThread
+				ps2_exit_current_thread();
 				break;
 
 			case 20:// GetThreadID
@@ -2756,6 +2802,9 @@ void psx_iop_call(uint32_t pc, uint32_t callnum)
 				printf("IOP: WaitSema(%d) (cnt %d) (th %d) (PC=%x)\n", a0, iCurThread, semaphores[a0].current, mipsinfo.i);
 				#endif
 
+				mipsinfo.i = 0;
+				mips_set_info(CPUINFO_INT_REGISTER + MIPS_R2, &mipsinfo);
+
 				if (semaphores[a0].current > 0)
 				{
 					semaphores[a0].current--;
@@ -2765,11 +2814,10 @@ void psx_iop_call(uint32_t pc, uint32_t callnum)
 					FreezeThread(iCurThread, 1);
 					threads[iCurThread].iState = TS_WAITSEMA;
 					threads[iCurThread].waitparm = a0;
+					semaphores[a0].threadsWaiting++;
+					iCurThread = -1;
 					ps2_reschedule();
 				}
-
-				mipsinfo.i = 0;
-				mips_set_info(CPUINFO_INT_REGISTER + MIPS_R2, &mipsinfo);
 				break;
 
 			default:
@@ -3426,7 +3474,7 @@ void psx_iop_call(uint32_t pc, uint32_t callnum)
 						printf("IOP: out of file slots!\n");
 						mipsinfo.i = 0xffffffff;
 						mips_set_info(CPUINFO_INT_REGISTER + MIPS_R2, &mipsinfo);
-						return;
+						return ps2_iop_call_should_advance(calling_thread);
 					}
 
 					mname = (char *)psx_ram;
@@ -3440,12 +3488,12 @@ void psx_iop_call(uint32_t pc, uint32_t callnum)
 					{
 						mname += 8;
 					}
-					else if (!strncmp(mname, "host0:", 6))
-					{
-						mname += 7;
-					}
+				else if (!strncmp(mname, "host0:", 6))
+				{
+					mname += 7;
+				}
 
-					mips_get_info(CPUINFO_INT_REGISTER + MIPS_R31, &mipsinfo);
+				mips_get_info(CPUINFO_INT_REGISTER + MIPS_R31, &mipsinfo);
 					#if DEBUG_HLE_IOP
 					printf("IOP: open(\"%s\") (PC=%08x)\n", mname, mipsinfo.i);
 					#endif
@@ -3605,12 +3653,14 @@ void psx_iop_call(uint32_t pc, uint32_t callnum)
 					mipsinfo.i -= 4;
 					mips_set_info(CPUINFO_INT_PC, &mipsinfo);
 
-					return;
+					return ps2_iop_call_should_advance(calling_thread);
 				}
 			}
 		}
 
 		printf("IOP: Unhandled service %d for module %s\n", callnum, name);
 	}
+
+	return ps2_iop_call_should_advance(calling_thread);
 }
 /* Modified by brr890 for PSF SPU Player through 2026-07-21. */

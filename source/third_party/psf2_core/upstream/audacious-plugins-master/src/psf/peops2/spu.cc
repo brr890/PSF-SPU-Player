@@ -1245,20 +1245,10 @@ ENDX:   ;
    }
   else if((((u8*)pS)-((u8*)pSpuBuffer)) == (735*4))
    {
-    short *pSilenceIter = (short *)pSpuBuffer;
-    int iSilenceCount = 0;
-
-    for(; pSilenceIter < pS; pSilenceIter++)
-     {
-      if(*pSilenceIter == 0)
-       iSilenceCount++;
-
-      if(iSilenceCount > 20)
-       break;
-     }
-
-    if(iSilenceCount < 20)
-     update((u8*)pSpuBuffer,(u8*)pS-(u8*)pSpuBuffer);
+    // A normal stereo block can contain many zero crossings or a silent side.
+    // Dropping the whole block after 20 zero samples muted sparse PSF2 tracks
+    // and could make playback appear to stop after the first note.
+    update((u8*)pSpuBuffer,(u8*)pS-(u8*)pSpuBuffer);
 
     pS=(short *)pSpuBuffer;
    }
@@ -1305,6 +1295,32 @@ EXPORT_GCC long CALLBACK SPU2init(void)
  spuMemC=(unsigned char *)spuMem;                      // just small setup
  memset((void *)s_chan,0,MAXCHAN*sizeof(SPUCHAN2));
  memset(rvb,0,2*sizeof(REVERBInfo2));
+ memset(regArea,0,sizeof(regArea));
+ memset(spuMem,0,sizeof(spuMem));
+
+ dwNoiseVal=1;
+ dwNewChannel2[0]=0;
+ dwNewChannel2[1]=0;
+ dwEndChannel2[0]=0;
+ dwEndChannel2[1]=0;
+ spuCtrl2[0]=0;
+ spuCtrl2[1]=0;
+ spuStat2[0]=0;
+ spuStat2[1]=0;
+ spuIrq2[0]=0;
+ spuIrq2[1]=0;
+ spuAddr2[0]=0xffffffff;
+ spuAddr2[1]=0xffffffff;
+ spuRvbAddr2[0]=0;
+ spuRvbAddr2[1]=0;
+ spuRvbAEnd2[0]=0;
+ spuRvbAEnd2[1]=0;
+ pSpuIrq[0]=0;
+ pSpuIrq[1]=0;
+ iCycle=0;
+ iSpuAsyncWait=0;
+ lastch=-1;
+ iSecureStart=0;
 
  sampcount = 0;
  seektime = 0;
