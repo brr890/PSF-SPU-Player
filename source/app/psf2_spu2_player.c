@@ -48,6 +48,7 @@
 #define PLAYER_TRACK_SWITCH_FADE_FRAMES 256u
 #define VOICE_DISPLAY_HOLD_SAMPLES ((PLAYER_SAMPLE_RATE * 100u) / 1000u)
 #define TIMBRE_SOLO_MAX_KEYS 64u
+#define TIMBRE_SOLO_LOOKUP_SIZE 128u
 #define TIMBRE_GROUP_MAX_SAMPLE_GAP 0x0800u
 #define TIMBRE_PS2_GROUP_MAX_SAMPLE_GAP 0x0200u
 #define TIMBRE_PERCUSSION_MAX_SAMPLE_GAP 0x1000u
@@ -313,6 +314,17 @@ typedef struct PlayerState {
     CRITICAL_SECTION lock;
     int lock_ready;
     HWND hwnd;
+    HDC paint_dc;
+    HBITMAP paint_bitmap;
+    HBITMAP paint_old_bitmap;
+    HFONT meter_font;
+    int meter_line_height;
+    int paint_width;
+    int paint_height;
+    uint64_t display_render_sequence;
+    int display_render_source;
+    int gauge_only_paint_pending;
+    int paint_frame_initialized;
     HWND open_button;
     HWND play_button;
     HWND pause_button;
@@ -366,7 +378,11 @@ typedef struct PlayerState {
     COLORREF theme_lr_custom_color[2];
     COLORREF custom_colors[CUSTOM_COLOR_COUNT];
     uint64_t total_samples;
-    uint64_t last_ps1_voice_diag_sample;
+    uint64_t time_label_tenths;
+    uint64_t time_label_total_samples;
+    int time_label_cache_valid;
+    uint64_t last_gauge_update_ms;
+    int gauge_animation_active;
     uint8_t key_on_event_buffers[2][24];
     uint8_t release_event_buffers[2][24];
     uint8_t release_event_latched[2][24];
@@ -1275,6 +1291,8 @@ static void reset_live_display(PlayerState *state)
     ZeroMemory(state->gauge_vol_l, sizeof(state->gauge_vol_l));
     ZeroMemory(state->gauge_vol_r, sizeof(state->gauge_vol_r));
     ZeroMemory(state->gauge_valid, sizeof(state->gauge_valid));
+    state->last_gauge_update_ms = 0;
+    state->gauge_animation_active = 0;
     ZeroMemory(state->audio_display_snapshots, sizeof(state->audio_display_snapshots));
     ZeroMemory(&state->audible_display_snapshot, sizeof(state->audible_display_snapshot));
     state->audible_display_valid = 0;
@@ -1330,6 +1348,8 @@ static void reset_stopped_display(PlayerState *state)
     ZeroMemory(state->gauge_vol_l, sizeof(state->gauge_vol_l));
     ZeroMemory(state->gauge_vol_r, sizeof(state->gauge_vol_r));
     ZeroMemory(state->gauge_valid, sizeof(state->gauge_valid));
+    state->last_gauge_update_ms = 0;
+    state->gauge_animation_active = 0;
     ZeroMemory(state->audio_display_snapshots, sizeof(state->audio_display_snapshots));
     ZeroMemory(&state->audible_display_snapshot, sizeof(state->audible_display_snapshot));
     state->audible_display_valid = 0;
@@ -1972,16 +1992,13 @@ static void apply_window_theme(HWND hwnd, PlayerState *state)
 
 static void fill_player_background(HDC hdc, const RECT *rect, const PlayerState *state)
 {
-    HBRUSH brush;
+    HBRUSH brush = (HBRUSH)GetStockObject(DC_BRUSH);
 
     if (hdc == NULL || rect == NULL) {
         return;
     }
-    brush = CreateSolidBrush(player_background_color(state));
-    if (brush != NULL) {
-        FillRect(hdc, rect, brush);
-        DeleteObject(brush);
-    }
+    SetDCBrushColor(hdc, player_background_color(state));
+    FillRect(hdc, rect, brush);
 }
 
 static int is_dark_owner_draw_button_id(unsigned id)
@@ -3367,18 +3384,47 @@ static void effective_voice_mute_masks_locked(
     uint32_t *core1_mask)
 {
     uint32_t masks[2];
+    uint32_t selected_keys[TIMBRE_SOLO_LOOKUP_SIZE];
     unsigned core;
     unsigned voice;
 
     masks[0] = state->voice_mute_mask[0] & 0x00ffffffu;
     masks[1] = state->voice_mute_mask[1] & 0x00ffffffu;
     if (state->timbre_solo_enabled && state->timbre_solo_key_count > 0) {
+        unsigned selected;
+
+        ZeroMemory(selected_keys, sizeof(selected_keys));
+        for (selected = 0; selected < state->timbre_solo_key_count; ++selected) {
+            uint32_t key = state->timbre_solo_keys[selected];
+            unsigned slot;
+
+            if (key == 0) {
+                continue;
+            }
+            slot = (unsigned)((key * 2654435761u) & (TIMBRE_SOLO_LOOKUP_SIZE - 1u));
+            while (selected_keys[slot] != 0 && selected_keys[slot] != key) {
+                slot = (slot + 1u) & (TIMBRE_SOLO_LOOKUP_SIZE - 1u);
+            }
+            selected_keys[slot] = key;
+        }
         for (core = 0; core < 2; ++core) {
             for (voice = 0; voice < 24; ++voice) {
                 const Spu2LogVoiceSnapshot *snapshot = &live->voices[core][voice];
+                uint32_t key = voice_timbre_key(snapshot);
                 uint32_t bit = 1u << voice;
+                unsigned slot = (unsigned)((key * 2654435761u) & (TIMBRE_SOLO_LOOKUP_SIZE - 1u));
+                int selected_voice = 0;
 
-                if (timbre_solo_has_key_locked(state, voice_timbre_key(snapshot))) {
+                if (key != 0) {
+                    while (selected_keys[slot] != 0) {
+                        if (selected_keys[slot] == key) {
+                            selected_voice = 1;
+                            break;
+                        }
+                        slot = (slot + 1u) & (TIMBRE_SOLO_LOOKUP_SIZE - 1u);
+                    }
+                }
+                if (selected_voice) {
                     masks[core] &= ~bit;
                 } else {
                     masks[core] |= bit;
@@ -6877,39 +6923,77 @@ static void format_voice_mode_columns(
 {
     char modulation = (flags & SPU2LOG_VOICE_PMOD) ? (psf_version == 0x01u ? 'F' : 'P') : '.';
 
-    snprintf(buffer,
-        size,
-        "%c %c %c %c",
-        key_on_pulse ? 'K' : '.',
-        release_pulse ? 'R' : '.',
-        (flags & SPU2LOG_VOICE_NOISE) ? 'N' : '.',
-        modulation);
+    if (buffer == NULL || size == 0) {
+        return;
+    }
+    if (size < 8u) {
+        buffer[0] = '\0';
+        return;
+    }
+    buffer[0] = key_on_pulse ? 'K' : '.';
+    buffer[1] = ' ';
+    buffer[2] = release_pulse ? 'R' : '.';
+    buffer[3] = ' ';
+    buffer[4] = (flags & SPU2LOG_VOICE_NOISE) ? 'N' : '.';
+    buffer[5] = ' ';
+    buffer[6] = modulation;
+    buffer[7] = '\0';
 }
 
 static void format_adsr_rate_columns(char *buffer, size_t size, uint16_t adsr1, uint16_t adsr2)
 {
+    static const char hex_digits[] = "0123456789ABCDEF";
     unsigned attack_rate = (unsigned)((adsr1 >> 8) & 0x7fu);
     unsigned decay_rate = (unsigned)((adsr1 >> 4) & 0x0fu);
     unsigned sustain_level = (unsigned)(adsr1 & 0x0fu);
     unsigned sustain_rate = (unsigned)((adsr2 >> 6) & 0x7fu);
     unsigned release_rate = (unsigned)(adsr2 & 0x1fu);
 
-    snprintf(buffer,
-        size,
-        "%02X %02X %02X %02X %02X",
-        attack_rate,
-        decay_rate,
-        sustain_level,
-        sustain_rate,
-        release_rate);
+    if (buffer == NULL || size == 0) {
+        return;
+    }
+    if (size < 15u) {
+        buffer[0] = '\0';
+        return;
+    }
+    buffer[0] = hex_digits[(attack_rate >> 4) & 0x0fu];
+    buffer[1] = hex_digits[attack_rate & 0x0fu];
+    buffer[2] = ' ';
+    buffer[3] = hex_digits[(decay_rate >> 4) & 0x0fu];
+    buffer[4] = hex_digits[decay_rate & 0x0fu];
+    buffer[5] = ' ';
+    buffer[6] = hex_digits[(sustain_level >> 4) & 0x0fu];
+    buffer[7] = hex_digits[sustain_level & 0x0fu];
+    buffer[8] = ' ';
+    buffer[9] = hex_digits[(sustain_rate >> 4) & 0x0fu];
+    buffer[10] = hex_digits[sustain_rate & 0x0fu];
+    buffer[11] = ' ';
+    buffer[12] = hex_digits[(release_rate >> 4) & 0x0fu];
+    buffer[13] = hex_digits[release_rate & 0x0fu];
+    buffer[14] = '\0';
 }
 
-static void format_adsr_rate_header_for_psf(char *buffer, size_t size, uint8_t psf_version)
+static void write_hex_u16(char *buffer, uint16_t value)
 {
-    snprintf(buffer,
-        size,
-        "K R N %c Rv AR DR SL SR RR",
-        psf_version == 0x01u ? 'F' : 'P');
+    static const char hex_digits[] = "0123456789ABCDEF";
+
+    buffer[0] = hex_digits[(value >> 12) & 0x0fu];
+    buffer[1] = hex_digits[(value >> 8) & 0x0fu];
+    buffer[2] = hex_digits[(value >> 4) & 0x0fu];
+    buffer[3] = hex_digits[value & 0x0fu];
+}
+
+static void format_hex_u16(char buffer[5], uint16_t value)
+{
+    write_hex_u16(buffer, value);
+    buffer[4] = '\0';
+}
+
+static const char *adsr_rate_header_for_psf(uint8_t psf_version)
+{
+    return psf_version == 0x01u ?
+        "K R N F Rv AR DR SL SR RR" :
+        "K R N P Rv AR DR SL SR RR";
 }
 
 static unsigned noise_clock_from_core_flags(uint32_t flags)
@@ -7006,12 +7090,17 @@ static uint32_t smooth_gauge_value(uint32_t current, uint32_t target, uint32_t m
     }
 
     delta = current - target;
-    step = (delta + 2u) / 3u;
+    step = (delta + 3u) / 4u;
     return current - (step != 0 ? step : 1u);
 }
 
 static void update_gauge_display_values(PlayerState *state, const Spu2LogLiveState *live, uint8_t psf_version)
 {
+    uint64_t now_ms;
+    uint64_t elapsed_ms;
+    unsigned smoothing_steps = 1u;
+    unsigned core_count;
+    int animation_active = 0;
     unsigned core;
     unsigned voice;
 
@@ -7019,12 +7108,26 @@ static void update_gauge_display_values(PlayerState *state, const Spu2LogLiveSta
         return;
     }
 
-    for (core = 0; core < 2; ++core) {
+    now_ms = GetTickCount64();
+    if (state->last_gauge_update_ms != 0u && now_ms >= state->last_gauge_update_ms) {
+        elapsed_ms = now_ms - state->last_gauge_update_ms;
+        smoothing_steps = (unsigned)((elapsed_ms + PLAYER_TIMER_MS - 1u) / PLAYER_TIMER_MS);
+        if (smoothing_steps < 1u) {
+            smoothing_steps = 1u;
+        } else if (smoothing_steps > 8u) {
+            smoothing_steps = 8u;
+        }
+    }
+    state->last_gauge_update_ms = now_ms;
+    core_count = psf_version == 0x01u ? 1u : 2u;
+
+    for (core = 0; core < core_count; ++core) {
         for (voice = 0; voice < 24; ++voice) {
             const Spu2LogVoiceSnapshot *v = &live->voices[core][voice];
             uint32_t env_target = v->envx;
             uint32_t vol_l_target;
             uint32_t vol_r_target;
+            unsigned smoothing_step;
 
             if (psf_version == 0x01u) {
                 vol_l_target = ps1_volume_bar_value(v->vol_l, v->vol_r);
@@ -7042,11 +7145,18 @@ static void update_gauge_display_values(PlayerState *state, const Spu2LogLiveSta
                 continue;
             }
 
-            state->gauge_env[core][voice] = smooth_gauge_value(state->gauge_env[core][voice], env_target, 0x7fffu);
+            for (smoothing_step = 0; smoothing_step < smoothing_steps; ++smoothing_step) {
+                state->gauge_env[core][voice] = smooth_gauge_value(
+                    state->gauge_env[core][voice], env_target, 0x7fffu);
+            }
+            if (state->gauge_env[core][voice] != env_target) {
+                animation_active = 1;
+            }
             state->gauge_vol_l[core][voice] = vol_l_target;
             state->gauge_vol_r[core][voice] = vol_r_target;
         }
     }
+    state->gauge_animation_active = animation_active;
 }
 
 static void format_elapsed_time(char *buffer, size_t size, uint64_t sample_pos, uint32_t sample_rate)
@@ -7983,6 +8093,7 @@ static void update_time_label(PlayerState *state)
     char label[80];
     uint64_t sample_pos;
     uint64_t total_samples;
+    uint64_t displayed_tenths;
 
     if (state == NULL || state->time_label == NULL) {
         return;
@@ -7997,6 +8108,17 @@ static void update_time_label(PlayerState *state)
         sample_pos = state->live.last_sample_pos;
     }
     total_samples = state->total_samples;
+    displayed_tenths = ((sample_pos * 10u) + (PLAYER_SAMPLE_RATE / 2u)) /
+        PLAYER_SAMPLE_RATE;
+    if (state->time_label_cache_valid &&
+        state->time_label_tenths == displayed_tenths &&
+        state->time_label_total_samples == total_samples) {
+        unlock_state(state);
+        return;
+    }
+    state->time_label_tenths = displayed_tenths;
+    state->time_label_total_samples = total_samples;
+    state->time_label_cache_valid = 1;
     unlock_state(state);
 
     format_elapsed_time(elapsed, sizeof(elapsed), sample_pos, PLAYER_SAMPLE_RATE);
@@ -8031,15 +8153,11 @@ static void draw_bar(
     uint32_t value,
     uint32_t max_value,
     COLORREF fill_color,
-    COLORREF background_color,
-    COLORREF border_color)
+    COLORREF background_color)
 {
     RECT border;
     RECT fill;
-    HBRUSH fill_brush;
-    HBRUSH background_brush;
-    HBRUSH border_brush;
-    HBRUSH old_brush;
+    HBRUSH brush = (HBRUSH)GetStockObject(DC_BRUSH);
     int fill_width;
 
     value = clamp_u32(value, max_value);
@@ -8050,16 +8168,8 @@ static void draw_bar(
     border.right = x + width;
     border.bottom = y + height;
 
-    background_brush = CreateSolidBrush(background_color);
-    if (background_brush != NULL) {
-        FillRect(hdc, &border, background_brush);
-        DeleteObject(background_brush);
-    }
-    border_brush = CreateSolidBrush(border_color);
-    if (border_brush != NULL) {
-        FrameRect(hdc, &border, border_brush);
-        DeleteObject(border_brush);
-    }
+    SetDCBrushColor(hdc, background_color);
+    Rectangle(hdc, border.left, border.top, border.right, border.bottom);
 
     if (fill_width <= 1) {
         return;
@@ -8070,11 +8180,8 @@ static void draw_bar(
     fill.right = x + fill_width;
     fill.bottom = y + height - 1;
 
-    fill_brush = CreateSolidBrush(fill_color);
-    old_brush = (HBRUSH)SelectObject(hdc, fill_brush);
-    PatBlt(hdc, fill.left, fill.top, fill.right - fill.left, fill.bottom - fill.top, PATCOPY);
-    SelectObject(hdc, old_brush);
-    DeleteObject(fill_brush);
+    SetDCBrushColor(hdc, fill_color);
+    FillRect(hdc, &fill, brush);
 }
 
 static void draw_stereo_bar(
@@ -8088,16 +8195,12 @@ static void draw_stereo_bar(
     uint32_t max_value,
     COLORREF left_color,
     COLORREF right_color,
-    COLORREF background_color,
-    COLORREF border_color)
+    COLORREF background_color)
 {
     RECT border;
     RECT left_fill;
     RECT right_fill;
-    HBRUSH brush;
-    HBRUSH background_brush;
-    HBRUSH border_brush;
-    HBRUSH old_brush;
+    HBRUSH brush = (HBRUSH)GetStockObject(DC_BRUSH);
     int left_width;
     int right_width;
     int mid;
@@ -8120,27 +8223,16 @@ static void draw_stereo_bar(
     border.top = y;
     border.right = x + width;
     border.bottom = y + height;
-    background_brush = CreateSolidBrush(background_color);
-    if (background_brush != NULL) {
-        FillRect(hdc, &border, background_brush);
-        DeleteObject(background_brush);
-    }
-    border_brush = CreateSolidBrush(border_color);
-    if (border_brush != NULL) {
-        FrameRect(hdc, &border, border_brush);
-        DeleteObject(border_brush);
-    }
+    SetDCBrushColor(hdc, background_color);
+    Rectangle(hdc, border.left, border.top, border.right, border.bottom);
 
     if (left_width > 1) {
         left_fill.left = x + 1;
         left_fill.top = y + 1;
         left_fill.right = x + left_width;
         left_fill.bottom = mid;
-        brush = CreateSolidBrush(left_color);
-        old_brush = (HBRUSH)SelectObject(hdc, brush);
-        PatBlt(hdc, left_fill.left, left_fill.top, left_fill.right - left_fill.left, left_fill.bottom - left_fill.top, PATCOPY);
-        SelectObject(hdc, old_brush);
-        DeleteObject(brush);
+        SetDCBrushColor(hdc, left_color);
+        FillRect(hdc, &left_fill, brush);
     }
 
     if (right_width > 1) {
@@ -8148,11 +8240,8 @@ static void draw_stereo_bar(
         right_fill.top = mid;
         right_fill.right = x + right_width;
         right_fill.bottom = y + height - 1;
-        brush = CreateSolidBrush(right_color);
-        old_brush = (HBRUSH)SelectObject(hdc, brush);
-        PatBlt(hdc, right_fill.left, right_fill.top, right_fill.right - right_fill.left, right_fill.bottom - right_fill.top, PATCOPY);
-        SelectObject(hdc, old_brush);
-        DeleteObject(brush);
+        SetDCBrushColor(hdc, right_color);
+        FillRect(hdc, &right_fill, brush);
     }
 }
 
@@ -8219,23 +8308,10 @@ static int visible_voice_count(const Spu2LogLiveState *state, unsigned core, int
     return count;
 }
 
-static int active_voice_count(const Spu2LogLiveState *state, unsigned core)
-{
-    unsigned voice;
-    int count = 0;
-
-    for (voice = 0; voice < 24; ++voice) {
-        if (state->voices[core][voice].active) {
-            ++count;
-        }
-    }
-
-    return count;
-}
-
-static void adsr_phase_counts(
+static void voice_status_counts(
     const Spu2LogLiveState *state,
     unsigned core,
+    int *active,
     int *attack,
     int *decay,
     int *sustain,
@@ -8243,6 +8319,7 @@ static void adsr_phase_counts(
 {
     unsigned voice;
 
+    *active = 0;
     *attack = 0;
     *decay = 0;
     *sustain = 0;
@@ -8251,6 +8328,9 @@ static void adsr_phase_counts(
     for (voice = 0; voice < 24; ++voice) {
         const Spu2LogVoiceSnapshot *snapshot = &state->voices[core][voice];
 
+        if (snapshot->active) {
+            *active += 1;
+        }
         if (snapshot->active && snapshot->adsr_phase == SPU2LOG_ADSR_RELEASE) {
             *release += 1;
             continue;
@@ -8274,6 +8354,33 @@ static void adsr_phase_counts(
             break;
         }
     }
+}
+
+static int active_voice_count(const Spu2LogLiveState *state, unsigned core)
+{
+    unsigned voice;
+    int count = 0;
+
+    for (voice = 0; voice < 24; ++voice) {
+        if (state->voices[core][voice].active) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+static void adsr_phase_counts(
+    const Spu2LogLiveState *state,
+    unsigned core,
+    int *attack,
+    int *decay,
+    int *sustain,
+    int *release)
+{
+    int active;
+
+    voice_status_counts(state, core, &active, attack, decay, sustain, release);
+    (void)active;
 }
 
 static int calculate_content_height(HDC hdc, const PlayerState *state)
@@ -8517,53 +8624,6 @@ static Spu2LogResult player_voice_snapshot(
     }
     state->live.voices[merged.core][merged.voice] = merged;
     state->stopped_display = 0;
-    if (state->psf_version == 0x01u &&
-        sample_pos >= (uint64_t)PLAYER_SAMPLE_RATE * 12u &&
-        sample_pos >= state->last_ps1_voice_diag_sample + ((uint64_t)PLAYER_SAMPLE_RATE / 4u)) {
-        unsigned voice;
-        unsigned active_count = 0;
-        unsigned sounding_count = 0;
-        unsigned release_count = 0;
-        char details[1536];
-        size_t offset = 0;
-
-        for (voice = 0; voice < 24; ++voice) {
-            const Spu2LogVoiceSnapshot *v = &state->live.voices[0][voice];
-            int sounding = is_voice_really_sounding(v);
-            if (v->active) {
-                active_count += 1;
-            }
-            if (sounding) {
-                sounding_count += 1;
-            }
-            if ((v->flags & SPU2LOG_VOICE_RELEASE) != 0) {
-                release_count += 1;
-            }
-        }
-        if (sounding_count >= 22 || active_count >= 22) {
-            state->last_ps1_voice_diag_sample = sample_pos;
-            for (voice = 0; voice < 24 && offset + 64 < sizeof(details); ++voice) {
-                const Spu2LogVoiceSnapshot *v = &state->live.voices[0][voice];
-                offset += (size_t)snprintf(details + offset,
-                    sizeof(details) - offset,
-                    " %02u:%c%c e%04X p%04X s%05X n%05X",
-                    voice,
-                    v->active ? 'A' : '.',
-                    (v->flags & SPU2LOG_VOICE_RELEASE) ? 'R' : '.',
-                    v->envx,
-                    v->pitch,
-                    v->ssa,
-                    v->nax);
-            }
-            player_log("ps1 voice diag sample=%llu sec=%.2f active=%u sounding=%u release=%u%s",
-                (unsigned long long)sample_pos,
-                (double)sample_pos / (double)PLAYER_SAMPLE_RATE,
-                active_count,
-                sounding_count,
-                release_count,
-                details);
-        }
-    }
     state->live.last_sample_pos = sample_pos;
     if (state->frame_advance && state->frame_live_valid &&
         state->frame_capture_until != 0 &&
@@ -10396,7 +10456,7 @@ static DWORD WINAPI playback_thread_proc(void *user)
 
                 /* Keep every retained song sample, but avoid handing waveOut
                    a very short first buffer when the onset falls near the end
-                   of PeOPS2's 735-frame block. */
+                   of the render block. */
                 ZeroMemory(startup_silence, sizeof(startup_silence));
                 ZeroMemory(startup_packet, sizeof(startup_packet));
                 memcpy(startup_packet + silence_frames * 2u,
@@ -12707,7 +12767,6 @@ static int reopen_core_for_seek(PlayerState *state, uint64_t *out_sample_pos)
     }
 
     reset_live_display(state);
-    state->last_ps1_voice_diag_sample = 0;
     ZeroMemory(&callbacks, sizeof(callbacks));
     callbacks.user = state;
     callbacks.spu2_write16 = player_spu2_write16;
@@ -12883,7 +12942,6 @@ static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
     reset_live_display(state);
     lock_state(state);
     state->live.last_sample_pos = 0;
-    state->last_ps1_voice_diag_sample = 0;
     unlock_state(state);
     if (state->timbre_hwnd != NULL) {
         timbre_refresh_listbox(state);
@@ -12947,7 +13005,6 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
         state->ps2_startup_origin_valid = 0;
         state->ps2_startup_origin_sample = 0;
     }
-    state->last_ps1_voice_diag_sample = 0;
     state->psf_version = normalize_saved_psf_version(read_psf_version(path));
     state->startup_silence_trim = 0;
     state->total_samples = read_psf_length_samples(path);
@@ -13206,16 +13263,67 @@ static void frame_advance_tick(HWND hwnd, PlayerState *state, int delta_ticks)
 
 static void render_playback_tick(HWND hwnd, PlayerState *state)
 {
+    RECT redraw_rect;
+    uint64_t render_sequence;
+    int render_source;
+    int gauge_only;
+    int same_render_state;
+    int skip_draw;
+    int line_height;
+    uint8_t psf_version;
+
     if (state == NULL) {
         return;
     }
 
     update_time_label(state);
-    if (state->playback_only) {
+    if (state->playback_only || IsIconic(hwnd) || !IsWindowVisible(hwnd)) {
         return;
     }
-    update_scrollbar(hwnd, state);
-    InvalidateRect(hwnd, NULL, FALSE);
+
+    lock_state(state);
+    if (state->frame_advance && state->frame_live_valid) {
+        render_source = 3;
+        render_sequence = state->sequence;
+    } else if (!state->frame_advance && state->audible_display_valid) {
+        render_source = 2;
+        render_sequence = state->audible_display_snapshot.sequence;
+    } else {
+        render_source = 1;
+        render_sequence = state->sequence;
+    }
+    same_render_state = state->display_render_source == render_source &&
+        state->display_render_sequence == render_sequence;
+    gauge_only = state->playing && !state->frame_advance &&
+        state->audible_display_valid && state->paint_frame_initialized &&
+        state->gauge_animation_active && same_render_state;
+    skip_draw = state->playing && !state->frame_advance &&
+        state->audible_display_valid && state->paint_frame_initialized &&
+        !state->gauge_animation_active &&
+        state->display_render_source == render_source &&
+        state->display_render_sequence == render_sequence;
+    state->display_render_source = render_source;
+    state->display_render_sequence = render_sequence;
+    state->gauge_only_paint_pending = gauge_only;
+    line_height = state->meter_line_height > 0 ? state->meter_line_height : 16;
+    psf_version = state->psf_version;
+    unlock_state(state);
+
+    if (skip_draw) {
+        return;
+    }
+
+    GetClientRect(hwnd, &redraw_rect);
+    if (gauge_only) {
+        redraw_rect.left = CORE0_X + COL_ENV_BAR_X;
+        redraw_rect.top = 2 + CONTROLS_HEIGHT + (line_height * 2);
+        redraw_rect.right = psf_version == 0x01u ?
+            CORE0_X + COL_VOL_BAR_X + 100 :
+            CORE1_X + COL_VOL_BAR_X + 100;
+    } else {
+        redraw_rect.top = CONTROLS_HEIGHT;
+    }
+    InvalidateRect(hwnd, &redraw_rect, FALSE);
 }
 
 static void paint_core_panel(
@@ -13249,127 +13357,183 @@ static void paint_core_panel(
     COLORREF inactive_text_color,
     COLORREF muted_text_color,
     COLORREF gauge_background_color,
-    COLORREF gauge_border_color)
+    COLORREF gauge_border_color,
+    int gauges_only)
 {
     unsigned voice;
-    char line[1024];
+    char line[160];
+    const char *adsr_header;
+    POLYTEXTA header_text[4];
+    POLYTEXTA row_text[3];
     const Spu2LogCoreSnapshot *core_state = &live->cores[core];
-    int active_count = active_voice_count(live, core);
+    int active_count;
     int attack_count;
     int decay_count;
     int sustain_count;
     int release_count;
-    unsigned noise_clock = noise_clock_from_core_flags(core_state->flags);
-    unsigned noise_hz = noise_clock_frequency_hz(noise_clock);
+    unsigned noise_clock;
+    unsigned noise_hz;
     COLORREF env_color = env_color_from_index(env_color_index, env_custom_color);
     COLORREF lr_left_color = lr_left_color_from_index(lr_color_index, lr_custom_color);
     COLORREF lr_right_color = lr_right_color_from_index(lr_color_index, lr_custom_color);
+    COLORREF current_text_color = active_text_color;
 
-    adsr_phase_counts(
-        live,
-        core,
-        &attack_count,
-        &decay_count,
-        &sustain_count,
-        &release_count);
-    if (show_core_label) {
-        snprintf(line, sizeof(line),
-            "Core %u  active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%uHz)",
+    SetDCPenColor(hdc, gauge_border_color);
+    if (!gauges_only) {
+        SetTextColor(hdc, active_text_color);
+        voice_status_counts(
+            live,
             core,
-            active_count,
-            attack_count,
-            decay_count,
-            sustain_count,
-            release_count,
-            core_state->reverb_l,
-            core_state->reverb_r,
-            noise_clock,
-            noise_hz);
-    } else {
-        snprintf(line, sizeof(line),
-            "active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%uHz)",
-            active_count,
-            attack_count,
-            decay_count,
-            sustain_count,
-            release_count,
-            core_state->reverb_l,
-            core_state->reverb_r,
-            noise_clock,
-            noise_hz);
-    }
-    TextOutA(hdc, x, y, line, (int)strlen(line));
-    y += line_height;
+            &active_count,
+            &attack_count,
+            &decay_count,
+            &sustain_count,
+            &release_count);
+        noise_clock = noise_clock_from_core_flags(core_state->flags);
+        noise_hz = noise_clock_frequency_hz(noise_clock);
+        if (show_core_label) {
+            snprintf(line, sizeof(line),
+                "Core %u  active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%uHz)",
+                core,
+                active_count,
+                attack_count,
+                decay_count,
+                sustain_count,
+                release_count,
+                core_state->reverb_l,
+                core_state->reverb_r,
+                noise_clock,
+                noise_hz);
+        } else {
+            snprintf(line, sizeof(line),
+                "active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%uHz)",
+                active_count,
+                attack_count,
+                decay_count,
+                sustain_count,
+                release_count,
+                core_state->reverb_l,
+                core_state->reverb_r,
+                noise_clock,
+                noise_hz);
+        }
+        TextOutA(hdc, x, y, line, (int)strlen(line));
+        y += line_height;
 
-    snprintf(line, sizeof(line), "Vo On ADSR        Vol L/R    Pitch");
-    TextOutA(hdc, x + COL_TEXT_X, y, line, (int)strlen(line));
-    TextOutA(hdc, x + COL_ENV_TEXT_X, y, "Env", 3);
-    TextOutA(hdc, x + COL_VOL_BAR_X, y, "Vol L/R", 7);
-    format_adsr_rate_header_for_psf(line, sizeof(line), psf_version);
-    TextOutA(hdc, x + COL_FLAGS_X, y, line, (int)strlen(line));
-    y += line_height;
+        adsr_header = adsr_rate_header_for_psf(psf_version);
+        ZeroMemory(header_text, sizeof(header_text));
+        header_text[0].x = x + COL_TEXT_X;
+        header_text[0].y = y;
+        header_text[0].n = 34;
+        header_text[0].lpstr = (LPSTR)"Vo On ADSR        Vol L/R    Pitch";
+        header_text[1].x = x + COL_ENV_TEXT_X;
+        header_text[1].y = y;
+        header_text[1].n = 3;
+        header_text[1].lpstr = (LPSTR)"Env";
+        header_text[2].x = x + COL_VOL_BAR_X;
+        header_text[2].y = y;
+        header_text[2].n = 7;
+        header_text[2].lpstr = (LPSTR)"Vol L/R";
+        header_text[3].x = x + COL_FLAGS_X;
+        header_text[3].y = y;
+        header_text[3].n = (UINT)strlen(adsr_header);
+        header_text[3].lpstr = adsr_header;
+        PolyTextOutA(hdc, header_text, 4);
+        y += line_height;
+
+        ZeroMemory(row_text, sizeof(row_text));
+        row_text[0].x = x + COL_TEXT_X;
+        row_text[1].x = x + COL_ENV_TEXT_X;
+        row_text[1].n = 4u;
+        row_text[2].x = x + COL_FLAGS_X;
+        row_text[2].n = 25u;
+    } else {
+        y += line_height * 2;
+    }
 
     for (voice = 0; voice < 24; ++voice) {
         const Spu2LogVoiceSnapshot *v = &live->voices[core][voice];
-        char modes[32];
-        char rates[32];
-        char voice_detail[96];
-        char pitch_text[8];
+        char modes[8];
+        char rates[15];
+        char voice_detail[26];
+        char env_text[5];
+        const char *phase_label;
+        size_t phase_length;
+        int line_length = 33;
         int row_y = y;
         int ps2_env_off = psf_version != 0x01u && v->envx == 0;
         int active = ps2_env_off ? 0 : is_voice_active(v);
-        int hide_voice_detail = 0;
         int muted = (voice_mute_mask[core] & (1u << voice)) != 0;
-        uint32_t flags = ps2_env_off ? 0 : effective_voice_flags(
-            v->flags,
-            voice_reverb_force_on_mask[core],
-            voice_reverb_force_off_mask[core],
-            voice_noise_force_on_mask[core],
-            voice_noise_force_off_mask[core],
-            voice_pmod_force_on_mask[core],
-            voice_pmod_force_off_mask[core],
-            voice);
-        int key_on_pulse = !ps2_env_off && key_on_events[core][voice] != 0;
-        int release_pulse = !ps2_env_off && release_events[core][voice] != 0;
-        COLORREF old_text_color;
+        uint32_t flags;
+        int key_on_pulse;
+        int release_pulse;
+        COLORREF row_text_color;
 
         if (hide_inactive && !active) {
             continue;
         }
 
-        format_voice_mode_columns(modes, sizeof(modes), flags, key_on_pulse, release_pulse, psf_version);
-        format_adsr_rate_columns(rates, sizeof(rates), v->adsr1, v->adsr2);
-        if (hide_voice_detail) {
-            snprintf(line, sizeof(line), "%02u", voice);
-            pitch_text[0] = '\0';
-        } else {
-            snprintf(pitch_text, sizeof(pitch_text), "%04X", v->pitch);
-            snprintf(line, sizeof(line), "%02u %c  %-11s %04X/%04X  %4s",
-                voice,
-                v->envx >= 1 ? '*' : ' ',
-                adsr_state_label(v->adsr_phase, v->adsr1, v->adsr2),
-                v->vol_l,
-                v->vol_r,
-                pitch_text);
+        if (!gauges_only) {
+            flags = ps2_env_off ? 0 : effective_voice_flags(
+                v->flags,
+                voice_reverb_force_on_mask[core],
+                voice_reverb_force_off_mask[core],
+                voice_noise_force_on_mask[core],
+                voice_noise_force_off_mask[core],
+                voice_pmod_force_on_mask[core],
+                voice_pmod_force_off_mask[core],
+                voice);
+            key_on_pulse = !ps2_env_off && key_on_events[core][voice] != 0;
+            release_pulse = !ps2_env_off && release_events[core][voice] != 0;
+            format_voice_mode_columns(modes, sizeof(modes), flags, key_on_pulse, release_pulse, psf_version);
+            format_adsr_rate_columns(rates, sizeof(rates), v->adsr1, v->adsr2);
+            phase_label = adsr_state_label(v->adsr_phase, v->adsr1, v->adsr2);
+            phase_length = strlen(phase_label);
+            if (phase_length > 11u) {
+                phase_length = 11u;
+            }
+            line[0] = (char)('0' + (voice / 10u));
+            line[1] = (char)('0' + (voice % 10u));
+            line[2] = ' ';
+            line[3] = v->envx >= 1 ? '*' : ' ';
+            line[4] = ' ';
+            line[5] = ' ';
+            memset(line + 6, ' ', 11u);
+            memcpy(line + 6, phase_label, phase_length);
+            line[17] = ' ';
+            write_hex_u16(line + 18, v->vol_l);
+            line[22] = '/';
+            write_hex_u16(line + 23, v->vol_r);
+            line[27] = ' ';
+            line[28] = ' ';
+            write_hex_u16(line + 29, v->pitch);
+            line[33] = '\0';
+            format_hex_u16(env_text, v->envx);
+            memcpy(voice_detail, modes, 7u);
+            voice_detail[7] = ' ';
+            voice_detail[8] = (flags & SPU2LOG_VOICE_REVERB) ? '*' : '.';
+            voice_detail[9] = ' ';
+            voice_detail[10] = ' ';
+            memcpy(voice_detail + 11, rates, 14u);
+            voice_detail[25] = '\0';
+            row_text_color =
+                muted ? muted_text_color :
+                (active && !stopped_display ? active_text_color : inactive_text_color);
+            if (row_text_color != current_text_color) {
+                SetTextColor(hdc, row_text_color);
+                current_text_color = row_text_color;
+            }
+            row_text[0].y = y;
+            row_text[0].n = (UINT)line_length;
+            row_text[0].lpstr = line;
+            row_text[1].y = y;
+            row_text[1].lpstr = env_text;
+            row_text[2].y = y;
+            row_text[2].lpstr = voice_detail;
+            PolyTextOutA(hdc, row_text, 3);
         }
-        old_text_color = SetTextColor(hdc,
-            muted ? muted_text_color :
-            (active && !stopped_display ? active_text_color : inactive_text_color));
-        TextOutA(hdc, x + COL_TEXT_X, y, line, (int)strlen(line));
-        if (!hide_voice_detail) {
-            snprintf(line, sizeof(line), "%04X", v->envx);
-            snprintf(voice_detail,
-                sizeof(voice_detail),
-                "%s %c  %s",
-                modes,
-                (flags & SPU2LOG_VOICE_REVERB) ? '*' : '.',
-                rates);
-            TextOutA(hdc, x + COL_ENV_TEXT_X, y, line, (int)strlen(line));
-            TextOutA(hdc, x + COL_FLAGS_X, y, voice_detail, (int)strlen(voice_detail));
-        }
-        SetTextColor(hdc, old_text_color);
 
-        if (!hide_voice_detail) {
+        {
             uint32_t vol_bar_l;
             uint32_t vol_bar_r;
             COLORREF row_env_color = muted ? muted_gauge_color(env_color, gauge_background_color) : env_color;
@@ -13377,25 +13541,29 @@ static void paint_core_panel(
             COLORREF row_lr_right_color = muted ? muted_gauge_color(lr_right_color, gauge_background_color) : lr_right_color;
 
             draw_bar(hdc, x + COL_ENV_BAR_X, row_y + 1, 175, line_height - 5, gauge_env[core][voice], 0x7fffu,
-                row_env_color, gauge_background_color, gauge_border_color);
+                row_env_color, gauge_background_color);
             vol_bar_l = gauge_vol_l[core][voice];
             vol_bar_r = gauge_vol_r[core][voice];
             draw_stereo_bar(hdc, x + COL_VOL_BAR_X, row_y + 1, 100, line_height - 5,
                 vol_bar_l, vol_bar_r, 0x3fffu, row_lr_left_color, row_lr_right_color,
-                gauge_background_color, gauge_border_color);
+                gauge_background_color);
         }
 
         y += line_height;
     }
+    if (!gauges_only && current_text_color != active_text_color) {
+        SetTextColor(hdc, active_text_color);
+    }
 }
 
-static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
+static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only)
 {
-    TEXTMETRICA tm;
     int line_height;
     int y = 2;
     HFONT font;
     HFONT old_font;
+    HBRUSH old_brush;
+    HPEN old_pen;
     Spu2LogLiveState live;
     uint8_t key_on_events[2][24];
     uint8_t release_events[2][24];
@@ -13422,12 +13590,15 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
     COLORREF gauge_background_color;
     COLORREF gauge_border_color;
     uint8_t psf_version;
+    unsigned display_core_count;
 
     if (state == NULL) {
         return;
     }
 
     lock_state(state);
+    psf_version = state->psf_version;
+    display_core_count = psf_version == 0x01u ? 1u : 2u;
     use_audible_display = !state->frame_advance && state->audible_display_valid;
     if (state->frame_advance && state->frame_live_valid) {
         live = state->frame_live;
@@ -13440,7 +13611,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
         unsigned hold_core;
         unsigned hold_voice;
 
-        for (hold_core = 0; hold_core < 2; ++hold_core) {
+        for (hold_core = 0; hold_core < display_core_count; ++hold_core) {
             for (hold_voice = 0; hold_voice < 24; ++hold_voice) {
                 uint64_t hold_until = use_audible_display ?
                     state->audible_display_snapshot.voice_display_hold_until[hold_core][hold_voice] :
@@ -13458,7 +13629,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
             }
         }
     }
-    update_gauge_display_values(state, &live, state->psf_version);
+    update_gauge_display_values(state, &live, psf_version);
     if (use_audible_display) {
         memcpy(key_on_events,
             state->audible_display_snapshot.key_on_events,
@@ -13473,7 +13644,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
             unsigned event_core;
             unsigned event_voice;
 
-            for (event_core = 0; event_core < 2; ++event_core) {
+            for (event_core = 0; event_core < display_core_count; ++event_core) {
                 for (event_voice = 0; event_voice < 24; ++event_voice) {
                     if (state->key_on_event_buffers[event_core][event_voice] > 0) {
                         --state->key_on_event_buffers[event_core][event_voice];
@@ -13501,7 +13672,6 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
     lr_color_index = state->lr_color_index;
     env_custom_color = state->env_custom_color;
     lr_custom_color = state->lr_custom_color;
-    psf_version = state->psf_version;
     active_text_color = player_text_color(state);
     inactive_text_color = player_inactive_text_color(state);
     muted_text_color = player_muted_text_color(state);
@@ -13509,31 +13679,123 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state)
     gauge_border_color = active_text_color;
     unlock_state(state);
 
-    font = CreateFontA(
-        -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
-    if (font == NULL) {
-        font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
+    if (state->meter_font == NULL) {
+        state->meter_font = CreateFontA(
+            -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+        if (state->meter_font == NULL) {
+            state->meter_font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
+        }
     }
+    font = state->meter_font;
     old_font = (HFONT)SelectObject(hdc, font);
-    GetTextMetricsA(hdc, &tm);
-    line_height = tm.tmHeight + 1;
+    old_brush = (HBRUSH)SelectObject(hdc, GetStockObject(DC_BRUSH));
+    old_pen = (HPEN)SelectObject(hdc, GetStockObject(DC_PEN));
+    if (state->meter_line_height <= 0) {
+        TEXTMETRICA tm;
+
+        state->meter_line_height = GetTextMetricsA(hdc, &tm) ? tm.tmHeight + 1 : 16;
+    }
+    line_height = state->meter_line_height;
     y += CONTROLS_HEIGHT;
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, active_text_color);
 
-    paint_core_panel(hdc, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE0_X, y, line_height, psf_version != 0x01u, psf_version, stopped_display, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color);
+    paint_core_panel(hdc, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE0_X, y, line_height, psf_version != 0x01u, psf_version, stopped_display, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, gauges_only);
     if (psf_version != 0x01u) {
-        paint_core_panel(hdc, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, 1, psf_version, stopped_display, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color);
+        paint_core_panel(hdc, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, 1, psf_version, stopped_display, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, gauges_only);
     }
 
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
     SelectObject(hdc, old_font);
-    if (font != GetStockObject(ANSI_FIXED_FONT)) {
-        DeleteObject(font);
-    }
     (void)hwnd;
+}
+
+static void destroy_player_paint_resources(PlayerState *state)
+{
+    if (state == NULL) {
+        return;
+    }
+    if (state->paint_dc != NULL && state->paint_old_bitmap != NULL) {
+        SelectObject(state->paint_dc, state->paint_old_bitmap);
+    }
+    if (state->paint_bitmap != NULL) {
+        DeleteObject(state->paint_bitmap);
+    }
+    if (state->paint_dc != NULL) {
+        DeleteDC(state->paint_dc);
+    }
+    if (state->meter_font != NULL &&
+        state->meter_font != (HFONT)GetStockObject(ANSI_FIXED_FONT)) {
+        DeleteObject(state->meter_font);
+    }
+    state->paint_dc = NULL;
+    state->paint_bitmap = NULL;
+    state->paint_old_bitmap = NULL;
+    state->meter_font = NULL;
+    state->meter_line_height = 0;
+    state->paint_width = 0;
+    state->paint_height = 0;
+    state->gauge_only_paint_pending = 0;
+    state->paint_frame_initialized = 0;
+}
+
+static int ensure_player_backbuffer(PlayerState *state, HDC reference_dc, int width, int height)
+{
+    HDC new_dc;
+    HBITMAP new_bitmap;
+    HBITMAP old_bitmap;
+
+    if (state == NULL || reference_dc == NULL || width <= 0 || height <= 0) {
+        return 0;
+    }
+    if (state->paint_dc != NULL && state->paint_bitmap != NULL &&
+        state->paint_width == width && state->paint_height == height) {
+        return 1;
+    }
+
+    if (state->paint_dc != NULL && state->paint_old_bitmap != NULL) {
+        SelectObject(state->paint_dc, state->paint_old_bitmap);
+    }
+    if (state->paint_bitmap != NULL) {
+        DeleteObject(state->paint_bitmap);
+    }
+    if (state->paint_dc != NULL) {
+        DeleteDC(state->paint_dc);
+    }
+    state->paint_dc = NULL;
+    state->paint_bitmap = NULL;
+    state->paint_old_bitmap = NULL;
+    state->paint_width = 0;
+    state->paint_height = 0;
+    state->gauge_only_paint_pending = 0;
+    state->paint_frame_initialized = 0;
+
+    new_dc = CreateCompatibleDC(reference_dc);
+    if (new_dc == NULL) {
+        return 0;
+    }
+    new_bitmap = CreateCompatibleBitmap(reference_dc, width, height);
+    if (new_bitmap == NULL) {
+        DeleteDC(new_dc);
+        return 0;
+    }
+    old_bitmap = (HBITMAP)SelectObject(new_dc, new_bitmap);
+    if (old_bitmap == NULL || old_bitmap == HGDI_ERROR) {
+        DeleteObject(new_bitmap);
+        DeleteDC(new_dc);
+        return 0;
+    }
+
+    state->paint_dc = new_dc;
+    state->paint_bitmap = new_bitmap;
+    state->paint_old_bitmap = old_bitmap;
+    state->paint_width = width;
+    state->paint_height = height;
+    return 1;
 }
 
 static int get_player_display_line_height(HWND hwnd)
@@ -14745,33 +15007,58 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         PAINTSTRUCT ps;
         RECT rect;
         HDC hdc = BeginPaint(hwnd, &ps);
-        HDC mem_dc;
-        HBITMAP mem_bitmap;
-        HBITMAP old_bitmap;
 
         if (state != NULL) {
+            int gauges_only = 0;
+            int line_height = state->meter_line_height > 0 ? state->meter_line_height : 16;
+            int voice_top = 2 + CONTROLS_HEIGHT + (line_height * 2);
+
             GetClientRect(hwnd, &rect);
             if (state->playback_only) {
-                fill_player_background(hdc, &rect, state);
+                state->gauge_only_paint_pending = 0;
+                fill_player_background(hdc, &ps.rcPaint, state);
                 EndPaint(hwnd, &ps);
                 return 0;
             }
-            mem_dc = CreateCompatibleDC(hdc);
-            mem_bitmap = CreateCompatibleBitmap(hdc, rect.right - rect.left, rect.bottom - rect.top);
-            if (mem_dc != NULL && mem_bitmap != NULL) {
-                old_bitmap = (HBITMAP)SelectObject(mem_dc, mem_bitmap);
-                fill_player_background(mem_dc, &rect, state);
-                paint_player(hwnd, mem_dc, state);
-                BitBlt(hdc, 0, 0, rect.right - rect.left, rect.bottom - rect.top, mem_dc, 0, 0, SRCCOPY);
-                SelectObject(mem_dc, old_bitmap);
+            if (ensure_player_backbuffer(
+                    state, hdc, rect.right - rect.left, rect.bottom - rect.top)) {
+                int saved_dc = SaveDC(state->paint_dc);
+
+                gauges_only = state->gauge_only_paint_pending &&
+                    state->paint_frame_initialized &&
+                    ps.rcPaint.left >= CORE0_X + COL_ENV_BAR_X &&
+                    ps.rcPaint.top >= voice_top;
+                state->gauge_only_paint_pending = 0;
+                if (saved_dc != 0) {
+                    IntersectClipRect(state->paint_dc,
+                        ps.rcPaint.left,
+                        ps.rcPaint.top,
+                        ps.rcPaint.right,
+                        ps.rcPaint.bottom);
+                }
+                if (!gauges_only) {
+                    fill_player_background(state->paint_dc, &ps.rcPaint, state);
+                }
+                paint_player(hwnd, state->paint_dc, state, gauges_only);
+                if (!gauges_only) {
+                    state->paint_frame_initialized = 1;
+                }
+                if (saved_dc != 0) {
+                    RestoreDC(state->paint_dc, saved_dc);
+                }
+                BitBlt(hdc,
+                    ps.rcPaint.left,
+                    ps.rcPaint.top,
+                    ps.rcPaint.right - ps.rcPaint.left,
+                    ps.rcPaint.bottom - ps.rcPaint.top,
+                    state->paint_dc,
+                    ps.rcPaint.left,
+                    ps.rcPaint.top,
+                    SRCCOPY);
             } else {
-                paint_player(hwnd, hdc, state);
-            }
-            if (mem_bitmap != NULL) {
-                DeleteObject(mem_bitmap);
-            }
-            if (mem_dc != NULL) {
-                DeleteDC(mem_dc);
+                state->gauge_only_paint_pending = 0;
+                fill_player_background(hdc, &ps.rcPaint, state);
+                paint_player(hwnd, hdc, state, 0);
             }
         }
         EndPaint(hwnd, &ps);
@@ -14813,6 +15100,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         KillTimer(hwnd, PLAYER_CLICK_TIMER_ID);
         if (state != NULL) {
             stop_playback(state);
+            destroy_player_paint_resources(state);
             if (state->playlist_hwnd != NULL) {
                 DestroyWindow(state->playlist_hwnd);
                 state->playlist_hwnd = NULL;
@@ -14872,6 +15160,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_BAR_CLASSES;
     InitCommonControlsEx(&icc);
+    GdiSetBatchLimit(1024u);
 
     ZeroMemory(&state, sizeof(state));
     InitializeCriticalSection(&state.lock);
