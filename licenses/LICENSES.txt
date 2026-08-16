@@ -16,6 +16,9 @@ license terms:
 - GCC runtime libraries: GNU GPL version 3 with GCC Runtime Library Exception
 - libwinpthread: MIT/BSD terms
 - zlib: zlib License
+- Optional archive extraction runtime: libarchive/bsdtar and dynamically
+  linked compression libraries under their respective BSD, MIT, 0BSD, zlib,
+  GNU LGPL, and GCC Runtime Library Exception terms
 
 License files
 -------------
@@ -28,6 +31,17 @@ License files
 - LICENSE_GCC_RUNTIME_EXCEPTION.txt
 - LICENSE_LIBWINPTHREAD.txt
 - LICENSE_ZLIB.txt
+- archive-runtime/LICENSE_LIBARCHIVE.txt
+- archive-runtime/LICENSE_BZIP2.txt
+- archive-runtime/LICENSE_EXPAT.txt
+- archive-runtime/LICENSE_LIBB2.txt
+- archive-runtime/LICENSE_LIBICONV_LGPL21.txt
+- archive-runtime/LICENSE_LZ4.txt
+- archive-runtime/LICENSE_PCRE2.md
+- archive-runtime/LICENSE_XZ_OVERVIEW.txt
+- archive-runtime/LICENSE_XZ_0BSD.txt
+- archive-runtime/LICENSE_ZLIB.txt
+- archive-runtime/LICENSE_ZSTD.txt
 
 Source code requirement
 -----------------------

@@ -71,6 +71,7 @@
 #define LE32(x) FROM_LE32(x)
 
 static corlett_t	*c = nullptr;
+static corlett_t	*c_lib = nullptr;
 
 // main RAM
 static uint32_t initialPC, initialSP;
@@ -447,7 +448,6 @@ int32_t psf2_start(uint8_t *buffer, uint32_t length)
 	uint64_t file_len, lib_len;
 	uint8_t *buf;
 	union cpuinfo mipsinfo;
-	corlett_t *lib;
 
 	loadAddr = 0x23f00;	// this value makes allocations work out similarly to how they would
 				// in Highly Experimental (as per Shadow Hearts' hard-coded assumptions)
@@ -463,6 +463,7 @@ int32_t psf2_start(uint8_t *buffer, uint32_t length)
 
 	if (file_len > 0)
 		printf ("ERROR: PSF2 can't have a program section!  ps %lx\n", (unsigned long) file_len);
+	free(file);
 
 	#if DEBUG_LOADER
 	printf("FS section: size %x\n", c->res_size);
@@ -485,16 +486,17 @@ int32_t psf2_start(uint8_t *buffer, uint32_t length)
 			return AO_FAIL;
 
 		if (corlett_decode((uint8_t *)lib_raw_file.begin(), lib_raw_file.len(),
-		 &lib_decoded, &lib_len, &lib) != AO_SUCCESS)
+		 &lib_decoded, &lib_len, &c_lib) != AO_SUCCESS)
 			return AO_FAIL;
+		free(lib_decoded);
 
 		#if DEBUG_LOADER
-		printf("Lib FS section: size %x bytes\n", lib->res_size);
+		printf("Lib FS section: size %x bytes\n", c_lib->res_size);
 		#endif
 
 		num_fs++;
-		filesys[1] = (uint8_t *)lib->res_section;
- 		fssize[1] = lib->res_size;
+		filesys[1] = (uint8_t *)c_lib->res_section;
+	 	fssize[1] = c_lib->res_size;
 	}
 
 	// dump all files
@@ -589,7 +591,10 @@ int32_t psf2_stop(void)
 {
 	SPU2close();
 	lib_raw_file.clear();
+	free(c_lib);
+	c_lib = nullptr;
 	free(c);
+	c = nullptr;
 
 	return AO_SUCCESS;
 }

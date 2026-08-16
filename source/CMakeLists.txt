@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(psf_spu_player VERSION 1.52 LANGUAGES C CXX)
+project(psf_spu_player VERSION 1.54 LANGUAGES C CXX)
+
+set(PSF_ARCHIVE_RUNTIME_DIR "" CACHE PATH "Folder containing the optional 32-bit bsdtar archive runtime")
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -143,5 +145,55 @@ if(MINGW)
             COMMENT "Removing non-runtime debug and symbol data"
             VERBATIM
         )
+    endif()
+
+    if(NOT PSF_ARCHIVE_RUNTIME_DIR)
+        find_program(PSF_ARCHIVE_BSDTAR_EXECUTABLE
+            NAMES bsdtar.exe bsdtar
+            HINTS "C:/msys64/mingw32/bin"
+        )
+        if(PSF_ARCHIVE_BSDTAR_EXECUTABLE)
+            get_filename_component(PSF_ARCHIVE_RUNTIME_DIR
+                "${PSF_ARCHIVE_BSDTAR_EXECUTABLE}" DIRECTORY)
+        endif()
+    endif()
+    set(PSF_ARCHIVE_RUNTIME_FILES
+        bsdtar.exe
+        libarchive-13.dll
+        libb2-1.dll
+        libbz2-1.dll
+        libexpat-1.dll
+        libgcc_s_dw2-1.dll
+        libiconv-2.dll
+        liblz4.dll
+        liblzma-5.dll
+        libpcre2-8-0.dll
+        libpcre2-posix-3.dll
+        libwinpthread-1.dll
+        libzstd.dll
+        zlib1.dll
+    )
+    set(PSF_ARCHIVE_RUNTIME_READY TRUE)
+    foreach(PSF_ARCHIVE_RUNTIME_FILE IN LISTS PSF_ARCHIVE_RUNTIME_FILES)
+        if(NOT EXISTS "${PSF_ARCHIVE_RUNTIME_DIR}/${PSF_ARCHIVE_RUNTIME_FILE}")
+            set(PSF_ARCHIVE_RUNTIME_READY FALSE)
+        endif()
+    endforeach()
+    if(PSF_ARCHIVE_RUNTIME_READY)
+        add_custom_command(TARGET psf_spu_player POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:psf_spu_player>/archive"
+            COMMENT "Installing the optional archive extraction runtime"
+        )
+        foreach(PSF_ARCHIVE_RUNTIME_FILE IN LISTS PSF_ARCHIVE_RUNTIME_FILES)
+            add_custom_command(TARGET psf_spu_player POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${PSF_ARCHIVE_RUNTIME_DIR}/${PSF_ARCHIVE_RUNTIME_FILE}"
+                    "$<TARGET_FILE_DIR:psf_spu_player>/archive/${PSF_ARCHIVE_RUNTIME_FILE}"
+                VERBATIM
+            )
+        endforeach()
+    else()
+        message(STATUS "Archive runtime not found; installed 7-Zip or Windows tar will be used")
     endif()
 endif()

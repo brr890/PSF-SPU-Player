@@ -326,9 +326,9 @@ void mips_set_icount(int count);
 
 /* psx_hw.cc */
 extern uint32_t psx_ram[((2*1024*1024)/4)+4];
-extern uint32_t psx_scratch[0x400];
+extern uint32_t psx_scratch[0x400/4];
 extern uint32_t initial_ram[((2*1024*1024)/4)+4];
-extern uint32_t initial_scratch[0x400];
+extern uint32_t initial_scratch[0x400/4];
 
 void psx_hw_slice(void);
 void psx_hw_scan_slice(unsigned int timer_step, unsigned int cpu_step);

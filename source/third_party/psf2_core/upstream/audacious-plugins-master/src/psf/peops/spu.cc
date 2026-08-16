@@ -139,6 +139,8 @@ extern "C" unsigned int psf2log_peops_copy_sample(
 
 // user settings
 static int             iVolume;
+static int             iMainVolumeLeft;
+static int             iMainVolumeRight;
 
 // MAIN infos struct for each channel
 
@@ -961,6 +963,13 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
   }
 
   sampcount++;
+
+  // The PS1 clamps the voice/reverb mix before applying the signed main
+  // output volumes. Some drivers use this stage as their normal mix level.
+  CLIP(sl);
+  CLIP(sr);
+  sl=(sl*iMainVolumeLeft)>>14;
+  sr=(sr*iMainVolumeRight)>>14;
   sl=(sl*volmul)>>8;
   sr=(sr*volmul)>>8;
 
@@ -1124,6 +1133,8 @@ int SPUopen(void)
  pSpuIrq=0;
 
  iVolume=255; //85;
+ iMainVolumeLeft=0x3fff;
+ iMainVolumeRight=0x3fff;
  SetupStreams();                                       // prepare streaming
 
  bSPUIsOpen=1;

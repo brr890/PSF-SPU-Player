@@ -60,6 +60,8 @@
 
 #include "spu2log_audacious_hooks.h"
 
+extern uint32_t spuAddr2[];
+
 #define DEBUG_HLE_BIOS	(0)		// debug PS1 HLE BIOS
 #define DEBUG_SPU	(0)		// debug PS1 SPU read/write
 #define DEBUG_SPU2	(0)		// debug PS2 SPU read/write
@@ -234,10 +236,10 @@ static EvtCtrlBlk *CounterEvent;
 
 // PSX main RAM
 uint32_t psx_ram[(2*1024*1024)/4+4];
-uint32_t psx_scratch[0x400];
+uint32_t psx_scratch[0x400/4];
 // backup image to restart songs
 uint32_t initial_ram[(2*1024*1024)/4+4];
-uint32_t initial_scratch[0x400];
+uint32_t initial_scratch[0x400/4];
 
 static uint32_t spu_delay, dma_icr, irq_data, irq_mask, dma_timer, WAI;
 static uint32_t dma4_madr, dma4_bcr, dma4_chcr, dma4_delay;
@@ -496,10 +498,17 @@ static uint32_t gpu_stat = 0;
 
 static uint32_t psx_hw_read(offs_t offset, uint32_t mem_mask)
 {
+	const offs_t physical_offset = offset & 0x1fffffff;
+
 	if (offset <= 0x007fffff)
 	{
 		offset &= 0x1fffff;
 		return LE32(psx_ram[offset>>2]);
+	}
+
+	if (physical_offset >= 0x1f800000 && physical_offset < 0x1f800400)
+	{
+		return LE32(psx_scratch[(physical_offset - 0x1f800000) >> 2]);
 	}
 
 	if (offset >= 0x80000000 && offset <= 0x807fffff)
@@ -650,6 +659,23 @@ static void psx_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 	}
 }
 
+static uint32_t ps2_dma_word_count(uint32_t bcr, unsigned int core)
+{
+	const uint32_t block_words = (bcr >> 16) * (bcr & 0xffff);
+	const uint32_t spu_address = spuAddr2[core] & 0xfffff;
+	const uint32_t ring_offset = spu_address & 0x1fff;
+
+	/* Neill Corlett's streaming driver feeds 16 KiB left/right blocks into
+	   fixed low SPU2 ring buffers.  The legacy x4 conversion doubles those
+	   blocks and overlaps the other channel; regular PSF2 sample loaders rely
+	   on the legacy conversion and must retain it. */
+	if (block_words == 0x1000 && spu_address < 0x24000 &&
+	    (ring_offset == 0x20 || ring_offset == 0x60))
+		return block_words * 2;
+
+	return block_words * 4;
+}
+
 static void ps2_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 {
 	if (chcr == 0x01000201)	// cpu to SPU2
@@ -657,7 +683,7 @@ static void ps2_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 		#if DEBUG_HLE_IOP
 		printf("DMA4: RAM %08x to SPU2\n", madr);
 		#endif
-		bcr = (bcr>>16) * (bcr & 0xffff) * 4;
+		bcr = ps2_dma_word_count(bcr, 0);
 		SPU2writeDMA4Mem(madr&0x1fffff, bcr);
 	}
 	else
@@ -665,7 +691,7 @@ static void ps2_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 		#if DEBUG_HLE_IOP
 		printf("DMA4: SPU2 to RAM %08x\n", madr);
 		#endif
-		bcr = (bcr>>16) * (bcr & 0xffff) * 4;
+		bcr = ps2_dma_word_count(bcr, 0);
 		SPU2readDMA4Mem(madr&0x1fffff, bcr);
 	}
 
@@ -680,7 +706,7 @@ static void ps2_dma7(uint32_t madr, uint32_t bcr, uint32_t chcr)
 		#if DEBUG_HLE_IOP
 		printf("DMA7: RAM %08x to SPU2\n", madr);
 		#endif
-		bcr = (bcr>>16) * (bcr & 0xffff) * 4;
+		bcr = ps2_dma_word_count(bcr, 1);
 		SPU2writeDMA7Mem(madr&0x1fffff, bcr);
 	}
 	else
@@ -688,7 +714,7 @@ static void ps2_dma7(uint32_t madr, uint32_t bcr, uint32_t chcr)
 		#if DEBUG_HLE_IOP
 		printf("DMA7: SPU2 to RAM %08x\n", madr);
 		#endif
-		bcr = (bcr>>16) * (bcr & 0xffff) * 4;
+		bcr = ps2_dma_word_count(bcr, 1);
 //		SPU2readDMA7Mem(madr&0x1fffff, bcr);
 	}
 
@@ -698,6 +724,7 @@ static void ps2_dma7(uint32_t madr, uint32_t bcr, uint32_t chcr)
 static void psx_hw_write(offs_t offset, uint32_t data, uint32_t mem_mask)
 {
 	union cpuinfo mipsinfo;
+	const offs_t physical_offset = offset & 0x1fffffff;
 
 	spu2log_audacious_debug_hw_write(offset);
 
@@ -710,6 +737,14 @@ static void psx_hw_write(offs_t offset, uint32_t data, uint32_t mem_mask)
 
 		psx_ram[offset>>2] &= LE32(mem_mask);
 		psx_ram[offset>>2] |= LE32(data);
+		return;
+	}
+
+	if (physical_offset >= 0x1f800000 && physical_offset < 0x1f800400)
+	{
+		uint32_t &word = psx_scratch[(physical_offset - 0x1f800000) >> 2];
+		word &= LE32(mem_mask);
+		word |= LE32(data);
 		return;
 	}
 
@@ -1378,6 +1413,7 @@ static uint32_t calc_spec(uint32_t a1)
 void psx_hw_init(void)
 {
 	timerexp = 0;
+	memset(psx_scratch, 0, sizeof(psx_scratch));
 
 	memset(filestat, 0, sizeof(filestat));
 	memset(filedata, 0, sizeof(filedata));
@@ -2087,20 +2123,16 @@ uint8_t program_read_byte_32le(offs_t address)
 	switch (address & 0x3)
 	{
 		case 0:
-			return psx_hw_read(address, 0xffffff00);
-			break;
+			return (uint8_t)psx_hw_read(address, 0xffffff00);
 		case 1:
-			return psx_hw_read(address, 0xffff00ff)>>8;
-			break;
+			return (uint8_t)(psx_hw_read(address, 0xffff00ff)>>8);
 		case 2:
-			return psx_hw_read(address, 0xff00ffff)>>16;
-			break;
+			return (uint8_t)(psx_hw_read(address, 0xff00ffff)>>16);
 		case 3:
-			return psx_hw_read(address, 0x00ffffff)>>24;
-			break;
+			return (uint8_t)(psx_hw_read(address, 0x00ffffff)>>24);
+		default:
+			return (uint8_t)psx_hw_read(address, 0xffffff00);
 	}
-
-	return psx_hw_read(address, 0xffffff00);
 }
 
 uint16_t program_read_word_32le(offs_t address)

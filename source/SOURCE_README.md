@@ -1,6 +1,6 @@
 # PSF SPU Player Production Source
 
-This folder contains the source required to build PSF SPU Player Ver 1.52.
+This folder contains the source required to build PSF SPU Player Ver 1.54.
 
 Included:
 
@@ -22,7 +22,7 @@ Not included:
 
 ## Build
 
-Install CMake, MSYS2 MinGW32, Ninja, GCC, and zlib. Then run:
+Install CMake, MSYS2 MinGW32, Ninja, GCC, zlib, and libarchive. Then run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
@@ -36,5 +36,8 @@ build\mingw32-release\psf_spu_player.exe
 
 The resulting 32-bit executable runs on Windows 10 32-bit and through WOW64 on
 Windows 10 64-bit. GCC runtime code, zlib, and the logger are statically linked.
+When the MinGW32 libarchive runtime is installed, the build also creates an
+`archive` folder beside the executable. Keep it there to open ZIP, 7Z, RAR,
+LHA, and LZH archives without requiring a separate 7-Zip installation.
 
 See `LICENSE`, `THIRD_PARTY_NOTICES.md`, and `licenses/` for license terms.

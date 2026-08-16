@@ -199,6 +199,7 @@ void SPUwriteRegister(u32 reg, u16 val)
       break;
     //-------------------------------------------------//
     case H_SPUctrl:
+      psf2log_ps1_trace("write CTRL val=%04X old=%04X",val,spuCtrl);
       spuCtrl=val;
       break;
     //-------------------------------------------------//
@@ -249,11 +250,15 @@ void SPUwriteRegister(u32 reg, u16 val)
       break;
     //-------------------------------------------------//
     case H_SPUmvolL:
-     //auxprintf("ML %d\n",val);
+      psf2log_ps1_trace("write MVOL L raw=%04X effective=%d",val,
+       psf2log_ps1_effective_volume_from_raw(val));
+      iMainVolumeLeft=psf2log_ps1_effective_volume_from_raw(val);
       break;
     //-------------------------------------------------//
     case H_SPUmvolR:
-     //auxprintf("MR %d\n",val);
+      psf2log_ps1_trace("write MVOL R raw=%04X effective=%d",val,
+       psf2log_ps1_effective_volume_from_raw(val));
+      iMainVolumeRight=psf2log_ps1_effective_volume_from_raw(val);
       break;
     //-------------------------------------------------//
 /*
@@ -529,6 +534,7 @@ static void NoiseOn(int start,int end,u16 val)     // NOISE ON PSX COMMAND
 static void SetVolumeLR(int right, u8 ch,s16 vol)            // LEFT VOLUME
 {
  unsigned int locked_volume;
+ const u16 raw_volume=(u16)vol;
  if(psf2log_peops_get_volume_lock_value((unsigned int)ch,right?1u:0u,&locked_volume))
   vol=(s16)(locked_volume&0xffffu);
  //if(vol&0xc000)
@@ -537,7 +543,6 @@ static void SetVolumeLR(int right, u8 ch,s16 vol)            // LEFT VOLUME
   s_chan[ch].iRightVolRaw=vol;
  else
   s_chan[ch].iLeftVolRaw=vol;
-
  if(vol&0x8000)                                        // sweep?
   {
    s16 sInc=1;                                       // -> sweep up?
@@ -565,6 +570,8 @@ static void SetVolumeLR(int right, u8 ch,s16 vol)            // LEFT VOLUME
   s_chan[ch].iRightVolume=vol;
  else
   s_chan[ch].iLeftVolume=vol;                           // store volume
+ psf2log_ps1_trace("write VOL ch=%02u side=%c raw=%04X effective=%d",
+  (unsigned int)ch,right?'R':'L',(unsigned int)raw_volume,(int)vol);
 }
 
 ////////////////////////////////////////////////////////////////////////

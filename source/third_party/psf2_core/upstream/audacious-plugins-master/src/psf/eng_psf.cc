@@ -172,6 +172,8 @@ int32_t psf_start(uint8_t *buffer, uint32_t length)
 		printf("library offset: %x plength: %d\n", offset, plength);
 		#endif
 		memcpy(&psx_ram[offset/4], lib_decoded + 2048, plength);
+		free(lib_decoded);
+		lib_decoded = nullptr;
 
 		// Dispose the corlett structure for the lib - we don't use it
 		free(lib);
@@ -230,6 +232,8 @@ int32_t psf_start(uint8_t *buffer, uint32_t length)
 				plength = alib_len - 2048;
 
 			memcpy(&psx_ram[offset/4], alib_decoded + 2048, plength);
+			free(alib_decoded);
+			alib_decoded = nullptr;
 
 			// Dispose the corlett structure for the lib - we don't use it
 			free(lib);
@@ -237,7 +241,6 @@ int32_t psf_start(uint8_t *buffer, uint32_t length)
 	}
 
 	free(file);
-//	free(lib_decoded);
 
 	// Finally, set psfby tag
 	strcpy(psfby, "n/a");
@@ -350,6 +353,8 @@ int32_t psf_stop(void)
 {
 	SPUclose();
 	free(c);
+	c = nullptr;
+	psf_refresh = -1;
 
 	return AO_SUCCESS;
 }

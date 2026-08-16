@@ -2992,7 +2992,6 @@ void mips_set_icount(int count)
 	mips_ICount = count;
 }
 
-
 #if (HAS_PSXCPU)
 /**************************************************************************
  * CPU-specific set_info
