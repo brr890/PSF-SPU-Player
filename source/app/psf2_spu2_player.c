@@ -613,6 +613,7 @@ static int read_font_family_from_file(const char *font_path, char *out_face, siz
 static void rebuild_ui_font(PlayerState *state);
 static void apply_ui_font_to_window(HWND hwnd, HFONT font);
 static void restore_debug_edits_to_saved_values(HWND hwnd, PlayerState *state);
+static int get_player_display_line_height(HWND hwnd);
 
 static int g_text_log_enabled = 1;
 static int g_window_fixed_width = PLAYER_DEFAULT_WIDTH;
@@ -7526,7 +7527,11 @@ static uint32_t ps1_volume_bar_value(uint16_t value, uint16_t other_value)
     return magnitude;
 }
 
-static uint32_t smooth_gauge_value(uint32_t current, uint32_t target, uint32_t max_value)
+static uint32_t smooth_gauge_value(
+    uint32_t current,
+    uint32_t target,
+    uint32_t max_value,
+    int smooth_rise)
 {
     uint32_t delta;
     uint32_t step;
@@ -7537,11 +7542,16 @@ static uint32_t smooth_gauge_value(uint32_t current, uint32_t target, uint32_t m
         return current;
     }
 
-    if (target == 0 || current == 0) {
-        return target;
+    if (target > current) {
+        if (!smooth_rise) {
+            return target;
+        }
+        delta = target - current;
+        step = (delta + 1u) / 2u;
+        return current + (step != 0 ? step : 1u);
     }
 
-    if (target > current) {
+    if (target == 0 || current == 0) {
         return target;
     }
 
@@ -7583,6 +7593,9 @@ static void update_gauge_display_values(PlayerState *state, const Spu2LogLiveSta
             uint32_t env_target = v->envx;
             uint32_t vol_l_target;
             uint32_t vol_r_target;
+            unsigned attack_rate = (unsigned)((v->adsr1 >> 8) & 0x7fu);
+            int smooth_attack =
+                v->adsr_phase == SPU2LOG_ADSR_ATTACK && attack_rate < 0x7cu;
             unsigned smoothing_step;
 
             if (psf_version == 0x01u) {
@@ -7603,7 +7616,8 @@ static void update_gauge_display_values(PlayerState *state, const Spu2LogLiveSta
 
             for (smoothing_step = 0; smoothing_step < smoothing_steps; ++smoothing_step) {
                 state->gauge_env[core][voice] = smooth_gauge_value(
-                    state->gauge_env[core][voice], env_target, 0x7fffu);
+                    state->gauge_env[core][voice], env_target, 0x7fffu,
+                    smooth_attack);
             }
             if (state->gauge_env[core][voice] != env_target) {
                 animation_active = 1;
@@ -8754,6 +8768,51 @@ static int player_height_for_mode(const PlayerState *state, uint8_t psf_version)
         PLAYER_DEFAULT_HEIGHT;
 }
 
+static int psf1_values_keyboard_window_height(HWND hwnd, const PlayerState *state)
+{
+    RECT window_rect;
+    RECT client_rect;
+    int line_height;
+    int client_height;
+    int nonclient_height;
+
+    if (hwnd == NULL || state == NULL ||
+        normalize_psf1_display_mode(state->psf1_display_mode) !=
+            PSF1_DISPLAY_VALUES_KEYBOARD) {
+        return PLAYER_PSF1_HEIGHT;
+    }
+
+    line_height = state->meter_line_height > 0 ?
+        state->meter_line_height : get_player_display_line_height(hwnd);
+    client_height = 2 + CONTROLS_HEIGHT + (line_height * 2) +
+        (24 * (line_height + PSF1_TRACK_KEYBOARD_HEIGHT)) + 4;
+    if (!GetWindowRect(hwnd, &window_rect) ||
+        !GetClientRect(hwnd, &client_rect)) {
+        return PLAYER_PSF1_HEIGHT;
+    }
+    nonclient_height = (window_rect.bottom - window_rect.top) -
+        (client_rect.bottom - client_rect.top);
+    return client_height + nonclient_height;
+}
+
+static int preview_keyboard_is_active(const PlayerState *state)
+{
+    HWND focus;
+
+    if (state == NULL || state->preview_hwnd == NULL ||
+        !IsWindow(state->preview_hwnd) ||
+        !IsWindowVisible(state->preview_hwnd)) {
+        return 0;
+    }
+    if (GetActiveWindow() == state->preview_hwnd ||
+        GetForegroundWindow() == state->preview_hwnd) {
+        return 1;
+    }
+    focus = GetFocus();
+    return focus != NULL &&
+        GetAncestor(focus, GA_ROOT) == state->preview_hwnd;
+}
+
 static void apply_psf_window_mode(HWND hwnd, const PlayerState *state, uint8_t psf_version)
 {
     int width = psf_version == 0x01u ? PLAYER_PSF1_WIDTH : PLAYER_DEFAULT_WIDTH;
@@ -8772,6 +8831,10 @@ static void apply_psf_window_mode(HWND hwnd, const PlayerState *state, uint8_t p
         if (load_psf1_mode_window_position(
                 state->psf1_display_mode, &x, &y)) {
             flags &= ~SWP_NOMOVE;
+        }
+        if (normalize_psf1_display_mode(state->psf1_display_mode) ==
+            PSF1_DISPLAY_VALUES_KEYBOARD) {
+            height = psf1_values_keyboard_window_height(hwnd, state);
         }
     }
 
@@ -15097,8 +15160,7 @@ static void render_playback_tick(HWND hwnd, PlayerState *state)
         state->display_render_sequence == render_sequence;
     gauge_only = state->playing && !state->frame_advance &&
         state->audible_display_valid && state->paint_frame_initialized &&
-        state->gauge_animation_active && same_render_state &&
-        psf1_keyboard_height_for_state(state, state->psf_version) == 0;
+        state->gauge_animation_active && same_render_state;
     skip_draw = state->playing && !state->frame_advance &&
         state->audible_display_valid && state->paint_frame_initialized &&
         !state->gauge_animation_active &&
@@ -16993,6 +17055,9 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         }
         break;
     case WM_KEYDOWN:
+        if (state != NULL && preview_keyboard_is_active(state)) {
+            return 0;
+        }
         if (state != NULL && wparam == VK_TAB) {
             set_tab_speed_active(hwnd, state, 1);
             return 0;
@@ -17475,6 +17540,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     PlayerState state;
     INITCOMMONCONTROLSEX icc;
     HANDLE instance_mutex;
+    MMRESULT timer_period_result;
     int window_x;
     int window_y;
     int window_width;
@@ -17587,6 +17653,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         &state, &window_x, &window_y, &window_width, &window_height);
     g_window_fixed_width = window_width;
     g_window_fixed_height = window_height;
+    timer_period_result = timeBeginPeriod(1u);
 
     hwnd = CreateWindowExA(
         0,
@@ -17603,10 +17670,14 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         &state);
     if (hwnd == NULL) {
         player_log("CreateWindow failed error=%lu", (unsigned long)GetLastError());
+        if (timer_period_result == TIMERR_NOERROR) {
+            timeEndPeriod(1u);
+        }
         CloseHandle(instance_mutex);
         return 1;
     }
 
+    apply_psf_window_mode(hwnd, &state, state.psf_version);
     ShowWindow(hwnd, show_cmd);
     UpdateWindow(hwnd);
     if (state.timbre_scan_enabled) {
@@ -17702,6 +17773,15 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
             SendMessageA(state.preview_hwnd, msg.message, msg.wParam, msg.lParam);
             continue;
         }
+        if (preview_keyboard_is_active(&state) &&
+            (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP)) {
+            if (msg.message == WM_KEYUP && msg.wParam == VK_TAB) {
+                set_tab_speed_active(hwnd, &state, 0);
+            }
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+            continue;
+        }
         if ((msg.message == WM_KEYDOWN || msg.message == WM_KEYUP) &&
             msg.wParam == VK_TAB) {
             SendMessageA(hwnd, msg.message, msg.wParam, msg.lParam);
@@ -17733,6 +17813,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         DeleteObject(state.ui_font);
         state.ui_font = NULL;
         g_ui_font = NULL;
+    }
+    if (timer_period_result == TIMERR_NOERROR) {
+        timeEndPeriod(1u);
     }
 
     CloseHandle(instance_mutex);

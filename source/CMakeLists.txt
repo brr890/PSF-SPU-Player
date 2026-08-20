@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(psf_spu_player VERSION 1.54 LANGUAGES C CXX)
+project(psf_spu_player VERSION 1.55 LANGUAGES C CXX)
 
 set(PSF_ARCHIVE_RUNTIME_DIR "" CACHE PATH "Folder containing the optional 32-bit bsdtar archive runtime")
 
