@@ -34,11 +34,14 @@
 #define PLAYER_TIMER_ID 1u
 #define PLAYER_CLICK_TIMER_ID 2u
 #define PLAYER_PLAYLIST_SWITCH_TIMER_ID 3u
+#define PLAYER_DIRECT_RETRY_TIMER_ID 4u
 #define PLAYER_DISPLAY_FPS 120u
 #define PLAYER_TIMER_MS 8u
 #define PLAYER_CLICK_DELAY_MS 220u
 #define PLAYER_CLICK_REPEAT_MS 85u
 #define PLAYER_PLAYLIST_SWITCH_TIMER_MS 15u
+#define PLAYER_DIRECT_RETRY_TIMER_MS 60u
+#define PLAYER_START_RETRY_TIMEOUT_MS 5000u
 #define PLAYER_RENDER_FRAMES 735u
 #define PLAYER_FRAME_ADVANCE_TICK_FRAMES 192u
 #define PLAYER_SEEK_RENDER_FRAMES 65536u
@@ -46,9 +49,11 @@
 #define PLAYER_WM_WORKER_UPDATE (WM_APP + 1u)
 #define PLAYER_WM_PLAYLIST_PLAY (WM_APP + 2u)
 #define PLAYER_WM_PLAYBACK_ENDED (WM_APP + 3u)
+#define PLAYER_WM_AUDIO_BUFFER_DONE (WM_APP + 4u)
+#define PLAYER_WM_AUDIO_STARTING (WM_APP + 5u)
 #define PLAYER_AUDIO_BUFFERS 16u
 #define PLAYER_AUDIO_PREBUFFER_BUFFERS 8u
-#define PLAYER_STARTUP_SILENCE_BUFFERS 6u
+#define PLAYER_STARTUP_SILENCE_BUFFERS 3u
 #define VOICE_EVENT_DISPLAY_BUFFERS 3u
 #define PLAYER_MAX_OUTPUT_FRAMES PLAYER_RENDER_FRAMES
 #define PLAYER_STARTUP_FADE_FRAMES 128u
@@ -137,6 +142,9 @@
 #define IDM_PLAYLIST_ORDER_NEXT 1096
 #define IDM_PLAYLIST_ORDER_RANDOM 1097
 #define IDM_PLAYLIST_ORDER_SINGLE 1098
+#define IDM_SPEED_PRESET_FIRST 1100
+#define IDM_SPEED_PRESET_LAST 1108
+#define SPEED_PRESET_COUNT 9u
 #define MENU_SEPARATOR_MAGIC ((ULONG_PTR)0x5053465355505345ull)
 #define MENU_BAR_ITEM_MAGIC ((ULONG_PTR)0x5053465355424152ull)
 #define IDC_PLAYLIST_LIST 3101
@@ -192,16 +200,21 @@
 #define COL_VOL_BAR_X 510
 #define COL_FLAGS_X 622
 #define CONTROLS_HEIGHT 30
-#define PLAYER_DEFAULT_WIDTH 1680
-#define PLAYER_DEFAULT_HEIGHT 562
+#define TIME_LABEL_MIN_WIDTH 112
+#define PLAYER_DEFAULT_WIDTH 1688
+#define PLAYER_DEFAULT_HEIGHT 563
 #define PLAYER_PSF1_WIDTH 854
 #define PLAYER_PSF1_HEIGHT 1080
 #define PLAYER_PSF1_KEYBOARD_ONLY_HEIGHT 679
+#define PLAYER_FULLSCREEN_CHROME_PERCENT 85
+#define PLAYER_PSF2_FULLSCREEN_CONTENT_PERCENT 98
+#define PLAYER_PSF2_FULLSCREEN_VERTICAL_PERCENT 108
 #define PLAYER_MIN_WIDTH PLAYER_PSF1_WIDTH
 #define PLAYER_MIN_HEIGHT PLAYER_DEFAULT_HEIGHT
 #define CORE_PANEL_WIDTH 832
+#define CORE_PANEL_GAP 8
 #define CORE0_X 8
-#define CORE1_X (CORE0_X + CORE_PANEL_WIDTH)
+#define CORE1_X (CORE0_X + CORE_PANEL_WIDTH + CORE_PANEL_GAP)
 #define SPU2_CORE_STRIDE 0x0400u
 #define PS1_SPU_BASE 0x1f801c00u
 #define PS1_SPU_END 0x1f801dffu
@@ -269,6 +282,18 @@ typedef struct {
     int menu_bar;
 } OwnerMenuItemData;
 
+static const int g_speed_menu_values[SPEED_PRESET_COUNT] = {
+    10, 25, 50, 75, 100, 125, 150, 175, 200
+};
+
+static const char *const g_speed_menu_labels[SPEED_PRESET_COUNT] = {
+    "10%", "25%", "50%", "75%", "100%", "125%", "150%", "175%", "200%"
+};
+
+static const char g_psf1_values_fixed_header[] =
+    "active:00/24  ADSR:00/00/00/00  rv:0x0000/0x0000 "
+    "nclk:00000Hz tempo:0x000000(000.000) 000/000 beat:00 bar:0000";
+
 typedef struct PreviewSample {
     uint32_t key;
     uint32_t ssa;
@@ -317,6 +342,7 @@ typedef struct Psf1TuningEntry {
 
 typedef struct AudioDisplaySnapshot {
     Spu2LogLiveState live;
+    Psf1AkaoPlaybackState akao;
     uint8_t key_on_events[2][24];
     uint8_t release_events[2][24];
     uint64_t voice_display_hold_until[2][24];
@@ -332,6 +358,7 @@ typedef struct AudioDisplaySnapshot {
 typedef struct PlayerState {
     Spu2LogLiveState live;
     Spu2LogLiveState frame_live;
+    Psf1AkaoPlaybackState akao;
     uint32_t sequence;
     const Psf2CoreProvider *provider;
     Psf2CoreBridge *core;
@@ -363,6 +390,9 @@ typedef struct PlayerState {
     HDC psf1_keyboard_dc;
     HBITMAP psf1_keyboard_bitmap;
     HBITMAP psf1_keyboard_old_bitmap;
+    HDC psf1_keyboard_base_dc;
+    HBITMAP psf1_keyboard_base_bitmap;
+    HBITMAP psf1_keyboard_base_old_bitmap;
     int psf1_keyboard_dark;
     int psf1_keyboard_width;
     HFONT meter_font;
@@ -374,6 +404,8 @@ typedef struct PlayerState {
     int display_render_source;
     int gauge_only_paint_pending;
     int paint_frame_initialized;
+    RECT voice_number_hit_rects[2][24];
+    uint8_t voice_number_hit_valid[2][24];
     HWND open_button;
     HWND play_button;
     HWND pause_button;
@@ -384,6 +416,7 @@ typedef struct PlayerState {
     HWND main_check;
     HWND reverb_check;
     HWND time_label;
+    HWND voice_scrollbar;
     int playing;
     int paused;
     int seek_discarding;
@@ -520,6 +553,12 @@ typedef struct PlayerState {
     int playlist_append_mode;
     int playback_from_playlist;
     uint32_t playback_generation;
+    int direct_start_retry_armed;
+    int direct_start_retry_remaining;
+    int direct_start_retry_from_playlist;
+    int direct_start_retry_playlist_index;
+    DWORD direct_start_retry_deadline;
+    char direct_start_retry_path[MAX_PATH];
     uint32_t playlist_random_state;
     HWND timbre_hwnd;
     HWND timbre_listbox;
@@ -560,6 +599,9 @@ typedef struct PlayerState {
     int32_t preview_reverb_r[PREVIEW_REVERB_FRAMES];
     uint32_t preview_reverb_pos;
     HFONT ui_font;
+    HFONT maximized_ui_font;
+    int maximized_ui_font_scale;
+    int time_label_base_width;
     char ui_font_path[MAX_PATH];
     char ui_font_face[LF_FACESIZE];
     int ui_font_size;
@@ -599,6 +641,9 @@ static COLORREF player_inactive_text_color(const PlayerState *state);
 static COLORREF player_muted_text_color(const PlayerState *state);
 static int reopen_core_for_seek(PlayerState *state, uint64_t *out_sample_pos);
 static void start_playback(HWND hwnd, PlayerState *state, const char *path);
+static void start_direct_playback(HWND hwnd, PlayerState *state, const char *path);
+static void cancel_direct_start_retry(HWND hwnd, PlayerState *state);
+static void process_direct_start_retry(HWND hwnd, PlayerState *state);
 static void show_playlist_window(HWND hwnd, PlayerState *state);
 static void playlist_play_index(HWND hwnd, PlayerState *state, int index);
 static void playlist_process_pending_play(HWND hwnd, PlayerState *state);
@@ -612,12 +657,25 @@ static void preview_stop_standalone_audio(PlayerState *state);
 static int read_font_family_from_file(const char *font_path, char *out_face, size_t out_size);
 static void rebuild_ui_font(PlayerState *state);
 static void apply_ui_font_to_window(HWND hwnd, HFONT font);
+static void layout_player_controls(HWND hwnd, PlayerState *state);
 static void restore_debug_edits_to_saved_values(HWND hwnd, PlayerState *state);
 static int get_player_display_line_height(HWND hwnd);
+static int maximized_voice_rows_target_bottom(
+    HWND hwnd,
+    const PlayerState *state);
 
 static int g_text_log_enabled = 1;
 static int g_window_fixed_width = PLAYER_DEFAULT_WIDTH;
 static int g_window_fixed_height = PLAYER_DEFAULT_HEIGHT;
+static int g_main_window_was_maximized = 0;
+static int g_main_restore_position_valid = 0;
+static int g_main_restore_position_active = 0;
+static int g_main_restore_x = 0;
+static int g_main_restore_y = 0;
+static int g_window_nonclient_width = 0;
+static int g_window_nonclient_height = 0;
+static int g_window_base_client_width = PLAYER_DEFAULT_WIDTH;
+static int g_window_base_client_height = PLAYER_DEFAULT_HEIGHT;
 static HFONT g_ui_font = NULL;
 
 static void show_about_dialog(HWND hwnd)
@@ -865,6 +923,41 @@ static int load_psf1_mode_window_size(
     return 1;
 }
 
+static int get_window_saved_rect(HWND hwnd, RECT *rect)
+{
+    WINDOWPLACEMENT placement;
+
+    if (hwnd == NULL || rect == NULL) {
+        return 0;
+    }
+    if (!IsZoomed(hwnd) && !IsIconic(hwnd)) {
+        return GetWindowRect(hwnd, rect) != 0;
+    }
+    ZeroMemory(&placement, sizeof(placement));
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(hwnd, &placement)) {
+        return 0;
+    }
+    *rect = placement.rcNormalPosition;
+    return 1;
+}
+
+static int window_is_or_restores_maximized(HWND hwnd)
+{
+    WINDOWPLACEMENT placement;
+
+    if (hwnd == NULL) {
+        return 0;
+    }
+    if (IsZoomed(hwnd)) {
+        return 1;
+    }
+    ZeroMemory(&placement, sizeof(placement));
+    placement.length = sizeof(placement);
+    return GetWindowPlacement(hwnd, &placement) &&
+        (placement.flags & WPF_RESTORETOMAXIMIZED) != 0;
+}
+
 static void save_psf1_mode_window_bounds(HWND hwnd, int display_mode)
 {
     const char *x_key = psf1_mode_window_key(display_mode, 0);
@@ -874,7 +967,10 @@ static void save_psf1_mode_window_bounds(HWND hwnd, int display_mode)
     char path[MAX_PATH];
     RECT rect;
 
-    if (hwnd == NULL || IsIconic(hwnd) || !GetWindowRect(hwnd, &rect)) {
+    if (hwnd == NULL || IsZoomed(hwnd) || IsIconic(hwnd)) {
+        return;
+    }
+    if (!get_window_saved_rect(hwnd, &rect)) {
         return;
     }
     get_player_ini_path(path, sizeof(path));
@@ -921,19 +1017,30 @@ static void load_window_bounds(
     }
 }
 
+static int load_window_maximized(void)
+{
+    char path[MAX_PATH];
+
+    get_player_ini_path(path, sizeof(path));
+    return GetPrivateProfileIntA("Window", "Maximized", 0, path) != 0;
+}
+
 static void save_window_bounds(HWND hwnd, const PlayerState *state)
 {
     char path[MAX_PATH];
     RECT rect;
+    int maximized;
 
-    if (hwnd == NULL || IsIconic(hwnd)) {
+    if (hwnd == NULL) {
         return;
     }
-    if (!GetWindowRect(hwnd, &rect)) {
+    if (!get_window_saved_rect(hwnd, &rect)) {
         return;
     }
 
     get_player_ini_path(path, sizeof(path));
+    maximized = window_is_or_restores_maximized(hwnd);
+    write_profile_int(path, "Window", "Maximized", maximized);
     write_profile_int(path, "Window", "X", rect.left);
     write_profile_int(path, "Window", "Y", rect.top);
     write_profile_int(path, "Window", "Width", rect.right - rect.left);
@@ -1128,6 +1235,9 @@ static void path_parent_folder(const char *path, char *out_folder, size_t out_si
         return;
     }
     length = (size_t)(last_slash - path);
+    if (length == 2u && path[1] == ':' && last_slash[0] != '\0') {
+        length = 3u;
+    }
     if (length >= out_size) {
         length = out_size - 1;
     }
@@ -1397,9 +1507,11 @@ static uint64_t scale_timeline_delta(uint64_t delta, int speed_percent)
 
 static uint64_t timeline_sample_at_locked(const PlayerState *state, uint64_t source_sample)
 {
-    if (state == NULL || !state->timeline_valid ||
-        source_sample < state->timeline_source_anchor) {
-        return source_sample;
+    if (state == NULL || !state->timeline_valid) {
+        return 0;
+    }
+    if (source_sample < state->timeline_source_anchor) {
+        return 0;
     }
     return state->timeline_scaled_anchor + scale_timeline_delta(
         source_sample - state->timeline_source_anchor,
@@ -1412,6 +1524,10 @@ static void rebase_timeline_speed_locked(PlayerState *state, int speed_percent)
     uint64_t scaled_sample;
 
     if (state == NULL) {
+        return;
+    }
+    if (!state->timeline_valid) {
+        state->timeline_speed_percent = speed_percent;
         return;
     }
     source_sample = state->live.last_sample_pos;
@@ -1531,6 +1647,7 @@ static void reset_live_display(PlayerState *state)
 
     lock_state(state);
     ZeroMemory(&state->live, sizeof(state->live));
+    ZeroMemory(&state->akao, sizeof(state->akao));
     state->live.version = SPU2LOG_VERSION;
     state->live.sample_rate = PLAYER_SAMPLE_RATE;
     state->stopped_display = 1;
@@ -1596,6 +1713,7 @@ static void reset_stopped_display(PlayerState *state)
 
     lock_state(state);
     ZeroMemory(&state->live, sizeof(state->live));
+    ZeroMemory(&state->akao, sizeof(state->akao));
     state->live.version = SPU2LOG_VERSION;
     state->live.sample_rate = PLAYER_SAMPLE_RATE;
     state->stopped_display = 1;
@@ -1682,6 +1800,27 @@ static void apply_effective_speed_percent(PlayerState *state)
     psf2log_set_imported_tempo_percent(get_effective_speed_percent(state));
 }
 
+static void update_speed_menu_check(HWND hwnd, const PlayerState *state)
+{
+    HMENU menu;
+    unsigned i;
+
+    if (hwnd == NULL || state == NULL) {
+        return;
+    }
+    menu = GetMenu(hwnd);
+    if (menu == NULL) {
+        return;
+    }
+    for (i = 0; i < SPEED_PRESET_COUNT; ++i) {
+        CheckMenuItem(menu,
+            IDM_SPEED_PRESET_FIRST + i,
+            MF_BYCOMMAND |
+                (state->speed_percent == g_speed_menu_values[i] ?
+                    MF_CHECKED : MF_UNCHECKED));
+    }
+}
+
 static void set_speed_percent(HWND hwnd, PlayerState *state, int speed_percent)
 {
     char label[32];
@@ -1712,6 +1851,7 @@ static void set_speed_percent(HWND hwnd, PlayerState *state, int speed_percent)
         (int)SendMessageA(state->speed_slider, TBM_GETPOS, 0, 0) != speed_percent) {
         SendMessageA(state->speed_slider, TBM_SETPOS, TRUE, speed_percent);
     }
+    update_speed_menu_check(hwnd, state);
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
@@ -2190,6 +2330,7 @@ static void store_active_gauge_colors_to_theme(PlayerState *state)
 }
 
 typedef HRESULT (WINAPI *DwmSetWindowAttributeProc)(HWND, DWORD, LPCVOID, DWORD);
+typedef HRESULT (WINAPI *SetWindowThemeProc)(HWND, LPCWSTR, LPCWSTR);
 typedef int (WINAPI *SetPreferredAppModeProc)(int);
 typedef void (WINAPI *FlushMenuThemesProc)(void);
 
@@ -2235,6 +2376,35 @@ static void apply_window_dark_title(HWND hwnd, const PlayerState *state)
         }
     }
     FreeLibrary(dwm);
+}
+
+static void apply_voice_scrollbar_theme(PlayerState *state)
+{
+    HMODULE ux_theme;
+    SetWindowThemeProc set_window_theme;
+    HRESULT result;
+
+    if (state == NULL || state->voice_scrollbar == NULL) {
+        return;
+    }
+    ux_theme = LoadLibraryA("uxtheme.dll");
+    if (ux_theme == NULL) {
+        return;
+    }
+    set_window_theme = (SetWindowThemeProc)GetProcAddress(
+        ux_theme, "SetWindowTheme");
+    if (set_window_theme != NULL) {
+        result = set_window_theme(state->voice_scrollbar,
+            is_dark_theme_active(state) ? L"DarkMode_Explorer" : L"Explorer",
+            NULL);
+        if (FAILED(result) && is_dark_theme_active(state)) {
+            (void)set_window_theme(state->voice_scrollbar, L"Explorer", NULL);
+        }
+        SendMessageA(state->voice_scrollbar, WM_THEMECHANGED, 0, 0);
+        RedrawWindow(state->voice_scrollbar, NULL, NULL,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    }
+    FreeLibrary(ux_theme);
 }
 
 static void apply_menu_info_recursive(HMENU menu, const MENUINFO *info)
@@ -2291,6 +2461,7 @@ static void apply_window_theme(HWND hwnd, PlayerState *state)
     apply_app_menu_dark_mode(is_dark_theme_active(state));
     apply_window_dark_title(hwnd, state);
     apply_menu_theme(hwnd, state);
+    apply_voice_scrollbar_theme(state);
     if (hwnd != NULL && state != NULL && state->playlist_hwnd != NULL) {
         apply_window_dark_title(state->playlist_hwnd, state);
         apply_menu_theme(state->playlist_hwnd, state);
@@ -2764,6 +2935,7 @@ static void update_settings_menu_check(HWND hwnd, const PlayerState *state)
     CheckMenuItem(menu, IDM_PERF_LOW, MF_BYCOMMAND | (state->performance_profile == 0 ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_PERF_MIDDLE, MF_BYCOMMAND | (state->performance_profile == 1 ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_PERF_HIGH, MF_BYCOMMAND | (state->performance_profile == 2 ? MF_CHECKED : MF_UNCHECKED));
+    update_speed_menu_check(hwnd, state);
     CheckMenuItem(menu, IDM_ENV_COLOR_GREEN, MF_BYCOMMAND | (state->env_color_index == 0 ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_ENV_COLOR_BLUE, MF_BYCOMMAND | (state->env_color_index == 1 ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_ENV_COLOR_CYAN, MF_BYCOMMAND | (state->env_color_index == 2 ? MF_CHECKED : MF_UNCHECKED));
@@ -2783,9 +2955,10 @@ static void update_settings_menu_check(HWND hwnd, const PlayerState *state)
     CheckMenuItem(menu, IDM_LR_COLOR_WHITE, MF_BYCOMMAND | (state->lr_color_index == 7 ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_LR_COLOR_CUSTOM, MF_BYCOMMAND | (state->lr_color_index == CUSTOM_COLOR_INDEX ? MF_CHECKED : MF_UNCHECKED));
     {
-        UINT id;
+        unsigned volume_percent;
         UINT checked_id = (UINT)(IDM_VOLUME_0 + (normalize_volume_percent(state->volume_percent) / 10));
-        for (id = IDM_VOLUME_0; id <= IDM_VOLUME_200; ++id) {
+        for (volume_percent = 0; volume_percent <= 200; volume_percent += 20) {
+            UINT id = (UINT)(IDM_VOLUME_0 + (volume_percent / 10));
             CheckMenuItem(menu, id, MF_BYCOMMAND | (id == checked_id ? MF_CHECKED : MF_UNCHECKED));
         }
     }
@@ -2891,6 +3064,7 @@ static void set_theme_mode(HWND hwnd, PlayerState *state, int mode)
     apply_window_theme(hwnd, state);
     update_settings_menu_check(hwnd, state);
     recreate_speed_slider(hwnd, state);
+    layout_player_controls(hwnd, state);
     RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     if (state->playlist_hwnd != NULL) {
         RedrawWindow(state->playlist_hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
@@ -4349,7 +4523,7 @@ static void set_voice_adsr_value(HWND hwnd, PlayerState *state, unsigned core, u
         break;
     }
     unlock_state(state);
-    InvalidateRect(hwnd, NULL, TRUE);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 typedef void (*HexValueChangedCallback)(void *user, unsigned value);
@@ -4379,7 +4553,7 @@ static void set_noise_clock_value(HWND hwnd, PlayerState *state, unsigned core, 
         state->live.voices[core][voice].noise_clock = (uint8_t)value;
     }
     unlock_state(state);
-    InvalidateRect(hwnd, NULL, TRUE);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static unsigned current_noise_clock_value(PlayerState *state, unsigned core)
@@ -4448,7 +4622,7 @@ static void set_reverb_value(HWND hwnd, PlayerState *state, unsigned core, unsig
     }
     state->manual_reverb_value_valid[core][side] = 1u;
     unlock_state(state);
-    InvalidateRect(hwnd, NULL, TRUE);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void adjust_noise_clock_value(HWND hwnd, PlayerState *state, unsigned core, int delta)
@@ -4608,14 +4782,13 @@ static void set_voice_pitch_value(HWND hwnd, PlayerState *state, unsigned core, 
         value = 0x3fffu;
     }
     save_debug_voice_value_if_needed(state, core, voice);
-    psf2log_set_imported_voice_pitch(core, voice, value);
     lock_state(state);
     state->live.voices[core][voice].pitch = (uint16_t)value;
     state->voice_pitch_lock_value[core][voice] = (uint16_t)value;
     state->voice_pitch_lock_mask[core] |= (1u << voice);
     unlock_state(state);
     psf2log_set_imported_voice_pitch_lock(core, voice, 1, value);
-    InvalidateRect(hwnd, NULL, TRUE);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void input_voice_pitch_value(HWND hwnd, PlayerState *state, unsigned core, unsigned voice)
@@ -4656,7 +4829,6 @@ static void set_voice_volume_value(HWND hwnd, PlayerState *state, unsigned core,
     }
     value &= 0xffffu;
     save_debug_voice_value_if_needed(state, core, voice);
-    psf2log_set_imported_voice_volume(core, voice, side, value);
     lock_state(state);
     if (side == 0u) {
         state->live.voices[core][voice].vol_l = (uint16_t)value;
@@ -4667,7 +4839,7 @@ static void set_voice_volume_value(HWND hwnd, PlayerState *state, unsigned core,
     state->voice_volume_lock_mask[side][core] |= (1u << voice);
     unlock_state(state);
     psf2log_set_imported_voice_volume_lock(core, voice, side, 1, value);
-    InvalidateRect(hwnd, NULL, TRUE);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void input_voice_volume_value(HWND hwnd, PlayerState *state, unsigned core, unsigned voice, unsigned side)
@@ -5557,6 +5729,7 @@ static void apply_font_dialog_selection(HWND hwnd, FontDialogState *dialog)
     rebuild_ui_font(dialog->player);
     save_ui_font_settings(dialog->player);
     apply_ui_font_to_window(dialog->player->hwnd, dialog->player->ui_font);
+    layout_player_controls(dialog->player->hwnd, dialog->player);
     apply_ui_font_to_window(hwnd, dialog->player->ui_font);
     if (dialog->player->playlist_hwnd != NULL) {
         apply_ui_font_to_window(dialog->player->playlist_hwnd, dialog->player->ui_font);
@@ -6014,6 +6187,11 @@ static void rebuild_ui_font(PlayerState *state)
     if (state->ui_font_face[0] != '\0') {
         new_font = create_ui_font_from_face(state->ui_font_face, state->ui_font_size);
     }
+    if (state->maximized_ui_font != NULL) {
+        DeleteObject(state->maximized_ui_font);
+        state->maximized_ui_font = NULL;
+        state->maximized_ui_font_scale = 0;
+    }
     if (state->ui_font != NULL) {
         DeleteObject(state->ui_font);
         state->ui_font = NULL;
@@ -6310,7 +6488,14 @@ static LRESULT CALLBACK value_dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, LP
     case WM_HSCROLL:
         if (dialog != NULL && (HWND)lparam == GetDlgItem(hwnd, IDC_VALUE_SLIDER)) {
             char code[16];
-            unsigned value = (unsigned)SendMessageA((HWND)lparam, TBM_GETPOS, 0, 0);
+            UINT scroll_code = LOWORD(wparam);
+            unsigned value;
+
+            if (scroll_code == SB_THUMBTRACK || scroll_code == SB_THUMBPOSITION) {
+                value = (unsigned)HIWORD(wparam);
+            } else {
+                value = (unsigned)SendMessageA((HWND)lparam, TBM_GETPOS, 0, 0);
+            }
             if (dialog->slider_step > 1u) {
                 int delta = (int)value - dialog->slider_pos;
                 int next_value;
@@ -6640,8 +6825,9 @@ static void apply_reverb_dialog_value(HWND hwnd, ReverbDialogState *dialog, unsi
     set_reverb_value(dialog->owner, dialog->player, dialog->core, side, value);
 }
 
-static void adjust_reverb_dialog_slider(HWND hwnd, ReverbDialogState *dialog, unsigned side, HWND slider, UINT scroll_code)
+static void adjust_reverb_dialog_slider(HWND hwnd, ReverbDialogState *dialog, unsigned side, HWND slider, WPARAM scroll_wparam)
 {
+    UINT scroll_code;
     int pos;
     int *base_pos;
     int delta;
@@ -6654,7 +6840,12 @@ static void adjust_reverb_dialog_slider(HWND hwnd, ReverbDialogState *dialog, un
         return;
     }
 
-    pos = (int)SendMessageA(slider, TBM_GETPOS, 0, 0);
+    scroll_code = LOWORD(scroll_wparam);
+    if (scroll_code == SB_THUMBTRACK || scroll_code == SB_THUMBPOSITION) {
+        pos = (int)(unsigned)HIWORD(scroll_wparam);
+    } else {
+        pos = (int)SendMessageA(slider, TBM_GETPOS, 0, 0);
+    }
     base_pos = side == 0u ? &dialog->slider_pos_l : &dialog->slider_pos_r;
     delta = pos - *base_pos;
     if (delta == 0) {
@@ -6671,7 +6862,9 @@ static void adjust_reverb_dialog_slider(HWND hwnd, ReverbDialogState *dialog, un
 
     apply_reverb_dialog_value(hwnd, dialog, side, new_value);
     *base_pos = (int)reverb_value_to_slider_pos(new_value);
-    SendMessageA(slider, TBM_SETPOS, TRUE, (LPARAM)*base_pos);
+    if (!is_thumb_scroll_code(scroll_code)) {
+        SendMessageA(slider, TBM_SETPOS, TRUE, (LPARAM)*base_pos);
+    }
 
     if (dialog->link) {
         unsigned other_side = side == 0u ? 1u : 0u;
@@ -6758,11 +6951,11 @@ static LRESULT CALLBACK reverb_dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, L
     }
     case WM_HSCROLL:
         if (dialog != NULL && (HWND)lparam == GetDlgItem(hwnd, IDC_REVERB_SLIDER_L)) {
-            adjust_reverb_dialog_slider(hwnd, dialog, 0u, (HWND)lparam, LOWORD(wparam));
+            adjust_reverb_dialog_slider(hwnd, dialog, 0u, (HWND)lparam, wparam);
             return 0;
         }
         if (dialog != NULL && (HWND)lparam == GetDlgItem(hwnd, IDC_REVERB_SLIDER_R)) {
-            adjust_reverb_dialog_slider(hwnd, dialog, 1u, (HWND)lparam, LOWORD(wparam));
+            adjust_reverb_dialog_slider(hwnd, dialog, 1u, (HWND)lparam, wparam);
             return 0;
         }
         break;
@@ -6990,8 +7183,9 @@ static void apply_volume_dialog_value(HWND hwnd, VolumeDialogState *dialog, unsi
     set_voice_volume_value(dialog->owner, dialog->player, dialog->core, dialog->voice, side, encoded);
 }
 
-static void adjust_volume_dialog_slider(HWND hwnd, VolumeDialogState *dialog, unsigned side, HWND slider, UINT scroll_code)
+static void adjust_volume_dialog_slider(HWND hwnd, VolumeDialogState *dialog, unsigned side, HWND slider, WPARAM scroll_wparam)
 {
+    UINT scroll_code;
     int pos;
     int *base_pos;
     int delta;
@@ -7004,7 +7198,12 @@ static void adjust_volume_dialog_slider(HWND hwnd, VolumeDialogState *dialog, un
         return;
     }
 
-    pos = (int)SendMessageA(slider, TBM_GETPOS, 0, 0);
+    scroll_code = LOWORD(scroll_wparam);
+    if (scroll_code == SB_THUMBTRACK || scroll_code == SB_THUMBPOSITION) {
+        pos = (int)(unsigned)HIWORD(scroll_wparam);
+    } else {
+        pos = (int)SendMessageA(slider, TBM_GETPOS, 0, 0);
+    }
     base_pos = side == 0u ? &dialog->slider_pos_l : &dialog->slider_pos_r;
     delta = pos - *base_pos;
     if (delta == 0) {
@@ -7021,7 +7220,9 @@ static void adjust_volume_dialog_slider(HWND hwnd, VolumeDialogState *dialog, un
 
     apply_volume_dialog_value(hwnd, dialog, side, new_value);
     *base_pos = (int)new_pos;
-    SendMessageA(slider, TBM_SETPOS, TRUE, (LPARAM)*base_pos);
+    if (!is_thumb_scroll_code(scroll_code)) {
+        SendMessageA(slider, TBM_SETPOS, TRUE, (LPARAM)*base_pos);
+    }
 
     if (dialog->link) {
         unsigned other_side = side == 0u ? 1u : 0u;
@@ -7108,11 +7309,11 @@ static LRESULT CALLBACK volume_dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, L
     }
     case WM_HSCROLL:
         if (dialog != NULL && (HWND)lparam == GetDlgItem(hwnd, IDC_REVERB_SLIDER_L)) {
-            adjust_volume_dialog_slider(hwnd, dialog, 0u, (HWND)lparam, LOWORD(wparam));
+            adjust_volume_dialog_slider(hwnd, dialog, 0u, (HWND)lparam, wparam);
             return 0;
         }
         if (dialog != NULL && (HWND)lparam == GetDlgItem(hwnd, IDC_REVERB_SLIDER_R)) {
-            adjust_volume_dialog_slider(hwnd, dialog, 1u, (HWND)lparam, LOWORD(wparam));
+            adjust_volume_dialog_slider(hwnd, dialog, 1u, (HWND)lparam, wparam);
             return 0;
         }
         break;
@@ -7468,6 +7669,19 @@ static unsigned noise_clock_frequency_hz(unsigned noise_clock)
         divisor = 1u;
     }
     return (unsigned)((PLAYER_SAMPLE_RATE + (divisor / 2u)) / divisor);
+}
+
+static double psf1_tempo_bpm(
+    uint32_t sequence_tempo,
+    int early_format,
+    int driver_type)
+{
+    const double divisor = early_format ? 214.998204082 : 218.453333333;
+
+    if (driver_type == PSF1_MUSIC_DRIVER_SONY_SEQ) {
+        return sequence_tempo != 0u ? 60000000.0 / (double)sequence_tempo : 0.0;
+    }
+    return (double)sequence_tempo / divisor;
 }
 
 static uint32_t effective_voice_flags(
@@ -8795,6 +9009,30 @@ static int psf1_values_keyboard_window_height(HWND hwnd, const PlayerState *stat
     return client_height + nonclient_height;
 }
 
+static int player_values_window_height(HWND hwnd, const PlayerState *state)
+{
+    RECT window_rect;
+    RECT client_rect;
+    int line_height;
+    int client_height;
+    int nonclient_height;
+
+    if (hwnd == NULL) {
+        return PLAYER_DEFAULT_HEIGHT;
+    }
+    line_height = state != NULL && state->meter_line_height > 0 ?
+        state->meter_line_height : get_player_display_line_height(hwnd);
+    client_height = 2 + CONTROLS_HEIGHT + (line_height * 2) +
+        (24 * line_height) + 4;
+    if (!GetWindowRect(hwnd, &window_rect) ||
+        !GetClientRect(hwnd, &client_rect)) {
+        return PLAYER_DEFAULT_HEIGHT;
+    }
+    nonclient_height = (window_rect.bottom - window_rect.top) -
+        (client_rect.bottom - client_rect.top);
+    return client_height + nonclient_height;
+}
+
 static int preview_keyboard_is_active(const PlayerState *state)
 {
     HWND focus;
@@ -8813,6 +9051,460 @@ static int preview_keyboard_is_active(const PlayerState *state)
         GetAncestor(focus, GA_ROOT) == state->preview_hwnd;
 }
 
+typedef struct PlayerScaleLayout {
+    int base_width;
+    int base_height;
+    int dest_x;
+    int dest_y;
+    int dest_width;
+    int dest_height;
+    int scale_milli;
+    int scaled;
+} PlayerScaleLayout;
+
+static void update_player_base_client_metrics(HWND hwnd)
+{
+    RECT window_rect;
+    RECT client_rect;
+
+    if (hwnd == NULL || IsZoomed(hwnd) || IsIconic(hwnd) ||
+        !GetWindowRect(hwnd, &window_rect) ||
+        !GetClientRect(hwnd, &client_rect)) {
+        return;
+    }
+    g_window_nonclient_width =
+        (window_rect.right - window_rect.left) -
+        (client_rect.right - client_rect.left);
+    g_window_nonclient_height =
+        (window_rect.bottom - window_rect.top) -
+        (client_rect.bottom - client_rect.top);
+    g_window_base_client_width = g_window_fixed_width - g_window_nonclient_width;
+    g_window_base_client_height = g_window_fixed_height - g_window_nonclient_height;
+    if (g_window_base_client_width <= 0) {
+        g_window_base_client_width = client_rect.right - client_rect.left;
+    }
+    if (g_window_base_client_height <= 0) {
+        g_window_base_client_height = client_rect.bottom - client_rect.top;
+    }
+}
+
+static void get_player_scale_layout(HWND hwnd, PlayerScaleLayout *layout)
+{
+    RECT client_rect;
+    int client_width;
+    int client_height;
+    int width_scale;
+    int height_scale;
+
+    if (layout == NULL) {
+        return;
+    }
+    ZeroMemory(layout, sizeof(*layout));
+    if (hwnd == NULL || !GetClientRect(hwnd, &client_rect)) {
+        return;
+    }
+    client_width = client_rect.right - client_rect.left;
+    client_height = client_rect.bottom - client_rect.top;
+    layout->base_width = g_window_base_client_width > 0 ?
+        g_window_base_client_width : client_width;
+    layout->base_height = g_window_base_client_height > 0 ?
+        g_window_base_client_height : client_height;
+    layout->scale_milli = 1000;
+    layout->dest_width = layout->base_width;
+    layout->dest_height = layout->base_height;
+    if (IsZoomed(hwnd) && layout->base_width > 0 && layout->base_height > 0) {
+        width_scale = (client_width * 1000) / layout->base_width;
+        height_scale = (client_height * 1000) / layout->base_height;
+        layout->scale_milli = width_scale < height_scale ?
+            width_scale : height_scale;
+        if (layout->scale_milli <= 0) {
+            layout->scale_milli = 1;
+        }
+        layout->dest_width =
+            (layout->base_width * layout->scale_milli + 500) / 1000;
+        layout->dest_height =
+            (layout->base_height * layout->scale_milli + 500) / 1000;
+        layout->dest_x = (client_width - layout->dest_width) / 2;
+        layout->dest_y = 0;
+        layout->scaled = 1;
+    }
+}
+
+static void get_player_chrome_scale_layout(
+    HWND hwnd,
+    const PlayerState *state,
+    PlayerScaleLayout *layout)
+{
+    RECT client_rect;
+    int client_width;
+    int client_height;
+    int width_scale;
+    int height_scale;
+
+    get_player_scale_layout(hwnd, layout);
+    if (hwnd == NULL || state == NULL || layout == NULL ||
+        !IsZoomed(hwnd) || !GetClientRect(hwnd, &client_rect)) {
+        return;
+    }
+
+    client_width = client_rect.right - client_rect.left;
+    client_height = client_rect.bottom - client_rect.top;
+    layout->base_width = PLAYER_PSF1_WIDTH - g_window_nonclient_width;
+    layout->base_height = PLAYER_PSF1_KEYBOARD_ONLY_HEIGHT -
+        g_window_nonclient_height;
+    if (layout->base_width <= 0 || layout->base_height <= 0) {
+        return;
+    }
+
+    width_scale = (client_width * 1000) / layout->base_width;
+    height_scale = (client_height * 1000) / layout->base_height;
+    layout->scale_milli = width_scale < height_scale ?
+        width_scale : height_scale;
+    layout->scale_milli =
+        (layout->scale_milli * PLAYER_FULLSCREEN_CHROME_PERCENT + 50) / 100;
+    if (layout->scale_milli <= 0) {
+        layout->scale_milli = 1;
+    }
+    layout->dest_width =
+        (layout->base_width * layout->scale_milli + 500) / 1000;
+    layout->dest_height =
+        (layout->base_height * layout->scale_milli + 500) / 1000;
+    layout->dest_x = (client_width - layout->dest_width) / 2;
+    layout->dest_y = 0;
+    layout->scaled = 1;
+}
+
+static void get_fullscreen_reference_layout(
+    HWND hwnd,
+    const PlayerState *state,
+    PlayerScaleLayout *layout)
+{
+    PlayerScaleLayout chrome_layout;
+    RECT client_rect;
+    int client_width;
+    int client_height;
+    int base_width;
+    int base_height;
+    int chrome_bottom;
+    int width_scale;
+    int height_scale;
+
+    if (layout == NULL) {
+        return;
+    }
+    ZeroMemory(layout, sizeof(*layout));
+    if (hwnd == NULL || state == NULL || !IsZoomed(hwnd) ||
+        !GetClientRect(hwnd, &client_rect)) {
+        return;
+    }
+    get_player_chrome_scale_layout(hwnd, state, &chrome_layout);
+    if (!chrome_layout.scaled) {
+        return;
+    }
+
+    client_width = client_rect.right - client_rect.left;
+    client_height = client_rect.bottom - client_rect.top;
+    base_width = PLAYER_PSF1_WIDTH - g_window_nonclient_width;
+    base_height = PLAYER_PSF1_KEYBOARD_ONLY_HEIGHT -
+        g_window_nonclient_height;
+    chrome_bottom =
+        (CONTROLS_HEIGHT * chrome_layout.scale_milli + 500) / 1000;
+    if (base_width <= 0 || base_height <= CONTROLS_HEIGHT + 4 ||
+        client_height <= chrome_bottom + 4) {
+        return;
+    }
+
+    width_scale = (client_width * 1000) / base_width;
+    height_scale = ((client_height - chrome_bottom - 4) * 1000) /
+        (base_height - CONTROLS_HEIGHT - 4);
+    layout->base_width = base_width;
+    layout->base_height = base_height;
+    layout->scale_milli = width_scale < height_scale ?
+        width_scale : height_scale;
+    if (layout->scale_milli <= 0) {
+        layout->scale_milli = 1;
+    }
+    layout->dest_width =
+        (base_width * layout->scale_milli + 500) / 1000;
+    layout->dest_height =
+        (base_height * layout->scale_milli + 500) / 1000;
+    layout->dest_x = (client_width - layout->dest_width) / 2;
+    layout->dest_y = chrome_bottom -
+        (CONTROLS_HEIGHT * layout->scale_milli + 500) / 1000;
+    layout->scaled = 1;
+}
+
+static int get_fullscreen_reference_scale_milli(
+    HWND hwnd,
+    const PlayerState *state)
+{
+    PlayerScaleLayout layout;
+
+    get_fullscreen_reference_layout(hwnd, state, &layout);
+    return layout.scaled ? layout.scale_milli : 1000;
+}
+
+static void get_player_content_scale_layout(
+    HWND hwnd,
+    const PlayerState *state,
+    PlayerScaleLayout *layout)
+{
+    PlayerScaleLayout chrome_layout;
+    RECT client_rect;
+    int client_width;
+    int client_height;
+    int chrome_bottom;
+    int content_height;
+    int line_height;
+    int active_header_scale;
+    int active_header_height;
+    int width_scale;
+    int height_scale;
+
+    get_player_scale_layout(hwnd, layout);
+    if (hwnd == NULL || state == NULL || layout == NULL ||
+        !IsZoomed(hwnd) || !layout->scaled ||
+        !GetClientRect(hwnd, &client_rect)) {
+        return;
+    }
+
+    get_player_chrome_scale_layout(hwnd, state, &chrome_layout);
+    if (!chrome_layout.scaled) {
+        return;
+    }
+    client_width = client_rect.right - client_rect.left;
+    client_height = client_rect.bottom - client_rect.top;
+    chrome_bottom =
+        (CONTROLS_HEIGHT * chrome_layout.scale_milli + 500) / 1000;
+    line_height = state->meter_line_height > 0 ?
+        state->meter_line_height : get_player_display_line_height(hwnd);
+    active_header_scale = get_fullscreen_reference_scale_milli(
+        hwnd, state);
+    active_header_height =
+        (line_height * active_header_scale + 500) / 1000;
+    if (state->psf_version == 0x01u &&
+        normalize_psf1_display_mode(state->psf1_display_mode) ==
+        PSF1_DISPLAY_VALUES_KEYBOARD) {
+        int rows_height = 2 + line_height +
+            16 * (line_height + PSF1_TRACK_KEYBOARD_HEIGHT);
+        int rows_scale = ((client_height - chrome_bottom -
+            active_header_height - 4) * 1000) / rows_height;
+
+        width_scale = (client_width * 1000) / layout->base_width;
+        layout->scale_milli = width_scale < rows_scale ?
+            width_scale : rows_scale;
+        if (layout->scale_milli <= 0) {
+            layout->scale_milli = 1;
+        }
+        layout->dest_width =
+            (layout->base_width * layout->scale_milli + 500) / 1000;
+        layout->dest_height =
+            (layout->base_height * layout->scale_milli + 500) / 1000;
+        layout->dest_x = (client_width - layout->dest_width) / 2;
+        layout->dest_y = chrome_bottom -
+            (CONTROLS_HEIGHT * layout->scale_milli + 500) / 1000;
+        layout->scaled = 1;
+        return;
+    }
+    content_height = layout->base_height - CONTROLS_HEIGHT -
+        line_height - 4;
+    if (content_height <= 0 ||
+        client_height <= chrome_bottom + active_header_height + 4) {
+        return;
+    }
+    width_scale = (client_width * 1000) / layout->base_width;
+    height_scale = ((client_height - chrome_bottom -
+        active_header_height - 4) * 1000) / content_height;
+    if (state->psf_version == 0x02u) {
+        int ps2_content_height = layout->base_height - CONTROLS_HEIGHT - 4;
+        int ps2_height_scale = ps2_content_height > 0 ?
+            ((client_height - chrome_bottom - 4) * 1000) /
+                ps2_content_height : height_scale;
+        int horizontal_scale;
+        int vertical_scale;
+
+        horizontal_scale = width_scale < ps2_height_scale ?
+            width_scale : ps2_height_scale;
+        horizontal_scale =
+            (horizontal_scale * PLAYER_PSF2_FULLSCREEN_CONTENT_PERCENT + 50) /
+                100;
+        vertical_scale =
+            (horizontal_scale * PLAYER_PSF2_FULLSCREEN_VERTICAL_PERCENT + 50) /
+                100;
+        if (vertical_scale > ps2_height_scale) {
+            vertical_scale = ps2_height_scale;
+        }
+        if (horizontal_scale <= 0) {
+            horizontal_scale = 1;
+        }
+        if (vertical_scale <= 0) {
+            vertical_scale = 1;
+        }
+        layout->scale_milli = vertical_scale;
+        layout->dest_width =
+            (layout->base_width * horizontal_scale + 500) / 1000;
+        layout->dest_height =
+            (layout->base_height * vertical_scale + 500) / 1000;
+        layout->dest_x = (client_width - layout->dest_width) / 2;
+        layout->dest_y = chrome_bottom -
+            (CONTROLS_HEIGHT * vertical_scale + 500) / 1000;
+        layout->scaled = 1;
+        return;
+    }
+    layout->scale_milli = width_scale < height_scale ?
+        width_scale : height_scale;
+    if (layout->scale_milli <= 0) {
+        layout->scale_milli = 1;
+    }
+    layout->dest_width =
+        (layout->base_width * layout->scale_milli + 500) / 1000;
+    layout->dest_height =
+        (layout->base_height * layout->scale_milli + 500) / 1000;
+    layout->dest_x = (client_width - layout->dest_width) / 2;
+    layout->dest_y = chrome_bottom -
+        (CONTROLS_HEIGHT * layout->scale_milli + 500) / 1000;
+    layout->scaled = 1;
+}
+
+static int maximized_active_header_line_height(
+    HWND hwnd,
+    const PlayerState *state,
+    int line_height)
+{
+    PlayerScaleLayout content_layout;
+    int target_scale;
+    int logical_height;
+
+    if (hwnd == NULL || state == NULL || line_height <= 0 ||
+        !IsZoomed(hwnd)) {
+        return line_height;
+    }
+    if (state->psf_version == 0x02u) {
+        return line_height;
+    }
+    get_player_content_scale_layout(hwnd, state, &content_layout);
+    if (!content_layout.scaled || content_layout.scale_milli <= 0) {
+        return line_height;
+    }
+    target_scale = get_fullscreen_reference_scale_milli(hwnd, state);
+    logical_height = (line_height * target_scale +
+        content_layout.scale_milli / 2) / content_layout.scale_milli;
+    return logical_height > 0 ? logical_height : 1;
+}
+
+static int scale_player_value(int value, int scale_milli)
+{
+    return (value * scale_milli + 500) / 1000;
+}
+
+static void position_scaled_control(
+    HWND control,
+    const PlayerScaleLayout *layout,
+    int x,
+    int y,
+    int width,
+    int height)
+{
+    if (control == NULL || layout == NULL) {
+        return;
+    }
+    SetWindowPos(control, NULL,
+        layout->dest_x + scale_player_value(x, layout->scale_milli),
+        layout->dest_y + scale_player_value(y, layout->scale_milli),
+        scale_player_value(width, layout->scale_milli),
+        scale_player_value(height, layout->scale_milli),
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+}
+
+static HFONT player_control_font_for_scale(
+    PlayerState *state,
+    int scale_milli)
+{
+    HFONT base_font;
+    LOGFONTA logfont;
+    int scaled_height;
+
+    if (state == NULL) {
+        return NULL;
+    }
+    base_font = state->ui_font != NULL ?
+        state->ui_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    if (scale_milli <= 1000) {
+        if (state->maximized_ui_font != NULL) {
+            DeleteObject(state->maximized_ui_font);
+            state->maximized_ui_font = NULL;
+            state->maximized_ui_font_scale = 0;
+        }
+        return base_font;
+    }
+    if (state->maximized_ui_font != NULL &&
+        state->maximized_ui_font_scale == scale_milli) {
+        return state->maximized_ui_font;
+    }
+    if (state->maximized_ui_font != NULL) {
+        DeleteObject(state->maximized_ui_font);
+        state->maximized_ui_font = NULL;
+    }
+    ZeroMemory(&logfont, sizeof(logfont));
+    if (GetObjectA(base_font, sizeof(logfont), &logfont) == 0) {
+        return base_font;
+    }
+    scaled_height = (logfont.lfHeight * scale_milli) / 1000;
+    if (scaled_height == 0) {
+        scaled_height = logfont.lfHeight < 0 ? -1 : 1;
+    }
+    logfont.lfHeight = scaled_height;
+    logfont.lfWidth = 0;
+    state->maximized_ui_font = CreateFontIndirectA(&logfont);
+    state->maximized_ui_font_scale = scale_milli;
+    return state->maximized_ui_font != NULL ?
+        state->maximized_ui_font : base_font;
+}
+
+static void layout_player_controls(HWND hwnd, PlayerState *state)
+{
+    PlayerScaleLayout layout;
+    HFONT control_font;
+    int spacing_step;
+    int time_width;
+
+    if (hwnd == NULL || state == NULL) {
+        return;
+    }
+    get_player_chrome_scale_layout(hwnd, state, &layout);
+    if (layout.base_width <= 0 || layout.base_height <= 0) {
+        return;
+    }
+    time_width = state->time_label_base_width > 0 ?
+        state->time_label_base_width : TIME_LABEL_MIN_WIDTH;
+    spacing_step = IsZoomed(hwnd) ? 2 : 0;
+    position_scaled_control(state->open_button, &layout, 6, 4, 54, 20);
+    position_scaled_control(state->play_button, &layout,
+        64 + spacing_step, 4, 54, 20);
+    position_scaled_control(state->pause_button, &layout,
+        122 + spacing_step * 2, 4, 58, 20);
+    position_scaled_control(state->stop_button, &layout,
+        184 + spacing_step * 3, 4, 54, 20);
+    position_scaled_control(state->speed_slider, &layout,
+        252 + spacing_step * 4, 1, 136, 26);
+    position_scaled_control(state->speed_label, &layout,
+        394 + spacing_step * 5, 6, 94, 16);
+    position_scaled_control(state->volume_label, &layout,
+        492 + spacing_step * 6, 6, 68, 16);
+    position_scaled_control(state->main_check, &layout,
+        564 + spacing_step * 7, 4, 58, 20);
+    position_scaled_control(state->reverb_check, &layout,
+        626 + spacing_step * 8, 4, 70, 20);
+    position_scaled_control(state->time_label, &layout,
+        702 + spacing_step * 9, 6, time_width, 16);
+    control_font = player_control_font_for_scale(state, layout.scale_milli);
+    if (control_font != NULL) {
+        apply_ui_font_to_window(hwnd, control_font);
+    }
+    RedrawWindow(hwnd, NULL, NULL,
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
 static void apply_psf_window_mode(HWND hwnd, const PlayerState *state, uint8_t psf_version)
 {
     int width = psf_version == 0x01u ? PLAYER_PSF1_WIDTH : PLAYER_DEFAULT_WIDTH;
@@ -8826,22 +9518,66 @@ static void apply_psf_window_mode(HWND hwnd, const PlayerState *state, uint8_t p
     }
 
     if (psf_version == 0x01u && state != NULL) {
+        int display_mode = normalize_psf1_display_mode(
+            state->psf1_display_mode);
+
         load_psf1_mode_window_size(
             state->psf1_display_mode, &width, &height);
         if (load_psf1_mode_window_position(
                 state->psf1_display_mode, &x, &y)) {
             flags &= ~SWP_NOMOVE;
         }
-        if (normalize_psf1_display_mode(state->psf1_display_mode) ==
-            PSF1_DISPLAY_VALUES_KEYBOARD) {
+        if (display_mode == PSF1_DISPLAY_VALUES_KEYBOARD) {
             height = psf1_values_keyboard_window_height(hwnd, state);
+        } else if (display_mode == PSF1_DISPLAY_VALUES) {
+            height = player_values_window_height(hwnd, state);
         }
+    } else {
+        height = player_values_window_height(hwnd, state);
+    }
+    if (g_main_restore_position_valid &&
+        (IsZoomed(hwnd) || g_main_restore_position_active)) {
+        x = g_main_restore_x;
+        y = g_main_restore_y;
+        flags &= ~SWP_NOMOVE;
     }
 
     g_window_fixed_width = width;
     g_window_fixed_height = height;
+    if (IsZoomed(hwnd) || IsIconic(hwnd)) {
+        WINDOWPLACEMENT placement;
+
+        ZeroMemory(&placement, sizeof(placement));
+        placement.length = sizeof(placement);
+        if (GetWindowPlacement(hwnd, &placement)) {
+            if ((flags & SWP_NOMOVE) != 0) {
+                x = placement.rcNormalPosition.left;
+                y = placement.rcNormalPosition.top;
+            }
+            placement.rcNormalPosition.left = x;
+            placement.rcNormalPosition.top = y;
+            placement.rcNormalPosition.right = x + width;
+            placement.rcNormalPosition.bottom = y + height;
+            SetWindowPlacement(hwnd, &placement);
+        }
+        g_window_base_client_width = width - g_window_nonclient_width;
+        g_window_base_client_height = height - g_window_nonclient_height;
+        layout_player_controls(hwnd, (PlayerState *)state);
+        InvalidateRect(hwnd, NULL, TRUE);
+        return;
+    }
     SetWindowPos(hwnd, NULL, x, y, width, height, flags);
+    update_player_base_client_metrics(hwnd);
+    layout_player_controls(hwnd, (PlayerState *)state);
     InvalidateRect(hwnd, NULL, TRUE);
+}
+
+static void toggle_player_maximized(HWND hwnd)
+{
+    if (hwnd == NULL || IsIconic(hwnd)) {
+        return;
+    }
+    ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
 }
 
 static void cycle_psf1_display_mode(HWND hwnd, PlayerState *state)
@@ -8879,6 +9615,8 @@ static void update_time_label(PlayerState *state)
         sample_pos = timeline_sample_at_locked(state, state->frame_live.last_sample_pos);
     } else if (state->audible_display_valid) {
         sample_pos = state->audible_display_snapshot.timeline_sample_pos;
+    } else if (state->playing) {
+        sample_pos = 0;
     } else {
         sample_pos = timeline_sample_at_locked(state, state->live.last_sample_pos);
     }
@@ -8905,17 +9643,44 @@ static void update_time_label(PlayerState *state)
     }
     if (strcmp(state->time_label_text, label) != 0) {
         HDC hdc;
+        HFONT label_font;
+        HGDIOBJ previous_font = NULL;
         SIZE text_size;
+        int measured_width = TIME_LABEL_MIN_WIDTH;
+
         snprintf(state->time_label_text, sizeof(state->time_label_text), "%s", label);
-        SetWindowTextA(state->time_label, label);
         hdc = GetDC(state->time_label);
         if (hdc != NULL) {
+            label_font = (HFONT)SendMessageA(
+                state->time_label, WM_GETFONT, 0, 0);
+            if (label_font != NULL) {
+                previous_font = SelectObject(hdc, label_font);
+            }
             if (GetTextExtentPoint32A(hdc, label, (int)strlen(label), &text_size)) {
-                SetWindowPos(state->time_label, NULL, 0, 0, text_size.cx + 6, 16,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                PlayerScaleLayout layout;
+
+                get_player_chrome_scale_layout(
+                    state->hwnd, state, &layout);
+                measured_width = layout.scale_milli > 0 ?
+                    ((text_size.cx + 2) * 1000 + layout.scale_milli / 2) /
+                        layout.scale_milli :
+                    text_size.cx + 2;
+                if (measured_width < 1) {
+                    measured_width = 1;
+                }
+                state->time_label_base_width = measured_width;
+                position_scaled_control(state->time_label, &layout,
+                    702 + (IsZoomed(state->hwnd) ? 18 : 0), 6,
+                    state->time_label_base_width, 16);
+            }
+            if (previous_font != NULL && previous_font != HGDI_ERROR) {
+                SelectObject(hdc, previous_font);
             }
             ReleaseDC(state->time_label, hdc);
         }
+        SetWindowTextA(state->time_label, label);
+        RedrawWindow(state->time_label, NULL, NULL,
+            RDW_INVALIDATE | RDW_ERASE);
     }
 }
 
@@ -8928,11 +9693,14 @@ static void draw_bar(
     uint32_t value,
     uint32_t max_value,
     COLORREF fill_color,
-    COLORREF background_color)
+    COLORREF background_color,
+    int force_black_border)
 {
     RECT border;
     RECT fill;
     HBRUSH brush = (HBRUSH)GetStockObject(DC_BRUSH);
+    COLORREF previous_pen_color;
+    HGDIOBJ previous_brush;
     int fill_width;
 
     value = clamp_u32(value, max_value);
@@ -8942,6 +9710,26 @@ static void draw_bar(
     border.top = y;
     border.right = x + width;
     border.bottom = y + height;
+
+    if (force_black_border) {
+        SetDCBrushColor(hdc, background_color);
+        FillRect(hdc, &border, brush);
+        if (fill_width > 0) {
+            fill.left = x;
+            fill.top = y;
+            fill.right = x + fill_width;
+            fill.bottom = y + height;
+            SetDCBrushColor(hdc, fill_color);
+            FillRect(hdc, &fill, brush);
+        }
+        previous_pen_color = GetDCPenColor(hdc);
+        previous_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        SetDCPenColor(hdc, RGB(0, 0, 0));
+        Rectangle(hdc, border.left, border.top, border.right, border.bottom);
+        SetDCPenColor(hdc, previous_pen_color);
+        SelectObject(hdc, previous_brush);
+        return;
+    }
 
     SetDCBrushColor(hdc, background_color);
     Rectangle(hdc, border.left, border.top, border.right, border.bottom);
@@ -8970,12 +9758,15 @@ static void draw_stereo_bar(
     uint32_t max_value,
     COLORREF left_color,
     COLORREF right_color,
-    COLORREF background_color)
+    COLORREF background_color,
+    int force_black_border)
 {
     RECT border;
     RECT left_fill;
     RECT right_fill;
     HBRUSH brush = (HBRUSH)GetStockObject(DC_BRUSH);
+    COLORREF previous_pen_color;
+    HGDIOBJ previous_brush;
     int left_width;
     int right_width;
     int mid;
@@ -8998,6 +9789,34 @@ static void draw_stereo_bar(
     border.top = y;
     border.right = x + width;
     border.bottom = y + height;
+    if (force_black_border) {
+        SetDCBrushColor(hdc, background_color);
+        FillRect(hdc, &border, brush);
+        if (left_width > 0) {
+            left_fill.left = x;
+            left_fill.top = y;
+            left_fill.right = x + left_width;
+            left_fill.bottom = mid;
+            SetDCBrushColor(hdc, left_color);
+            FillRect(hdc, &left_fill, brush);
+        }
+        if (right_width > 0) {
+            right_fill.left = x;
+            right_fill.top = mid;
+            right_fill.right = x + right_width;
+            right_fill.bottom = y + height;
+            SetDCBrushColor(hdc, right_color);
+            FillRect(hdc, &right_fill, brush);
+        }
+        previous_pen_color = GetDCPenColor(hdc);
+        previous_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        SetDCPenColor(hdc, RGB(0, 0, 0));
+        Rectangle(hdc, border.left, border.top, border.right, border.bottom);
+        SetDCPenColor(hdc, previous_pen_color);
+        SelectObject(hdc, previous_brush);
+        return;
+    }
+
     SetDCBrushColor(hdc, background_color);
     Rectangle(hdc, border.left, border.top, border.right, border.bottom);
 
@@ -9062,7 +9881,7 @@ static int is_voice_really_sounding(const Spu2LogVoiceSnapshot *voice)
         return 0;
     }
 
-    return voice->active || voice->envx != 0;
+    return voice->envx != 0;
 }
 
 static int visible_voice_count(const Spu2LogLiveState *state, unsigned core, int hide_inactive)
@@ -9103,17 +9922,10 @@ static void voice_status_counts(
     for (voice = 0; voice < 24; ++voice) {
         const Spu2LogVoiceSnapshot *snapshot = &state->voices[core][voice];
 
-        if (snapshot->active) {
-            *active += 1;
-        }
-        if (snapshot->active && snapshot->adsr_phase == SPU2LOG_ADSR_RELEASE) {
-            *release += 1;
+        if (snapshot->envx == 0) {
             continue;
         }
-
-        if (!is_voice_active(snapshot)) {
-            continue;
-        }
+        *active += 1;
 
         switch (snapshot->adsr_phase) {
         case SPU2LOG_ADSR_ATTACK:
@@ -9124,6 +9936,9 @@ static void voice_status_counts(
             break;
         case SPU2LOG_ADSR_SUSTAIN:
             *sustain += 1;
+            break;
+        case SPU2LOG_ADSR_RELEASE:
+            *release += 1;
             break;
         default:
             break;
@@ -9185,13 +10000,143 @@ static int calculate_content_height(HDC hdc, const PlayerState *state)
         (line_height * (core0_count > core1_count ? core0_count : core1_count));
 }
 
-static void update_scrollbar(HWND hwnd, PlayerState *state)
+static int player_voice_scroll_enabled(HWND hwnd, const PlayerState *state)
 {
+    return hwnd != NULL && state != NULL && IsZoomed(hwnd) &&
+        state->psf_version == 0x01u &&
+        normalize_psf1_display_mode(state->psf1_display_mode) ==
+            PSF1_DISPLAY_VALUES_KEYBOARD;
+}
+
+static int player_voice_scroll_metrics(
+    HWND hwnd,
+    const PlayerState *state,
+    int *total_height,
+    int *page_height,
+    int *device_top)
+{
+    PlayerScaleLayout layout;
+    RECT client_rect;
+    int line_height;
+    int active_header_height;
+    int rows_top;
+    int row_step;
+    int rows_bottom;
+    int visible_rows;
+
+    if (!player_voice_scroll_enabled(hwnd, state) ||
+        !GetClientRect(hwnd, &client_rect)) {
+        return 0;
+    }
+    get_player_content_scale_layout(hwnd, state, &layout);
+    if (!layout.scaled || layout.dest_height <= 0 ||
+        layout.base_height <= 0) {
+        return 0;
+    }
+    line_height = state->meter_line_height > 0 ?
+        state->meter_line_height : get_player_display_line_height(hwnd);
+    active_header_height = maximized_active_header_line_height(
+        hwnd, state, line_height);
+    row_step = line_height + PSF1_TRACK_KEYBOARD_HEIGHT;
+    visible_rows = 16;
+    rows_top = 2 + CONTROLS_HEIGHT + active_header_height + line_height;
+    rows_bottom = rows_top + 24 * row_step;
+    if (total_height != NULL) {
+        *total_height = rows_bottom - rows_top;
+    }
+    if (page_height != NULL) {
+        *page_height = visible_rows * row_step;
+    }
+    if (device_top != NULL) {
+        *device_top = layout.dest_y + (int)(((int64_t)rows_top *
+            layout.dest_height) / layout.base_height);
+    }
+    return (24 - visible_rows) * row_step;
+}
+
+static int player_voice_scroll_max(HWND hwnd, const PlayerState *state)
+{
+    return player_voice_scroll_metrics(hwnd, state, NULL, NULL, NULL);
+}
+
+static void set_player_voice_scroll(
+    HWND hwnd,
+    PlayerState *state,
+    int scroll_y)
+{
+    int maximum;
+
     if (state == NULL) {
         return;
     }
-    state->scroll_y = 0;
-    ShowScrollBar(hwnd, SB_VERT, FALSE);
+    maximum = player_voice_scroll_max(hwnd, state);
+    if (scroll_y < 0) {
+        scroll_y = 0;
+    } else if (scroll_y > maximum) {
+        scroll_y = maximum;
+    }
+    if (state->scroll_y == scroll_y) {
+        return;
+    }
+    state->scroll_y = scroll_y;
+    if (state->voice_scrollbar != NULL) {
+        SetScrollPos(state->voice_scrollbar, SB_CTL, scroll_y, TRUE);
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void adjust_player_voice_scroll(
+    HWND hwnd,
+    PlayerState *state,
+    int delta)
+{
+    if (state == NULL || !player_voice_scroll_enabled(hwnd, state)) {
+        return;
+    }
+    set_player_voice_scroll(hwnd, state, state->scroll_y + delta);
+}
+
+static void update_scrollbar(HWND hwnd, PlayerState *state)
+{
+    RECT client_rect;
+
+    if (state == NULL) {
+        return;
+    }
+    if (player_voice_scroll_enabled(hwnd, state)) {
+        SCROLLINFO info;
+        int total_height = 1;
+        int page_height = 1;
+        int device_top = 0;
+        int maximum = player_voice_scroll_metrics(
+            hwnd, state, &total_height, &page_height, &device_top);
+        int scrollbar_width = GetSystemMetrics(SM_CXVSCROLL);
+
+        set_player_voice_scroll(hwnd, state, state->scroll_y);
+        ZeroMemory(&info, sizeof(info));
+        info.cbSize = sizeof(info);
+        info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        info.nMin = 0;
+        info.nMax = total_height > 0 ? total_height - 1 : 0;
+        info.nPage = (UINT)(page_height > 0 ? page_height : 1);
+        info.nPos = state->scroll_y > maximum ? maximum : state->scroll_y;
+        if (state->voice_scrollbar != NULL) {
+            SetScrollInfo(state->voice_scrollbar, SB_CTL, &info, TRUE);
+            if (GetClientRect(hwnd, &client_rect)) {
+                SetWindowPos(state->voice_scrollbar, HWND_TOP,
+                    client_rect.right - scrollbar_width,
+                    device_top,
+                    scrollbar_width,
+                    client_rect.bottom - device_top - 4,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+        }
+    } else {
+        state->scroll_y = 0;
+        if (state->voice_scrollbar != NULL) {
+            ShowWindow(state->voice_scrollbar, SW_HIDE);
+        }
+    }
 }
 
 static Spu2LogResult player_spu2_write16(
@@ -9486,7 +10431,31 @@ static Spu2LogResult player_core_snapshot(
     return SPU2LOG_OK;
 }
 
-static int open_waveout(HWAVEOUT *out_wave)
+static int sync_audible_display_after_sequence(PlayerState *state, uint64_t completed_sequence);
+
+static void CALLBACK player_waveout_callback(
+    HWAVEOUT wave,
+    UINT message,
+    DWORD_PTR instance,
+    DWORD_PTR parameter1,
+    DWORD_PTR parameter2)
+{
+    PlayerState *state = (PlayerState *)instance;
+    WAVEHDR *header = (WAVEHDR *)parameter1;
+
+    (void)parameter2;
+    if (message != WOM_DONE || state == NULL || header == NULL ||
+        state->hwnd == NULL || state->wave != wave) {
+        return;
+    }
+    PostMessageA(
+        state->hwnd,
+        PLAYER_WM_AUDIO_BUFFER_DONE,
+        (WPARAM)header->dwUser,
+        (LPARAM)(UINT_PTR)wave);
+}
+
+static int open_waveout(HWAVEOUT *out_wave, PlayerState *callback_state)
 {
     WAVEFORMATEX format;
 
@@ -9498,7 +10467,13 @@ static int open_waveout(HWAVEOUT *out_wave)
     format.nBlockAlign = (WORD)(format.nChannels * (format.wBitsPerSample / 8u));
     format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
 
-    return waveOutOpen(out_wave, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL) == MMSYSERR_NOERROR;
+    return waveOutOpen(
+        out_wave,
+        WAVE_MAPPER,
+        &format,
+        callback_state != NULL ? (DWORD_PTR)player_waveout_callback : 0,
+        (DWORD_PTR)callback_state,
+        callback_state != NULL ? CALLBACK_FUNCTION : CALLBACK_NULL) == MMSYSERR_NOERROR;
 }
 
 static void reset_audio_display_tracking(PlayerState *state)
@@ -9516,15 +10491,31 @@ static void reset_audio_display_tracking(PlayerState *state)
 static void capture_audio_display_snapshot(PlayerState *state, unsigned index, uint64_t sequence)
 {
     AudioDisplaySnapshot *snapshot;
+    Psf1AkaoPlaybackState akao;
+    unsigned queued_index;
     unsigned core;
     unsigned voice;
 
     if (state == NULL || index >= PLAYER_AUDIO_BUFFERS) {
         return;
     }
+    ZeroMemory(&akao, sizeof(akao));
+    if (state->core != NULL) {
+        (void)psf2log_get_imported_ps1_akao_state(state->core, &akao);
+    }
     snapshot = &state->audio_display_snapshots[index];
     lock_state(state);
+    state->akao = akao;
+    if (akao.detected) {
+        for (queued_index = 0; queued_index < PLAYER_AUDIO_BUFFERS; ++queued_index) {
+            if (state->audio_display_snapshots[queued_index].valid &&
+                !state->audio_display_snapshots[queued_index].akao.detected) {
+                state->audio_display_snapshots[queued_index].akao = akao;
+            }
+        }
+    }
     snapshot->live = state->live;
+    snapshot->akao = akao;
     memcpy(snapshot->key_on_events,
         state->key_on_event_buffers,
         sizeof(snapshot->key_on_events));
@@ -9582,6 +10573,49 @@ static void sync_audible_display_to_queue(PlayerState *state)
         state->audible_display_valid = 1;
         unlock_state(state);
     }
+}
+
+static int sync_audible_display_after_sequence(PlayerState *state, uint64_t completed_sequence)
+{
+    unsigned i;
+    unsigned next = PLAYER_AUDIO_BUFFERS;
+    uint64_t next_sequence = UINT64_MAX;
+    int akao_changed = 0;
+
+    if (state == NULL) {
+        return 0;
+    }
+    lock_state(state);
+    for (i = 0; i < PLAYER_AUDIO_BUFFERS; ++i) {
+        if (state->audio_in_use[i] &&
+            (state->audio_headers[i].dwFlags & WHDR_DONE) == 0 &&
+            state->audio_display_snapshots[i].valid &&
+            state->audio_display_snapshots[i].sequence > completed_sequence &&
+            state->audio_display_snapshots[i].sequence < next_sequence) {
+            next = i;
+            next_sequence = state->audio_display_snapshots[i].sequence;
+        }
+    }
+    if (next < PLAYER_AUDIO_BUFFERS) {
+        const Psf1AkaoPlaybackState *old_state =
+            &state->audible_display_snapshot.akao;
+        const Psf1AkaoPlaybackState *new_state =
+            &state->audio_display_snapshots[next].akao;
+
+        akao_changed = !state->audible_display_valid ||
+            old_state->detected != new_state->detected ||
+            old_state->early_format != new_state->early_format ||
+            old_state->driver_type != new_state->driver_type ||
+            old_state->tempo != new_state->tempo ||
+            old_state->beats_per_measure != new_state->beats_per_measure ||
+            old_state->ticks_per_beat != new_state->ticks_per_beat ||
+            old_state->current_beat != new_state->current_beat ||
+            old_state->measure != new_state->measure;
+        state->audible_display_snapshot = state->audio_display_snapshots[next];
+        state->audible_display_valid = 1;
+    }
+    unlock_state(state);
+    return akao_changed;
 }
 
 static void cleanup_audio_queue(PlayerState *state)
@@ -9727,6 +10761,8 @@ static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t 
                 ZeroMemory(&state->audio_headers[i], sizeof(state->audio_headers[i]));
                 state->audio_headers[i].lpData = (LPSTR)state->audio_buffers[i];
                 state->audio_headers[i].dwBufferLength = frames * 2u * (uint32_t)sizeof(*pcm);
+                state->audio_headers[i].dwUser =
+                    (DWORD_PTR)(state->audio_chunks_queued + 1u);
 
                 result = waveOutPrepareHeader(state->wave, &state->audio_headers[i], sizeof(state->audio_headers[i]));
                 if (result != MMSYSERR_NOERROR) {
@@ -9745,17 +10781,25 @@ static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t 
                 state->audio_in_use[i] = 1;
                 state->audio_queued_buffers++;
                 state->audio_chunks_queued++;
-                if (state->audio_queued_buffers == 1u) {
+                if (state->audio_started && state->audio_queued_buffers == 1u) {
                     sync_audible_display_to_queue(state);
                 }
                 if (!state->audio_started &&
                     state->audio_queued_buffers >= PLAYER_AUDIO_PREBUFFER_BUFFERS) {
-                    result = waveOutRestart(state->wave);
-                    if (result != MMSYSERR_NOERROR) {
-                        return 0;
-                    }
                     state->audio_started = 1;
                     sync_audible_display_to_queue(state);
+                    result = waveOutRestart(state->wave);
+                    if (result != MMSYSERR_NOERROR) {
+                        state->audio_started = 0;
+                        return 0;
+                    }
+                    if (state->hwnd != NULL) {
+                        SendMessageA(
+                            state->hwnd,
+                            PLAYER_WM_AUDIO_STARTING,
+                            0,
+                            (LPARAM)(UINT_PTR)state->wave);
+                    }
                     player_log("audio prebuffer ready buffers=%u frames=%u",
                         state->audio_queued_buffers,
                         state->audio_queued_buffers * PLAYER_RENDER_FRAMES);
@@ -9802,6 +10846,53 @@ static uint32_t first_nonzero_pcm_frame(const int16_t *pcm, uint32_t frames)
         }
     }
     return frames;
+}
+
+static void start_timeline_at_first_audible_frame(
+    PlayerState *state,
+    const int16_t *pcm,
+    uint32_t frames)
+{
+    uint64_t block_end_sample;
+    uint64_t block_start_sample;
+    uint32_t first_audible;
+    int waiting;
+
+    if (state == NULL || pcm == NULL || frames == 0) {
+        return;
+    }
+
+    lock_state(state);
+    waiting = !state->timeline_valid;
+    unlock_state(state);
+    if (!waiting) {
+        return;
+    }
+
+    first_audible = first_nonzero_pcm_frame(pcm, frames);
+    if (first_audible >= frames) {
+        return;
+    }
+
+    block_end_sample = spu2log_audacious_get_sample_pos();
+    block_start_sample = block_end_sample >= frames ?
+        block_end_sample - frames : 0;
+
+    lock_state(state);
+    if (!state->timeline_valid) {
+        state->timeline_source_anchor = block_start_sample + first_audible;
+        state->timeline_scaled_anchor = 0;
+        state->timeline_speed_percent = effective_speed_percent_locked(state);
+        state->timeline_valid = 1;
+        state->time_label_cache_valid = 0;
+        if (state->psf_version == 0x02u) {
+            state->ps2_startup_track_dimmed = 0;
+        }
+        player_log("elapsed timeline started sample=%llu frame=%lu",
+            (unsigned long long)state->timeline_source_anchor,
+            (unsigned long)first_audible);
+    }
+    unlock_state(state);
 }
 
 static uint32_t first_ps2_song_frame(
@@ -11487,10 +12578,19 @@ static int drain_audio_queue_after_tag_fade(PlayerState *state)
     }
     if (!state->audio_started && state->wave != NULL &&
         state->audio_queued_buffers > 0) {
+        state->audio_started = 1;
+        sync_audible_display_to_queue(state);
         if (waveOutRestart(state->wave) != MMSYSERR_NOERROR) {
+            state->audio_started = 0;
             return 0;
         }
-        state->audio_started = 1;
+        if (state->hwnd != NULL) {
+            SendMessageA(
+                state->hwnd,
+                PLAYER_WM_AUDIO_STARTING,
+                0,
+                (LPARAM)(UINT_PTR)state->wave);
+        }
     }
     while (WaitForSingleObject(state->stop_event, 0) == WAIT_TIMEOUT) {
         reap_audio_queue(state);
@@ -11556,7 +12656,7 @@ static DWORD WINAPI preview_standalone_thread_proc(void *user)
     unsigned i;
 
     if (state == NULL || state->preview_audio_stop_event == NULL ||
-        !open_waveout(&state->preview_wave)) {
+        !open_waveout(&state->preview_wave, NULL)) {
         return 0;
     }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -11744,8 +12844,18 @@ static DWORD WINAPI playback_thread_proc(void *user)
             state->frame_audio_transition = 1;
             if (queue_waveout_chunk(state, state->pcm, PLAYER_TRACK_SWITCH_FADE_FRAMES)) {
                 if (!state->audio_started && state->wave != NULL &&
-                    waveOutRestart(state->wave) == MMSYSERR_NOERROR) {
+                    state->audio_queued_buffers > 0) {
                     state->audio_started = 1;
+                    sync_audible_display_to_queue(state);
+                    if (waveOutRestart(state->wave) != MMSYSERR_NOERROR) {
+                        state->audio_started = 0;
+                    } else if (state->hwnd != NULL) {
+                        SendMessageA(
+                            state->hwnd,
+                            PLAYER_WM_AUDIO_STARTING,
+                            0,
+                            (LPARAM)(UINT_PTR)state->wave);
+                    }
                 }
                 while (WaitForSingleObject(state->stop_event, 0) == WAIT_TIMEOUT) {
                     reap_audio_queue(state);
@@ -11915,6 +13025,10 @@ static DWORD WINAPI playback_thread_proc(void *user)
                 (unsigned long long)spu2log_audacious_get_spu2_write16_count());
         }
 
+        if (!state->startup_silence_trim) {
+            start_timeline_at_first_audible_frame(state, state->pcm, rendered);
+        }
+
         if (state->startup_silence_trim) {
             uint64_t block_end_sample = spu2log_audacious_get_sample_pos();
             uint32_t first_nonzero = first_ps2_song_frame(
@@ -11927,7 +13041,6 @@ static DWORD WINAPI playback_thread_proc(void *user)
                 startup_trimmed_frames += rendered;
                 continue;
             }
-            startup_trimmed_frames += first_nonzero;
             remember_ps2_startup_origin(
                 state,
                 block_end_sample,
@@ -11936,17 +13049,22 @@ static DWORD WINAPI playback_thread_proc(void *user)
             state->startup_silence_trim = 0;
             psf2log_rebase_imported_sample_position(
                 state->core,
-                rendered - first_nonzero);
+                rendered);
             reset_live_display(state);
+            lock_state(state);
+            state->timeline_source_anchor = 0;
+            state->timeline_scaled_anchor = 0;
+            state->timeline_speed_percent =
+                effective_speed_percent_locked(state);
+            state->timeline_valid = 0;
+            state->time_label_cache_valid = 0;
+            unlock_state(state);
+            psf2log_emit_imported_snapshot(state->core);
+            start_timeline_at_first_audible_frame(
+                state, state->pcm, rendered);
             player_log("PS2 startup silence trimmed frames=%llu seconds=%.3f",
                 (unsigned long long)startup_trimmed_frames,
                 (double)startup_trimmed_frames / (double)PLAYER_SAMPLE_RATE);
-            if (first_nonzero != 0) {
-                memmove(state->pcm,
-                    state->pcm + first_nonzero * 2u,
-                    (rendered - first_nonzero) * 2u * sizeof(*state->pcm));
-                rendered -= first_nonzero;
-            }
             {
                 int16_t startup_silence[PLAYER_RENDER_FRAMES * 2u];
                 int16_t startup_packet[PLAYER_RENDER_FRAMES * 2u];
@@ -11979,7 +13097,6 @@ static DWORD WINAPI playback_thread_proc(void *user)
                     set_status(state, "Stopped: waveOut write failed");
                     break;
                 }
-                psf2log_emit_imported_snapshot(state->core);
                 lock_state(state);
                 state->ps2_startup_track_dimmed = 0;
                 unlock_state(state);
@@ -12354,10 +13471,22 @@ static int choose_playlist_folder(HWND hwnd, char *out_folder, size_t out_size)
 
     if (state != NULL && state->playlist_last_folder[0] != '\0') {
         wchar_t initial_path[MAX_PATH];
-        if (runtime_path_to_wide(state->playlist_last_folder, initial_path, MAX_PATH) &&
+        wchar_t initial_name[MAX_PATH];
+        char parent_folder[MAX_PATH];
+        const char *folder_to_open;
+
+        path_parent_folder(state->playlist_last_folder,
+            parent_folder, sizeof(parent_folder));
+        folder_to_open = parent_folder[0] != '\0' ?
+            parent_folder : state->playlist_last_folder;
+        if (runtime_path_to_wide(folder_to_open, initial_path, MAX_PATH) &&
             SUCCEEDED(SHCreateItemFromParsingName(initial_path, NULL, &IID_IShellItem,
                 (void **)&initial_folder))) {
             dialog->lpVtbl->SetFolder(dialog, initial_folder);
+        }
+        if (runtime_path_to_wide(path_basename(state->playlist_last_folder),
+                initial_name, MAX_PATH)) {
+            dialog->lpVtbl->SetFileName(dialog, initial_name);
         }
     }
 
@@ -12491,6 +13620,7 @@ static void playlist_play_index(HWND hwnd, PlayerState *state, int index)
 
     state->playlist_pending_play_index = index;
     target = state->hwnd != NULL ? state->hwnd : hwnd;
+    cancel_direct_start_retry(target, state);
     player_log("playlist play requested index=%d current=%d busy=%d",
         index,
         state->playlist_current,
@@ -12579,7 +13709,17 @@ static void playlist_process_pending_play(HWND hwnd, PlayerState *state)
     playlist_refresh_listbox(state);
     snprintf(path, sizeof(path), "%s", state->playlist_paths[index]);
     player_log("playlist play begin index=%d path=%s", index, path);
+    snprintf(state->direct_start_retry_path,
+        sizeof(state->direct_start_retry_path), "%s", path);
+    state->direct_start_retry_remaining = 2;
+    state->direct_start_retry_from_playlist = 1;
+    state->direct_start_retry_playlist_index = index;
     start_playback(hwnd, state, path);
+    state->direct_start_retry_deadline =
+        GetTickCount() + PLAYER_START_RETRY_TIMEOUT_MS;
+    state->direct_start_retry_armed = 1;
+    SetTimer(hwnd, PLAYER_DIRECT_RETRY_TIMER_ID,
+        PLAYER_DIRECT_RETRY_TIMER_MS, NULL);
     player_log("playlist play end index=%d pending=%d", index,
         state->playlist_pending_play_index);
     state->playlist_play_in_progress = 0;
@@ -14090,7 +15230,7 @@ static void playlist_add_files_dialog(HWND hwnd, PlayerState *state, int play_fi
         if (play_first) {
             HWND main_hwnd = state->hwnd != NULL ? state->hwnd : hwnd;
             playlist_set_current_path(state, first);
-            start_playback(main_hwnd, state, first);
+            start_direct_playback(main_hwnd, state, first);
             ShowWindow(main_hwnd, SW_SHOW);
             SetForegroundWindow(main_hwnd);
         }
@@ -14112,7 +15252,7 @@ static void open_direct_file_dialog(HWND hwnd, PlayerState *state)
                 show_playlist_window(state->hwnd != NULL ? state->hwnd : hwnd, state);
             }
         } else {
-            start_playback(hwnd, state, path);
+            start_direct_playback(hwnd, state, path);
         }
     }
 }
@@ -14208,10 +15348,9 @@ static LRESULT CALLBACK playlist_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LP
         append_darkable_menu_separator(playlist_menu);
         append_darkable_menu_item(playlist_menu, IDM_PLAYLIST_LOAD, "Load playlist...");
         append_darkable_menu_item(playlist_menu, IDM_PLAYLIST_SAVE, "Save playlist...");
-        append_darkable_menu_separator(playlist_menu);
-        append_darkable_menu_item(playlist_menu, IDM_PLAYLIST_TOPMOST, "Always on top");
         append_darkable_menu_bar_popup(menu, playlist_menu, "Playlist");
         append_darkable_menu_item(settings_menu, IDM_TAG_FADE_ENABLED, "Fade at tag time");
+        append_darkable_menu_item(settings_menu, IDM_PLAYLIST_TOPMOST, "Always on top");
         append_darkable_menu_separator(settings_menu);
         append_darkable_menu_item(settings_menu, IDM_PLAYLIST_ORDER_SINGLE, "Current track only");
         append_darkable_menu_item(settings_menu, IDM_PLAYLIST_ORDER_NEXT, "Next track");
@@ -14393,6 +15532,7 @@ static LRESULT CALLBACK playlist_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LP
             return 0;
         }
         if (state != NULL && LOWORD(wparam) == IDC_PLAYLIST_STOP) {
+            cancel_direct_start_retry(hwnd, state);
             playlist_cancel_pending_play(hwnd, state);
             stop_playback(state);
             reset_stopped_display(state);
@@ -14803,13 +15943,17 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     int playback_from_playlist;
     int path_changed;
 
+    if (state == NULL || path == NULL || path[0] == '\0') {
+        return;
+    }
+    snprintf(open_path, sizeof(open_path), "%s", path);
+    path = open_path;
     player_log("start playback begin path=%s start_sample=%llu",
-        path != NULL ? path : "(null)",
+        path,
         (unsigned long long)start_sample);
     lock_state(state);
     snprintf(previous_path, sizeof(previous_path), "%s", state->input_path);
     unlock_state(state);
-    snprintf(open_path, sizeof(open_path), "%s", path != NULL ? path : "");
     path_changed = (open_path[0] != '\0' && lstrcmpiA(previous_path, open_path) != 0);
     playback_from_playlist = state != NULL && state->playlist_play_in_progress;
     read_psf_timing_samples(
@@ -14858,7 +16002,13 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     }
     state->psf_version = normalize_saved_psf_version(read_psf_version(path));
     state->ps2_startup_track_dimmed = state->psf_version == 0x02u ? 1 : 0;
-    state->startup_silence_trim = 0;
+    state->startup_silence_trim =
+        state->psf_version == 0x02u && start_sample == 0 ? 1 : 0;
+    state->timeline_source_anchor = 0;
+    state->timeline_scaled_anchor = 0;
+    state->timeline_speed_percent = effective_speed_percent_locked(state);
+    state->timeline_valid = start_sample > 0 ? 1 : 0;
+    state->time_label_cache_valid = 0;
     state->total_samples = tag_length_samples;
     state->fade_samples = tag_fade_samples;
     state->playback_from_playlist = playback_from_playlist ? 1 : 0;
@@ -14915,7 +16065,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     }
     player_log("start playback pcm allocated");
 
-    if (!open_waveout(&state->wave)) {
+    if (!open_waveout(&state->wave, state)) {
         player_log("start playback failed waveOut open");
         set_status(state, "waveOut open failed");
         stop_playback(state);
@@ -14939,6 +16089,16 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     callbacks.voice_snapshot = player_voice_snapshot;
     callbacks.core_snapshot = player_core_snapshot;
 
+    lock_state(state);
+    if (start_sample == 0) {
+        state->timeline_source_anchor = 0;
+        state->timeline_scaled_anchor = 0;
+        state->timeline_speed_percent = effective_speed_percent_locked(state);
+        state->timeline_valid = 0;
+        state->time_label_cache_valid = 0;
+    }
+    unlock_state(state);
+
     player_log("start playback provider open begin");
     result = state->provider->open(&state->core, path, PLAYER_SAMPLE_RATE, &callbacks);
     player_log("start playback provider open result=%d core=%p", (int)result, (void *)state->core);
@@ -14956,11 +16116,6 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     apply_voice_pmod_masks(state);
     apply_voice_adsr_force_masks(state);
 
-    if (start_sample == 0 && state->psf_version == 0x02) {
-        lock_state(state);
-        state->startup_silence_trim = 1;
-        unlock_state(state);
-    }
     if (start_sample > 0 && state->psf_version == 0x02 &&
         !advance_ps2_core_to_audible_start(state, &seek_base_sample)) {
         set_status(state, "Seek failed");
@@ -15021,6 +16176,118 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
 static void start_playback(HWND hwnd, PlayerState *state, const char *path)
 {
     start_playback_at(hwnd, state, path, 0);
+}
+
+static void cancel_direct_start_retry(HWND hwnd, PlayerState *state)
+{
+    HWND target;
+
+    if (state == NULL) {
+        return;
+    }
+    target = state->hwnd != NULL ? state->hwnd : hwnd;
+    if (target != NULL) {
+        KillTimer(target, PLAYER_DIRECT_RETRY_TIMER_ID);
+    }
+    state->direct_start_retry_armed = 0;
+    state->direct_start_retry_remaining = 0;
+    state->direct_start_retry_from_playlist = 0;
+    state->direct_start_retry_playlist_index = -1;
+    state->direct_start_retry_deadline = 0;
+    state->direct_start_retry_path[0] = '\0';
+}
+
+static void start_direct_playback(HWND hwnd, PlayerState *state, const char *path)
+{
+    HWND target;
+    char stable_path[MAX_PATH];
+
+    if (state == NULL || path == NULL || path[0] == '\0') {
+        return;
+    }
+    snprintf(stable_path, sizeof(stable_path), "%s", path);
+    target = state->hwnd != NULL ? state->hwnd : hwnd;
+    cancel_direct_start_retry(target, state);
+    playlist_cancel_pending_play(target, state);
+    snprintf(state->direct_start_retry_path,
+        sizeof(state->direct_start_retry_path), "%s", stable_path);
+    state->direct_start_retry_remaining = 2;
+    state->direct_start_retry_from_playlist = 0;
+    state->direct_start_retry_playlist_index = -1;
+    start_playback(target, state, stable_path);
+    state->direct_start_retry_deadline =
+        GetTickCount() + PLAYER_START_RETRY_TIMEOUT_MS;
+    state->direct_start_retry_armed = 1;
+    if (target != NULL) {
+        SetTimer(target, PLAYER_DIRECT_RETRY_TIMER_ID,
+            PLAYER_DIRECT_RETRY_TIMER_MS, NULL);
+    }
+}
+
+static void process_direct_start_retry(HWND hwnd, PlayerState *state)
+{
+    char path[MAX_PATH];
+    int from_playlist;
+    int playlist_index;
+    DWORD now;
+
+    if (state == NULL) {
+        return;
+    }
+    KillTimer(hwnd, PLAYER_DIRECT_RETRY_TIMER_ID);
+    if (!state->direct_start_retry_armed) {
+        return;
+    }
+    if (get_playing(state)) {
+        if (state->audio_started) {
+            cancel_direct_start_retry(hwnd, state);
+            return;
+        }
+        now = GetTickCount();
+        if ((LONG)(now - state->direct_start_retry_deadline) < 0) {
+            SetTimer(hwnd, PLAYER_DIRECT_RETRY_TIMER_ID,
+                PLAYER_DIRECT_RETRY_TIMER_MS, NULL);
+            return;
+        }
+        player_log("%s playback audio start timed out path=%s",
+            state->direct_start_retry_from_playlist ? "playlist" : "direct",
+            state->direct_start_retry_path);
+    }
+    if (state->direct_start_retry_remaining <= 0 ||
+        state->direct_start_retry_path[0] == '\0') {
+        cancel_direct_start_retry(hwnd, state);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s", state->direct_start_retry_path);
+    from_playlist = state->direct_start_retry_from_playlist;
+    playlist_index = state->direct_start_retry_playlist_index;
+    state->direct_start_retry_remaining -= 1;
+    state->direct_start_retry_armed = 0;
+    player_log("%s playback startup retry remaining=%d path=%s",
+        from_playlist ? "playlist" : "direct",
+        state->direct_start_retry_remaining,
+        path);
+    if (from_playlist) {
+        state->playlist_play_in_progress = 1;
+        if (playlist_index >= 0 &&
+            (unsigned)playlist_index < state->playlist_count) {
+            state->playlist_current = playlist_index;
+            playlist_refresh_listbox(state);
+        }
+    }
+    start_playback(hwnd, state, path);
+    if (from_playlist) {
+        state->playlist_play_in_progress = 0;
+    }
+    state->direct_start_retry_deadline =
+        GetTickCount() + PLAYER_START_RETRY_TIMEOUT_MS;
+    state->direct_start_retry_armed = 1;
+    if (state->direct_start_retry_remaining > 0) {
+        SetTimer(hwnd, PLAYER_DIRECT_RETRY_TIMER_ID,
+            PLAYER_DIRECT_RETRY_TIMER_MS, NULL);
+    } else if (!get_playing(state)) {
+        cancel_direct_start_retry(hwnd, state);
+    }
 }
 
 static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
@@ -15177,6 +16444,11 @@ static void render_playback_tick(HWND hwnd, PlayerState *state)
         return;
     }
 
+    if (IsZoomed(hwnd)) {
+        InvalidateRect(hwnd, NULL, FALSE);
+        return;
+    }
+
     GetClientRect(hwnd, &redraw_rect);
     if (gauge_only) {
         redraw_rect.left = CORE0_X + COL_ENV_BAR_X;
@@ -15296,9 +16568,24 @@ static int ensure_psf1_track_keyboard(
     }
     if (state->psf1_keyboard_dc != NULL &&
         state->psf1_keyboard_bitmap != NULL &&
+        state->psf1_keyboard_base_dc != NULL &&
+        state->psf1_keyboard_base_bitmap != NULL &&
         state->psf1_keyboard_dark == dark &&
         state->psf1_keyboard_width == width) {
         return 1;
+    }
+    if (state->psf1_keyboard_base_dc != NULL) {
+        if (state->psf1_keyboard_base_old_bitmap != NULL) {
+            SelectObject(state->psf1_keyboard_base_dc,
+                state->psf1_keyboard_base_old_bitmap);
+        }
+        if (state->psf1_keyboard_base_bitmap != NULL) {
+            DeleteObject(state->psf1_keyboard_base_bitmap);
+        }
+        DeleteDC(state->psf1_keyboard_base_dc);
+        state->psf1_keyboard_base_dc = NULL;
+        state->psf1_keyboard_base_bitmap = NULL;
+        state->psf1_keyboard_base_old_bitmap = NULL;
     }
     if (state->psf1_keyboard_dc != NULL) {
         if (state->psf1_keyboard_old_bitmap != NULL) {
@@ -15367,6 +16654,26 @@ static int ensure_psf1_track_keyboard(
     DeleteObject(border_pen);
     DeleteObject(black_brush);
     DeleteObject(white_brush);
+    state->psf1_keyboard_base_dc = CreateCompatibleDC(reference_dc);
+    state->psf1_keyboard_base_bitmap = CreateCompatibleBitmap(
+        reference_dc, width, PSF1_TRACK_KEYBOARD_HEIGHT);
+    if (state->psf1_keyboard_base_dc == NULL ||
+        state->psf1_keyboard_base_bitmap == NULL) {
+        if (state->psf1_keyboard_base_bitmap != NULL) {
+            DeleteObject(state->psf1_keyboard_base_bitmap);
+        }
+        if (state->psf1_keyboard_base_dc != NULL) {
+            DeleteDC(state->psf1_keyboard_base_dc);
+        }
+        state->psf1_keyboard_base_dc = NULL;
+        state->psf1_keyboard_base_bitmap = NULL;
+        return 0;
+    }
+    state->psf1_keyboard_base_old_bitmap = (HBITMAP)SelectObject(
+        state->psf1_keyboard_base_dc, state->psf1_keyboard_base_bitmap);
+    BitBlt(state->psf1_keyboard_base_dc, 0, 0,
+        width, PSF1_TRACK_KEYBOARD_HEIGHT,
+        state->psf1_keyboard_dc, 0, 0, SRCCOPY);
     state->psf1_keyboard_dark = dark;
     state->psf1_keyboard_width = width;
     return 1;
@@ -15374,7 +16681,7 @@ static int ensure_psf1_track_keyboard(
 
 static void paint_psf1_track_keyboard(
     HDC hdc,
-    const PlayerState *state,
+    PlayerState *state,
     int x,
     int y,
     int width,
@@ -15382,79 +16689,114 @@ static void paint_psf1_track_keyboard(
     int muted)
 {
     if (hdc == NULL || state == NULL || state->psf1_keyboard_dc == NULL ||
+        state->psf1_keyboard_base_dc == NULL ||
         width <= 0 || state->psf1_keyboard_width != width) {
         return;
     }
-    BitBlt(hdc, x, y, width, PSF1_TRACK_KEYBOARD_HEIGHT,
-        state->psf1_keyboard_dc, 0, 0, SRCCOPY);
     if (active_note >= PSF1_TRACK_KEY_FIRST_NOTE &&
         active_note <= PSF1_TRACK_KEY_LAST_NOTE) {
         RECT key;
+        RECT active_rect;
+        RECT restore_rect;
+        int full_key_highlight = state->hwnd != NULL &&
+            IsZoomed(state->hwnd) &&
+            psf1_keyboard_height_for_state(state, state->psf_version) > 0;
         HBRUSH active_brush = CreateSolidBrush(
             muted ? RGB(154, 78, 88) : RGB(230, 64, 84));
-        HPEN active_pen = CreatePen(
-            PS_SOLID, 1, muted ? RGB(154, 78, 88) : RGB(230, 64, 84));
-        HGDIOBJ old_brush = SelectObject(hdc, active_brush);
-        HGDIOBJ old_pen = SelectObject(hdc, active_pen);
 
         psf1_track_key_rect(active_note, width, &key);
-        OffsetRect(&key, x, y);
-        Rectangle(hdc, key.left, key.top, key.right + 1, key.bottom + 1);
-        if (!preview_is_black_key(active_note)) {
-            HBRUSH black_brush = CreateSolidBrush(
-                state->psf1_keyboard_dark ? RGB(3, 3, 3) : RGB(0, 0, 0));
-            HPEN border_pen = CreatePen(
-                PS_SOLID, 1,
-                state->psf1_keyboard_dark ? RGB(160, 160, 160) : RGB(45, 45, 45));
-            HGDIOBJ previous_brush = SelectObject(hdc, black_brush);
-            HGDIOBJ previous_pen = SelectObject(hdc, border_pen);
-            int note;
-
-            for (note = PSF1_TRACK_KEY_FIRST_NOTE;
-                 note <= PSF1_TRACK_KEY_LAST_NOTE;
-                 ++note) {
-                RECT black_key;
-
-                if (!preview_is_black_key(note)) {
-                    continue;
+        active_rect = key;
+        if (full_key_highlight) {
+            if (active_rect.right < width) {
+                active_rect.right += 1;
+            }
+            if (preview_is_black_key(active_note) &&
+                active_rect.bottom < PSF1_TRACK_KEYBOARD_HEIGHT) {
+                active_rect.bottom += 1;
+            }
+            if (full_key_highlight) {
+                active_rect.top += 1;
+                if (!preview_is_black_key(active_note)) {
+                    active_rect.bottom -= 1;
                 }
-                psf1_track_key_rect(note, width, &black_key);
-                OffsetRect(&black_key, x, y);
-                if (black_key.right > key.left && black_key.left < key.right) {
-                    Rectangle(hdc,
-                        black_key.left,
-                        black_key.top,
-                        black_key.right + 1,
-                        black_key.bottom + 1);
+                if (key.left <= 0) {
+                    active_rect.left += 1;
+                }
+                if (active_rect.right >= width) {
+                    active_rect.right -= 1;
                 }
             }
-            SelectObject(hdc, previous_pen);
-            SelectObject(hdc, previous_brush);
-            DeleteObject(border_pen);
-            DeleteObject(black_brush);
-
-            BitBlt(hdc, key.left, y, 1, PSF1_TRACK_KEYBOARD_HEIGHT,
-                state->psf1_keyboard_dc, key.left - x, 0, SRCCOPY);
-            BitBlt(hdc,
-                key.right < x + width ? key.right : x + width - 1,
-                y,
-                1,
-                PSF1_TRACK_KEYBOARD_HEIGHT,
-                state->psf1_keyboard_dc,
-                key.right < x + width ? key.right - x : width - 1,
-                0,
-                SRCCOPY);
+        } else {
+            active_rect.top += 1;
+            if (preview_is_black_key(active_note)) {
+                active_rect.left += 1;
+            } else {
+                active_rect.left += 1;
+                active_rect.bottom -= 1;
+            }
         }
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-        DeleteObject(active_pen);
+        if (active_rect.right > active_rect.left &&
+            active_rect.bottom > active_rect.top) {
+            FillRect(state->psf1_keyboard_dc, &active_rect, active_brush);
+            if (!preview_is_black_key(active_note)) {
+                int note;
+
+                for (note = PSF1_TRACK_KEY_FIRST_NOTE;
+                     note <= PSF1_TRACK_KEY_LAST_NOTE;
+                     ++note) {
+                    RECT black_key;
+
+                    if (!preview_is_black_key(note)) {
+                        continue;
+                    }
+                    psf1_track_key_rect(note, width, &black_key);
+                    if (black_key.right < active_rect.left ||
+                        black_key.left >= active_rect.right) {
+                        continue;
+                    }
+                    BitBlt(state->psf1_keyboard_dc,
+                        black_key.left, black_key.top,
+                        black_key.right - black_key.left + 1,
+                        black_key.bottom - black_key.top + 1,
+                        state->psf1_keyboard_base_dc,
+                        black_key.left, black_key.top, SRCCOPY);
+                }
+            }
+        }
+        BitBlt(hdc, x, y, width, PSF1_TRACK_KEYBOARD_HEIGHT,
+            state->psf1_keyboard_dc, 0, 0, SRCCOPY);
+        restore_rect = active_rect;
+        if (restore_rect.left < 0) {
+            restore_rect.left = 0;
+        }
+        if (restore_rect.right > width) {
+            restore_rect.right = width;
+        }
+        if (restore_rect.top < 0) {
+            restore_rect.top = 0;
+        }
+        if (restore_rect.bottom > PSF1_TRACK_KEYBOARD_HEIGHT) {
+            restore_rect.bottom = PSF1_TRACK_KEYBOARD_HEIGHT;
+        }
+        if (restore_rect.right > restore_rect.left &&
+            restore_rect.bottom > restore_rect.top) {
+            BitBlt(state->psf1_keyboard_dc,
+                restore_rect.left, restore_rect.top,
+                restore_rect.right - restore_rect.left,
+                restore_rect.bottom - restore_rect.top,
+                state->psf1_keyboard_base_dc,
+                restore_rect.left, restore_rect.top, SRCCOPY);
+        }
         DeleteObject(active_brush);
+    } else {
+        BitBlt(hdc, x, y, width, PSF1_TRACK_KEYBOARD_HEIGHT,
+            state->psf1_keyboard_dc, 0, 0, SRCCOPY);
     }
 }
 
 static void paint_core_panel(
     HDC hdc,
-    const PlayerState *player_state,
+    PlayerState *player_state,
     const Spu2LogLiveState *live,
     const uint8_t key_on_events[2][24],
     const uint8_t release_events[2][24],
@@ -15469,6 +16811,7 @@ static void paint_core_panel(
     const uint32_t gauge_vol_l[2][24],
     const uint32_t gauge_vol_r[2][24],
     const int psf1_track_notes[24],
+    const Psf1AkaoPlaybackState *akao,
     unsigned core,
     int hide_inactive,
     int env_color_index,
@@ -15478,6 +16821,8 @@ static void paint_core_panel(
     int x,
     int y,
     int line_height,
+    int active_header_line_height,
+    int voice_scroll_y,
     int show_core_label,
     uint8_t psf_version,
     int stopped_display,
@@ -15487,13 +16832,14 @@ static void paint_core_panel(
     COLORREF muted_text_color,
     COLORREF gauge_background_color,
     COLORREF gauge_border_color,
+    int voice_rows_target_bottom,
     int gauges_only)
 {
     unsigned voice;
     char line[160];
     const char *adsr_header;
-    POLYTEXTA header_text[4];
-    POLYTEXTA row_text[3];
+    POLYTEXTA header_text[6];
+    POLYTEXTA row_text[5];
     const Spu2LogCoreSnapshot *core_state = &live->cores[core];
     int active_count;
     int attack_count;
@@ -15509,6 +16855,14 @@ static void paint_core_panel(
     TEXTMETRICA text_metrics;
     int text_char_width = 8;
     int show_values = psf1_values_visible_for_state(player_state, psf_version);
+    int keyboard_height = psf1_keyboard_height_for_state(player_state, psf_version);
+    int keyboard_gap = psf1_keyboard_gap_for_state(player_state, psf_version);
+    int visible_count;
+    int row_content_height;
+    int row_extra_total = 0;
+    int visible_row_index = 0;
+    int rows_clip_saved_dc = 0;
+    int voice_hit_clip_top = 0;
     HFONT previous_row_font = NULL;
 
     if (GetTextMetricsA(hdc, &text_metrics) && text_metrics.tmAveCharWidth > 0) {
@@ -15530,7 +16884,7 @@ static void paint_core_panel(
         noise_hz = noise_clock_frequency_hz(noise_clock);
         if (show_core_label) {
             snprintf(line, sizeof(line),
-                "Core %u  active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%5uHz)",
+                "Core %u  active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X  nclk:%5uHz",
                 core,
                 active_count,
                 attack_count,
@@ -15539,11 +16893,49 @@ static void paint_core_panel(
                 release_count,
                 core_state->reverb_l,
                 core_state->reverb_r,
-                noise_clock,
                 noise_hz);
+        } else if (psf_version == 0x01u && akao != NULL && akao->detected) {
+            unsigned denominator = akao->beat_denominator != 0u ?
+                akao->beat_denominator :
+                (akao->ticks_per_beat != 0 ? 192u / akao->ticks_per_beat : 0u);
+            if (akao->driver_type == PSF1_MUSIC_DRIVER_SONY_SEQ) {
+                snprintf(line, sizeof(line),
+                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%06lX(%7.3f) %u/%u beat:%02u bar:%04u",
+                    active_count,
+                    attack_count,
+                    decay_count,
+                    sustain_count,
+                    release_count,
+                    core_state->reverb_l,
+                    core_state->reverb_r,
+                    noise_hz,
+                    (unsigned long)akao->tempo,
+                    psf1_tempo_bpm(akao->tempo, akao->early_format, akao->driver_type),
+                    akao->beats_per_measure,
+                    denominator,
+                    (unsigned)akao->current_beat + 1u,
+                    akao->measure);
+            } else {
+                snprintf(line, sizeof(line),
+                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%04lX(%7.3f) %u/%u beat:%02u bar:%04u",
+                    active_count,
+                    attack_count,
+                    decay_count,
+                    sustain_count,
+                    release_count,
+                    core_state->reverb_l,
+                    core_state->reverb_r,
+                    noise_hz,
+                    (unsigned long)akao->tempo,
+                    psf1_tempo_bpm(akao->tempo, akao->early_format, akao->driver_type),
+                    akao->beats_per_measure,
+                    denominator,
+                    (unsigned)akao->current_beat + 1u,
+                    akao->measure);
+            }
         } else {
             snprintf(line, sizeof(line),
-                "active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%5uHz)",
+                "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz",
                 active_count,
                 attack_count,
                 decay_count,
@@ -15551,47 +16943,125 @@ static void paint_core_panel(
                 release_count,
                 core_state->reverb_l,
                 core_state->reverb_r,
-                noise_clock,
                 noise_hz);
         }
-        TextOutA(hdc, x, y, line, (int)strlen(line));
-        y += line_height;
+        if (psf_version == 0x01u && player_state != NULL &&
+            IsZoomed(player_state->hwnd)) {
+            PlayerScaleLayout header_layout;
+            SIZE text_size;
+            const char *alignment_line = line;
+            int saved_dc;
+            int active_header_x = x;
+
+            if (normalize_psf1_display_mode(player_state->psf1_display_mode) ==
+                PSF1_DISPLAY_VALUES) {
+                alignment_line = g_psf1_values_fixed_header;
+            }
+            get_fullscreen_reference_layout(
+                player_state->hwnd, player_state, &header_layout);
+            saved_dc = SaveDC(hdc);
+            if (saved_dc != 0 && header_layout.scaled) {
+                SetMapMode(hdc, MM_ANISOTROPIC);
+                SetWindowExtEx(hdc, header_layout.base_width,
+                    header_layout.base_height, NULL);
+                SetViewportExtEx(hdc, header_layout.dest_width,
+                    header_layout.dest_height, NULL);
+                SetViewportOrgEx(hdc, header_layout.dest_x,
+                    header_layout.dest_y, NULL);
+                if (player_state->meter_font != NULL) {
+                    SelectObject(hdc, player_state->meter_font);
+                }
+                if (GetTextExtentPoint32A(
+                        hdc, alignment_line,
+                        (int)strlen(alignment_line), &text_size)) {
+                    active_header_x = x +
+                        (CORE_PANEL_WIDTH - text_size.cx) / 2;
+                }
+                TextOutA(hdc, active_header_x, y,
+                    line, (int)strlen(line));
+                RestoreDC(hdc, saved_dc);
+            } else {
+                if (saved_dc != 0) {
+                    RestoreDC(hdc, saved_dc);
+                }
+                TextOutA(hdc,
+                    x + (show_core_label ? COL_TEXT_X : 0), y,
+                    line, (int)strlen(line));
+            }
+        } else {
+            TextOutA(hdc,
+                x + (show_core_label ? COL_TEXT_X : 0), y,
+                line, (int)strlen(line));
+        }
+        y += active_header_line_height;
 
         if (show_values) {
             adsr_header = adsr_rate_header_for_psf(psf_version);
             ZeroMemory(header_text, sizeof(header_text));
             header_text[0].x = x + COL_TEXT_X;
             header_text[0].y = y;
-            header_text[0].n = 34;
-            header_text[0].lpstr = (LPSTR)"Vo On ADSR        Vol L/R    Pitch";
-            header_text[1].x = x + COL_ENV_TEXT_X;
+            header_text[0].n = 10;
+            header_text[0].lpstr = (LPSTR)"Vo On ADSR";
+            header_text[1].x = x + COL_TEXT_X + (18 * text_char_width);
             header_text[1].y = y;
-            header_text[1].n = 3;
-            header_text[1].lpstr = (LPSTR)"Env";
-            header_text[2].x = x + COL_VOL_BAR_X;
+            header_text[1].n = 7;
+            header_text[1].lpstr = (LPSTR)"Vol L/R";
+            header_text[2].x = x + COL_TEXT_X + (29 * text_char_width);
             header_text[2].y = y;
-            header_text[2].n = 7;
-            header_text[2].lpstr = (LPSTR)"Vol L/R";
-            header_text[3].x = x + COL_FLAGS_X;
+            header_text[2].n = 5;
+            header_text[2].lpstr = (LPSTR)"Pitch";
+            header_text[3].x = x + COL_ENV_TEXT_X;
             header_text[3].y = y;
-            header_text[3].n = (UINT)strlen(adsr_header);
-            header_text[3].lpstr = adsr_header;
-            PolyTextOutA(hdc, header_text, 4);
+            header_text[3].n = 3;
+            header_text[3].lpstr = (LPSTR)"Env";
+            header_text[4].x = x + COL_VOL_BAR_X;
+            header_text[4].y = y;
+            header_text[4].n = 7;
+            header_text[4].lpstr = (LPSTR)"Vol L/R";
+            header_text[5].x = x + COL_FLAGS_X;
+            header_text[5].y = y;
+            header_text[5].n = (UINT)strlen(adsr_header);
+            header_text[5].lpstr = adsr_header;
+            PolyTextOutA(hdc, header_text, 6);
             y += line_height;
 
             ZeroMemory(row_text, sizeof(row_text));
             row_text[0].x = x + COL_TEXT_X;
-            row_text[1].x = x + COL_ENV_TEXT_X;
-            row_text[1].n = 4u;
-            row_text[2].x = x + COL_FLAGS_X;
-            row_text[2].n = 25u;
+            row_text[0].n = 17u;
+            row_text[1].x = x + COL_TEXT_X + (18 * text_char_width);
+            row_text[1].n = 9u;
+            row_text[2].x = x + COL_TEXT_X + (29 * text_char_width);
+            row_text[2].n = 4u;
+            row_text[3].x = x + COL_ENV_TEXT_X;
+            row_text[3].n = 4u;
+            row_text[4].x = x + COL_FLAGS_X;
+            row_text[4].n = 25u;
         }
     } else {
-        y += line_height * (show_values ? 2 : 1);
+        y += active_header_line_height +
+            (show_values ? line_height : 0);
     }
 
     if (!show_values) {
-        y += psf1_keyboard_gap_for_state(player_state, psf_version);
+        y += keyboard_gap;
+    }
+    if (voice_scroll_y > 0) {
+        voice_hit_clip_top = y;
+        rows_clip_saved_dc = SaveDC(hdc);
+        IntersectClipRect(hdc, x, y,
+            x + CORE_PANEL_WIDTH, 0x7fff);
+        y -= voice_scroll_y;
+    }
+
+    visible_count = visible_voice_count(live, core, hide_inactive);
+    row_content_height = (show_values ? line_height : 0) + keyboard_height;
+    if (voice_rows_target_bottom > 0 && visible_count > 1) {
+        int base_bottom = y + row_content_height * visible_count +
+            keyboard_gap * (visible_count - 1);
+
+        if (voice_rows_target_bottom > base_bottom) {
+            row_extra_total = voice_rows_target_bottom - base_bottom;
+        }
     }
 
     if (!gauges_only &&
@@ -15609,7 +17079,6 @@ static void paint_core_panel(
         char env_text[5];
         const char *phase_label;
         size_t phase_length;
-        int line_length = 33;
         int row_y = y;
         int ps2_env_off = psf_version != 0x01u && v->envx == 0;
         int active = ps2_env_off ? 0 :
@@ -15622,6 +17091,24 @@ static void paint_core_panel(
 
         if (hide_inactive && !active) {
             continue;
+        }
+
+        if (player_state != NULL) {
+            RECT *voice_rect =
+                &player_state->voice_number_hit_rects[core][voice];
+
+            voice_rect->left = show_values ? x + COL_TEXT_X : x + 8;
+            voice_rect->right = voice_rect->left +
+                (show_values ? text_char_width * 2 : 40);
+            voice_rect->top = row_y;
+            voice_rect->bottom = row_y +
+                (show_values ? line_height : keyboard_height);
+            if (voice_hit_clip_top > 0 &&
+                voice_rect->top < voice_hit_clip_top) {
+                voice_rect->top = voice_hit_clip_top;
+            }
+            player_state->voice_number_hit_valid[core][voice] =
+                voice_rect->bottom > voice_rect->top ? 1u : 0u;
         }
 
         if (!gauges_only && show_values) {
@@ -15638,7 +17125,7 @@ static void paint_core_panel(
             release_pulse = !ps2_env_off && release_events[core][voice] != 0;
             format_voice_mode_columns(modes, sizeof(modes), flags, key_on_pulse, release_pulse, psf_version);
             format_adsr_rate_columns(rates, sizeof(rates), v->adsr1, v->adsr2);
-            phase_label = psf_version == 0x01u && !active ?
+            phase_label = v->envx == 0 ?
                 "off" : adsr_state_label(v->adsr_phase, v->adsr1, v->adsr2);
             phase_length = strlen(phase_label);
             if (phase_length > 11u) {
@@ -15676,25 +17163,32 @@ static void paint_core_panel(
                 SetTextColor(hdc, row_text_color);
                 current_text_color = row_text_color;
             }
-            if (psf_version == 0x01u && !active && !muted) {
+            if (psf_version == 0x01u && !active) {
                 TextOutA(hdc, x + COL_TEXT_X, y, line, 6);
-                TextOutA(hdc, x + COL_TEXT_X + (17 * text_char_width), y,
-                    line + 17, line_length - 17);
+                TextOutA(hdc, x + COL_TEXT_X + (18 * text_char_width), y,
+                    line + 18, 9);
+                TextOutA(hdc, x + COL_TEXT_X + (29 * text_char_width), y,
+                    line + 29, 4);
                 TextOutA(hdc, x + COL_ENV_TEXT_X, y, env_text, 4);
                 TextOutA(hdc, x + COL_FLAGS_X, y, voice_detail, 25);
-                SetTextColor(hdc, inactive_text_color);
-                current_text_color = inactive_text_color;
+                SetTextColor(hdc,
+                    muted ? muted_text_color : inactive_text_color);
+                current_text_color =
+                    muted ? muted_text_color : inactive_text_color;
                 TextOutA(hdc, x + COL_TEXT_X + (6 * text_char_width), y,
                     line + 6, 11);
             } else {
                 row_text[0].y = y;
-                row_text[0].n = (UINT)line_length;
                 row_text[0].lpstr = line;
                 row_text[1].y = y;
-                row_text[1].lpstr = env_text;
+                row_text[1].lpstr = line + 18;
                 row_text[2].y = y;
-                row_text[2].lpstr = voice_detail;
-                PolyTextOutA(hdc, row_text, 3);
+                row_text[2].lpstr = line + 29;
+                row_text[3].y = y;
+                row_text[3].lpstr = env_text;
+                row_text[4].y = y;
+                row_text[4].lpstr = voice_detail;
+                PolyTextOutA(hdc, row_text, 5);
             }
         }
 
@@ -15709,12 +17203,14 @@ static void paint_core_panel(
 
             SetDCPenColor(hdc, row_border_color);
             draw_bar(hdc, x + COL_ENV_BAR_X, row_y + 1, 175, line_height - 5, gauge_env[core][voice], 0x7fffu,
-                row_env_color, gauge_background_color);
+                row_env_color, gauge_background_color,
+                player_state != NULL && IsZoomed(player_state->hwnd));
             vol_bar_l = gauge_vol_l[core][voice];
             vol_bar_r = gauge_vol_r[core][voice];
             draw_stereo_bar(hdc, x + COL_VOL_BAR_X, row_y + 1, 100, line_height - 5,
                 vol_bar_l, vol_bar_r, 0x3fffu, row_lr_left_color, row_lr_right_color,
-                gauge_background_color);
+                gauge_background_color,
+                player_state != NULL && IsZoomed(player_state->hwnd));
         }
 
         if (psf_version == 0x01u &&
@@ -15747,15 +17243,25 @@ static void paint_core_panel(
                     voice_label, (int)strlen(voice_label));
             }
         }
-        y += (show_values ? line_height : 0) +
-            psf1_keyboard_height_for_state(player_state, psf_version) +
-            psf1_keyboard_gap_for_state(player_state, psf_version);
+        y += row_content_height;
+        if (visible_row_index + 1 < visible_count) {
+            int extra_before = visible_count > 1 ?
+                (row_extra_total * visible_row_index) / (visible_count - 1) : 0;
+            int extra_after = visible_count > 1 ?
+                (row_extra_total * (visible_row_index + 1)) / (visible_count - 1) : 0;
+
+            y += keyboard_gap + extra_after - extra_before;
+        }
+        ++visible_row_index;
     }
     if (!gauges_only && current_text_color != active_text_color) {
         SetTextColor(hdc, active_text_color);
     }
     if (previous_row_font != NULL) {
         SelectObject(hdc, previous_row_font);
+    }
+    if (rows_clip_saved_dc != 0) {
+        RestoreDC(hdc, rows_clip_saved_dc);
     }
 }
 
@@ -15795,18 +17301,26 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     COLORREF gauge_background_color;
     COLORREF gauge_border_color;
     uint8_t psf_version;
+    Psf1AkaoPlaybackState akao;
     unsigned display_core_count;
     unsigned note_voice;
+    int voice_rows_target_bottom;
+    int active_header_line_height;
+    int voice_scroll_y;
 
     if (state == NULL) {
         return;
     }
+
+    ZeroMemory(state->voice_number_hit_valid,
+        sizeof(state->voice_number_hit_valid));
 
     for (note_voice = 0; note_voice < 24u; ++note_voice) {
         psf1_track_notes[note_voice] = -1;
     }
 
     lock_state(state);
+    ZeroMemory(&akao, sizeof(akao));
     psf_version = state->psf_version;
     display_core_count = psf_version == 0x01u ? 1u : 2u;
     use_audible_display = !state->frame_advance && state->audible_display_valid;
@@ -15816,6 +17330,11 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
         live = state->audible_display_snapshot.live;
     } else {
         live = state->live;
+    }
+    akao = use_audible_display ?
+        state->audible_display_snapshot.akao : state->akao;
+    if (state->playing && !state->frame_advance && !state->audio_started) {
+        ZeroMemory(&akao, sizeof(akao));
     }
     stopped_display = use_audible_display ?
         state->audible_display_snapshot.stopped_display :
@@ -15937,7 +17456,14 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
         state->meter_line_height = GetTextMetricsA(hdc, &tm) ? tm.tmHeight + 1 : 16;
     }
     line_height = state->meter_line_height;
+    active_header_line_height = maximized_active_header_line_height(
+        hwnd, state, line_height);
     y += CONTROLS_HEIGHT;
+    voice_scroll_y = player_voice_scroll_enabled(hwnd, state) ?
+        state->scroll_y : 0;
+    voice_rows_target_bottom = voice_scroll_y > 0 ||
+        player_voice_scroll_enabled(hwnd, state) ? 0 :
+        maximized_voice_rows_target_bottom(hwnd, state);
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, active_text_color);
@@ -15954,9 +17480,9 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
             state, hdc, dark_keyboard, keyboard_width);
     }
 
-    paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE0_X, y, line_height, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, gauges_only);
+    paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, &akao, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE0_X, y, line_height, active_header_line_height, voice_scroll_y, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
     if (psf_version != 0x01u) {
-        paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, 1, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, gauges_only);
+        paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, NULL, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, active_header_line_height, 0, 1, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
     }
 
     SelectObject(hdc, old_pen);
@@ -15989,6 +17515,17 @@ static void destroy_player_paint_resources(PlayerState *state)
     if (state->psf1_keyboard_dc != NULL) {
         DeleteDC(state->psf1_keyboard_dc);
     }
+    if (state->psf1_keyboard_base_dc != NULL &&
+        state->psf1_keyboard_base_old_bitmap != NULL) {
+        SelectObject(state->psf1_keyboard_base_dc,
+            state->psf1_keyboard_base_old_bitmap);
+    }
+    if (state->psf1_keyboard_base_bitmap != NULL) {
+        DeleteObject(state->psf1_keyboard_base_bitmap);
+    }
+    if (state->psf1_keyboard_base_dc != NULL) {
+        DeleteDC(state->psf1_keyboard_base_dc);
+    }
     if (state->meter_bold_font != NULL &&
         state->meter_bold_font != state->meter_font &&
         state->meter_bold_font != (HFONT)GetStockObject(ANSI_FIXED_FONT)) {
@@ -16004,6 +17541,9 @@ static void destroy_player_paint_resources(PlayerState *state)
     state->psf1_keyboard_dc = NULL;
     state->psf1_keyboard_bitmap = NULL;
     state->psf1_keyboard_old_bitmap = NULL;
+    state->psf1_keyboard_base_dc = NULL;
+    state->psf1_keyboard_base_bitmap = NULL;
+    state->psf1_keyboard_base_old_bitmap = NULL;
     state->psf1_keyboard_width = 0;
     state->meter_font = NULL;
     state->meter_bold_font = NULL;
@@ -16101,6 +17641,88 @@ static int get_player_display_line_height(HWND hwnd)
     return line_height;
 }
 
+static int maximized_voice_rows_target_bottom(
+    HWND hwnd,
+    const PlayerState *state)
+{
+    PlayerScaleLayout layout;
+    RECT client_rect;
+    int device_bottom;
+
+    if (hwnd == NULL || !IsZoomed(hwnd) ||
+        !GetClientRect(hwnd, &client_rect)) {
+        return 0;
+    }
+    get_player_content_scale_layout(hwnd, state, &layout);
+    if (!layout.scaled || layout.dest_height <= 0 || layout.base_height <= 0) {
+        return 0;
+    }
+    device_bottom = client_rect.bottom - 4;
+    if (device_bottom <= layout.dest_y) {
+        return 0;
+    }
+    return (int)(((int64_t)(device_bottom - layout.dest_y) *
+        layout.base_height) / layout.dest_height);
+}
+
+static int voice_row_index_from_y(
+    HWND hwnd,
+    const PlayerState *state,
+    const Spu2LogLiveState *live,
+    unsigned core,
+    uint8_t psf_version,
+    int hide_inactive,
+    int mouse_y,
+    int line_height,
+    int hit_height)
+{
+    int show_values;
+    int keyboard_height;
+    int keyboard_gap;
+    int row_top;
+    int row_content_height;
+    int visible_count;
+    int target_bottom;
+    int base_bottom;
+    int extra_total = 0;
+    int active_header_height;
+    int row;
+
+    show_values = psf1_values_visible_for_state(state, psf_version);
+    keyboard_height = psf1_keyboard_height_for_state(state, psf_version);
+    keyboard_gap = psf1_keyboard_gap_for_state(state, psf_version);
+    active_header_height = maximized_active_header_line_height(
+        hwnd, state, line_height);
+    if (player_voice_scroll_enabled(hwnd, state)) {
+        mouse_y += state->scroll_y;
+    }
+    row_top = 2 + CONTROLS_HEIGHT +
+        active_header_height + (show_values ? line_height : 0) +
+        (show_values ? 0 : keyboard_gap);
+    row_content_height = (show_values ? line_height : 0) + keyboard_height;
+    visible_count = visible_voice_count(live, core, hide_inactive);
+    if (visible_count <= 0 || row_content_height <= 0) {
+        return -1;
+    }
+    target_bottom = maximized_voice_rows_target_bottom(hwnd, state);
+    base_bottom = row_top + (row_content_height * visible_count) +
+        (keyboard_gap * (visible_count - 1));
+    if (target_bottom > base_bottom && visible_count > 1) {
+        extra_total = target_bottom - base_bottom;
+    }
+    for (row = 0; row < visible_count; ++row) {
+        int row_y = row_top + row * (row_content_height + keyboard_gap);
+
+        if (visible_count > 1) {
+            row_y += (extra_total * row) / (visible_count - 1);
+        }
+        if (mouse_y >= row_y && mouse_y < row_y + hit_height) {
+            return row;
+        }
+    }
+    return -1;
+}
+
 static int get_player_display_char_width(HWND hwnd)
 {
     HDC hdc;
@@ -16135,113 +17757,64 @@ static int get_player_display_char_width(HWND hwnd)
 
 static int hit_test_voice_row(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core, unsigned *out_voice)
 {
-    Spu2LogLiveState live;
-    uint8_t psf_version;
-    int hide_inactive;
-    int line_height;
-    int panel_x;
-    int rel_y;
-    int row;
-    int keyboard_only;
     unsigned core;
     unsigned voice;
-    int visible_row = 0;
 
     if (state == NULL || out_core == NULL || out_voice == NULL) {
         return 0;
     }
 
-    lock_state(state);
-    live = state->live;
-    psf_version = state->psf_version;
-    hide_inactive = state->hide_inactive;
-    unlock_state(state);
+    (void)hwnd;
+    for (core = 0; core < 2u; ++core) {
+        for (voice = 0; voice < 24u; ++voice) {
+            const RECT *voice_rect =
+                &state->voice_number_hit_rects[core][voice];
 
-    keyboard_only = psf_version == 0x01u &&
-        !psf1_values_visible_for_state(state, psf_version) &&
-        psf1_keyboard_height_for_state(state, psf_version) > 0;
-    if (!psf1_values_visible_for_state(state, psf_version) && !keyboard_only) {
-        return 0;
-    }
-
-    if (psf_version == 0x01u) {
-        core = 0;
-        panel_x = CORE0_X;
-    } else if (mouse_x >= CORE1_X) {
-        core = 1;
-        panel_x = CORE1_X;
-    } else {
-        core = 0;
-        panel_x = CORE0_X;
-    }
-
-    if (mouse_x < panel_x || mouse_x >= panel_x + CORE_PANEL_WIDTH) {
-        return 0;
-    }
-    if (keyboard_only) {
-        if (mouse_x < panel_x + 8 || mouse_x >= panel_x + 48) {
-            return 0;
+            if (state->voice_number_hit_valid[core][voice] != 0u &&
+                mouse_x >= voice_rect->left && mouse_x < voice_rect->right &&
+                mouse_y >= voice_rect->top && mouse_y < voice_rect->bottom) {
+                *out_core = core;
+                *out_voice = voice;
+                return 1;
+            }
         }
-    } else {
-        if (mouse_x < panel_x + COL_TEXT_X || mouse_x >= panel_x + COL_TEXT_X + 28) {
-            return 0;
-        }
-    }
-
-    line_height = get_player_display_line_height(hwnd);
-    rel_y = mouse_y - (2 + CONTROLS_HEIGHT +
-        (keyboard_only ? line_height + psf1_keyboard_gap_for_state(state, psf_version) :
-            line_height * 2));
-    if (rel_y < 0) {
-        return 0;
-    }
-    if (keyboard_only) {
-        int row_stride = PSF1_TRACK_KEYBOARD_HEIGHT +
-            psf1_keyboard_gap_for_state(state, psf_version);
-        if ((rel_y % row_stride) >= PSF1_TRACK_KEYBOARD_HEIGHT) {
-            return 0;
-        }
-        row = rel_y / row_stride;
-    } else if (psf_version == 0x01u &&
-        psf1_keyboard_height_for_state(state, psf_version) > 0) {
-        int row_stride = line_height + PSF1_TRACK_KEYBOARD_HEIGHT;
-        if ((rel_y % row_stride) >= line_height) {
-            return 0;
-        }
-        row = rel_y / row_stride;
-    } else {
-        row = rel_y / line_height;
-    }
-
-    for (voice = 0; voice < 24u; ++voice) {
-        if (hide_inactive && !is_voice_active(&live.voices[core][voice])) {
-            continue;
-        }
-        if (visible_row == row) {
-            *out_core = core;
-            *out_voice = voice;
-            return 1;
-        }
-        ++visible_row;
     }
 
     return 0;
 }
 
+static int hit_test_painted_voice_y(
+    const PlayerState *state,
+    unsigned core,
+    int mouse_y,
+    unsigned *out_voice)
+{
+    unsigned voice;
+
+    if (state == NULL || out_voice == NULL || core >= 2u) {
+        return 0;
+    }
+    for (voice = 0; voice < 24u; ++voice) {
+        const RECT *voice_rect =
+            &state->voice_number_hit_rects[core][voice];
+
+        if (state->voice_number_hit_valid[core][voice] != 0u &&
+            mouse_y >= voice_rect->top && mouse_y < voice_rect->bottom) {
+            *out_voice = voice;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int hit_test_voice_text_column(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core, unsigned *out_voice, unsigned *out_column)
 {
-    Spu2LogLiveState live;
     uint8_t psf_version;
-    int hide_inactive;
-    int line_height;
     int char_width;
     int panel_x;
-    int rel_y;
-    int row;
     int rel_x;
     unsigned core;
     unsigned voice;
-    int visible_row = 0;
     unsigned column = VOICE_TEXT_COLUMN_NONE;
 
     if (state == NULL || out_core == NULL || out_voice == NULL || out_column == NULL) {
@@ -16249,9 +17822,7 @@ static int hit_test_voice_text_column(HWND hwnd, PlayerState *state, int mouse_x
     }
 
     lock_state(state);
-    live = state->live;
     psf_version = state->psf_version;
-    hide_inactive = state->hide_inactive;
     unlock_state(state);
 
     if (!psf1_values_visible_for_state(state, psf_version)) {
@@ -16291,59 +17862,28 @@ static int hit_test_voice_text_column(HWND hwnd, PlayerState *state, int mouse_x
         return 0;
     }
 
-    line_height = get_player_display_line_height(hwnd);
-    rel_y = mouse_y - (2 + CONTROLS_HEIGHT + (line_height * 2));
-    if (rel_y < 0) {
+    if (!hit_test_painted_voice_y(state, core, mouse_y, &voice)) {
         return 0;
     }
-    if (psf_version == 0x01u &&
-        psf1_keyboard_height_for_state(state, psf_version) > 0) {
-        int row_stride = line_height + PSF1_TRACK_KEYBOARD_HEIGHT;
-        if ((rel_y % row_stride) >= line_height) {
-            return 0;
-        }
-        row = rel_y / row_stride;
-    } else {
-        row = rel_y / line_height;
-    }
-
-    for (voice = 0; voice < 24u; ++voice) {
-        if (hide_inactive && !is_voice_active(&live.voices[core][voice])) {
-            continue;
-        }
-        if (visible_row == row) {
-            *out_core = core;
-            *out_voice = voice;
-            *out_column = column;
-            return 1;
-        }
-        ++visible_row;
-    }
-
-    return 0;
+    *out_core = core;
+    *out_voice = voice;
+    *out_column = column;
+    return 1;
 }
 
 static int hit_test_voice_env_column(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core, unsigned *out_voice)
 {
-    Spu2LogLiveState live;
     uint8_t psf_version;
-    int hide_inactive;
-    int line_height;
     int panel_x;
-    int rel_y;
-    int row;
     unsigned core;
     unsigned voice;
-    int visible_row = 0;
 
     if (state == NULL || out_core == NULL || out_voice == NULL) {
         return 0;
     }
 
     lock_state(state);
-    live = state->live;
     psf_version = state->psf_version;
-    hide_inactive = state->hide_inactive;
     unlock_state(state);
 
     if (!psf1_values_visible_for_state(state, psf_version)) {
@@ -16365,62 +17905,31 @@ static int hit_test_voice_env_column(HWND hwnd, PlayerState *state, int mouse_x,
         return 0;
     }
 
-    line_height = get_player_display_line_height(hwnd);
-    rel_y = mouse_y - (2 + CONTROLS_HEIGHT + (line_height * 2));
-    if (rel_y < 0) {
+    if (!hit_test_painted_voice_y(state, core, mouse_y, &voice)) {
         return 0;
     }
-    if (psf_version == 0x01u &&
-        psf1_keyboard_height_for_state(state, psf_version) > 0) {
-        int row_stride = line_height + PSF1_TRACK_KEYBOARD_HEIGHT;
-        if ((rel_y % row_stride) >= line_height) {
-            return 0;
-        }
-        row = rel_y / row_stride;
-    } else {
-        row = rel_y / line_height;
-    }
-
-    for (voice = 0; voice < 24u; ++voice) {
-        if (hide_inactive && !is_voice_active(&live.voices[core][voice])) {
-            continue;
-        }
-        if (visible_row == row) {
-            *out_core = core;
-            *out_voice = voice;
-            return 1;
-        }
-        ++visible_row;
-    }
-
-    return 0;
+    *out_core = core;
+    *out_voice = voice;
+    return 1;
 }
 
 static int hit_test_voice_flag_column(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core, unsigned *out_voice, unsigned *out_column)
 {
-    Spu2LogLiveState live;
     uint8_t psf_version;
-    int hide_inactive;
-    int line_height;
     int char_width;
     int panel_x;
-    int rel_y;
-    int row;
     int flag_x;
     int rel_x;
     int column = VOICE_FLAG_COLUMN_NONE;
     unsigned core;
     unsigned voice;
-    int visible_row = 0;
 
     if (state == NULL || out_core == NULL || out_voice == NULL || out_column == NULL) {
         return 0;
     }
 
     lock_state(state);
-    live = state->live;
     psf_version = state->psf_version;
-    hide_inactive = state->hide_inactive;
     unlock_state(state);
 
     if (!psf1_values_visible_for_state(state, psf_version)) {
@@ -16462,36 +17971,13 @@ static int hit_test_voice_flag_column(HWND hwnd, PlayerState *state, int mouse_x
         return 0;
     }
 
-    line_height = get_player_display_line_height(hwnd);
-    rel_y = mouse_y - (2 + CONTROLS_HEIGHT + (line_height * 2));
-    if (rel_y < 0) {
+    if (!hit_test_painted_voice_y(state, core, mouse_y, &voice)) {
         return 0;
     }
-    if (psf_version == 0x01u &&
-        psf1_keyboard_height_for_state(state, psf_version) > 0) {
-        int row_stride = line_height + PSF1_TRACK_KEYBOARD_HEIGHT;
-        if ((rel_y % row_stride) >= line_height) {
-            return 0;
-        }
-        row = rel_y / row_stride;
-    } else {
-        row = rel_y / line_height;
-    }
-
-    for (voice = 0; voice < 24u; ++voice) {
-        if (hide_inactive && !is_voice_active(&live.voices[core][voice])) {
-            continue;
-        }
-        if (visible_row == row) {
-            *out_core = core;
-            *out_voice = voice;
-            *out_column = (unsigned)column;
-            return 1;
-        }
-        ++visible_row;
-    }
-
-    return 0;
+    *out_core = core;
+    *out_voice = voice;
+    *out_column = (unsigned)column;
+    return 1;
 }
 
 static void format_core_header_line(
@@ -16514,7 +18000,7 @@ static void format_core_header_line(
     adsr_phase_counts(live, core, &attack_count, &decay_count, &sustain_count, &release_count);
     if (show_core_label) {
         snprintf(line, line_size,
-            "Core %u  active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%5uHz)",
+            "Core %u  active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X  nclk:%5uHz",
             core,
             active_count,
             attack_count,
@@ -16523,12 +18009,11 @@ static void format_core_header_line(
             release_count,
             core_state->reverb_l,
             core_state->reverb_r,
-            noise_clock,
             noise_hz);
     } else {
         (void)psf_version;
         snprintf(line, line_size,
-            "active:%02d/24  A/D/S/R:%02d/%02d/%02d/%02d  reverb:0x%04X/0x%04X  noise clock:0x%02X(%5uHz)",
+            "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz",
             active_count,
             attack_count,
             decay_count,
@@ -16536,9 +18021,41 @@ static void format_core_header_line(
             release_count,
             core_state->reverb_l,
             core_state->reverb_r,
-            noise_clock,
             noise_hz);
     }
+}
+
+static void active_header_logical_point(
+    HWND hwnd,
+    const PlayerState *state,
+    int *x,
+    int *y)
+{
+    PlayerScaleLayout content_layout;
+    PlayerScaleLayout header_layout;
+    int device_x;
+    int device_y;
+
+    if (hwnd == NULL || state == NULL || x == NULL || y == NULL ||
+        !IsZoomed(hwnd) || state->psf_version != 0x01u) {
+        return;
+    }
+    get_player_content_scale_layout(hwnd, state, &content_layout);
+    get_fullscreen_reference_layout(hwnd, state, &header_layout);
+    if (!content_layout.scaled || !header_layout.scaled ||
+        content_layout.base_width <= 0 || content_layout.base_height <= 0 ||
+        header_layout.dest_width <= 0 || header_layout.dest_height <= 0) {
+        return;
+    }
+
+    device_x = content_layout.dest_x + (int)(((int64_t)*x *
+        content_layout.dest_width) / content_layout.base_width);
+    device_y = content_layout.dest_y + (int)(((int64_t)*y *
+        content_layout.dest_height) / content_layout.base_height);
+    *x = (int)(((int64_t)(device_x - header_layout.dest_x) *
+        header_layout.base_width) / header_layout.dest_width);
+    *y = (int)(((int64_t)(device_y - header_layout.dest_y) *
+        header_layout.base_height) / header_layout.dest_height);
 }
 
 static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core, unsigned *out_side)
@@ -16548,9 +18065,11 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
     int char_width;
     int line_height;
     int panel_x;
+    int header_x;
     int rel_x;
     unsigned core;
     char line[256];
+    const char *alignment_line;
     const char *marker;
     const char *slash;
     int left_index;
@@ -16565,6 +18084,8 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
     live = state->live;
     psf_version = state->psf_version;
     unlock_state(state);
+
+    active_header_logical_point(hwnd, state, &mouse_x, &mouse_y);
 
     line_height = get_player_display_line_height(hwnd);
     if (mouse_y < 2 + CONTROLS_HEIGHT || mouse_y >= 2 + CONTROLS_HEIGHT + line_height) {
@@ -16586,7 +18107,7 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
     }
 
     format_core_header_line(&live, core, psf_version, psf_version != 0x01u, line, sizeof(line));
-    marker = strstr(line, "reverb:0x");
+    marker = strstr(line, "rv:0x");
     if (marker == NULL) {
         return 0;
     }
@@ -16596,9 +18117,21 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
     }
 
     char_width = get_player_display_char_width(hwnd);
-    rel_x = (mouse_x - panel_x) / char_width;
+    header_x = panel_x;
+    alignment_line = line;
+    if (psf_version == 0x01u && IsZoomed(hwnd)) {
+        if (normalize_psf1_display_mode(state->psf1_display_mode) ==
+            PSF1_DISPLAY_VALUES) {
+            alignment_line = g_psf1_values_fixed_header;
+        }
+        header_x += (CORE_PANEL_WIDTH -
+            (int)strlen(alignment_line) * char_width) / 2;
+    } else if (psf_version != 0x01u) {
+        header_x += COL_TEXT_X;
+    }
+    rel_x = (mouse_x - header_x) / char_width;
     marker_index = (int)(marker - line);
-    left_index = (int)((marker - line) + 9);
+    left_index = (int)((marker - line) + 5);
     right_index = (int)((slash - line) + 3);
     if (rel_x >= left_index && rel_x < left_index + 4) {
         *out_core = core;
@@ -16625,9 +18158,11 @@ static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mo
     int char_width;
     int line_height;
     int panel_x;
+    int header_x;
     int rel_x;
     unsigned core;
     char line[256];
+    const char *alignment_line;
     const char *marker;
     int value_index;
 
@@ -16639,6 +18174,8 @@ static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mo
     live = state->live;
     psf_version = state->psf_version;
     unlock_state(state);
+
+    active_header_logical_point(hwnd, state, &mouse_x, &mouse_y);
 
     line_height = get_player_display_line_height(hwnd);
     if (mouse_y < 2 + CONTROLS_HEIGHT || mouse_y >= 2 + CONTROLS_HEIGHT + line_height) {
@@ -16660,24 +18197,65 @@ static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mo
     }
 
     format_core_header_line(&live, core, psf_version, psf_version != 0x01u, line, sizeof(line));
-    marker = strstr(line, "noise clock:0x");
+    marker = strstr(line, "nclk:");
     if (marker == NULL) {
         return 0;
     }
 
     char_width = get_player_display_char_width(hwnd);
-    rel_x = (mouse_x - panel_x) / char_width;
-    value_index = (int)(marker - line) + (int)strlen("noise clock:0x");
-    if (rel_x >= value_index && rel_x < value_index + 2) {
+    header_x = panel_x;
+    alignment_line = line;
+    if (psf_version == 0x01u && IsZoomed(hwnd)) {
+        if (normalize_psf1_display_mode(state->psf1_display_mode) ==
+            PSF1_DISPLAY_VALUES) {
+            alignment_line = g_psf1_values_fixed_header;
+        }
+        header_x += (CORE_PANEL_WIDTH -
+            (int)strlen(alignment_line) * char_width) / 2;
+    } else if (psf_version != 0x01u) {
+        header_x += COL_TEXT_X;
+    }
+    rel_x = (mouse_x - header_x) / char_width;
+    value_index = (int)(marker - line) + (int)strlen("nclk:");
+    if (rel_x >= value_index && rel_x < value_index + 7) {
         *out_core = core;
         return 1;
     }
     return 0;
 }
 
+static LPARAM player_logical_mouse_lparam(
+    HWND hwnd,
+    const PlayerState *state,
+    LPARAM lparam)
+{
+    PlayerScaleLayout layout;
+    int x = GET_X_LPARAM(lparam);
+    int y = GET_Y_LPARAM(lparam);
+
+    get_player_content_scale_layout(hwnd, state, &layout);
+    if (!layout.scaled || layout.dest_width <= 0 || layout.dest_height <= 0 ||
+        layout.base_width <= 0 || layout.base_height <= 0) {
+        return lparam;
+    }
+    x = (int)(((int64_t)(x - layout.dest_x) * layout.base_width) /
+        layout.dest_width);
+    y = (int)(((int64_t)(y - layout.dest_y) * layout.base_height) /
+        layout.dest_height);
+    return MAKELPARAM((short)x, (short)y);
+}
+
 static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     PlayerState *state = (PlayerState *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    if (state != NULL &&
+        (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+         msg == WM_LBUTTONDBLCLK || msg == WM_MOUSEMOVE ||
+         msg == WM_RBUTTONDOWN ||
+         msg == WM_RBUTTONUP || msg == WM_RBUTTONDBLCLK)) {
+        lparam = player_logical_mouse_lparam(hwnd, state, lparam);
+    }
 
     switch (msg) {
     case WM_CREATE: {
@@ -16687,10 +18265,12 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         HMENU settings_menu = CreatePopupMenu();
         HMENU env_color_menu = CreatePopupMenu();
         HMENU lr_color_menu = CreatePopupMenu();
+        HMENU speed_menu = CreatePopupMenu();
         HMENU volume_menu = CreatePopupMenu();
         HMENU performance_menu = CreatePopupMenu();
         HMENU theme_menu = CreatePopupMenu();
         HMENU help_menu = CreatePopupMenu();
+        unsigned speed_index;
         unsigned volume_percent;
 
         state = (PlayerState *)create->lpCreateParams;
@@ -16704,28 +18284,30 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         append_darkable_menu_separator(file_menu);
         append_darkable_menu_item(file_menu, IDM_EXIT, "Exit");
         append_darkable_menu_bar_popup(menu, file_menu, "File");
-        AppendMenuA(settings_menu, MF_OWNERDRAW | MF_CHECKED, IDM_MAIN_ENABLED, "Main");
-        AppendMenuA(settings_menu, MF_OWNERDRAW | MF_CHECKED, IDM_REVERB_ENABLED, "Reverb");
-        append_darkable_menu_item(settings_menu, IDM_DEBUG_EDIT_CONTROLS, "Debug");
-        append_darkable_menu_item(settings_menu, IDM_FRAME_ADVANCE, "Frame Advance");
-        append_darkable_menu_item(settings_menu, IDM_TIMBRE_SCAN, "Samples Scan");
+        for (speed_index = 0; speed_index < SPEED_PRESET_COUNT; ++speed_index) {
+            append_darkable_menu_item(
+                speed_menu,
+                IDM_SPEED_PRESET_FIRST + speed_index,
+                g_speed_menu_labels[speed_index]);
+        }
+        append_darkable_menu_popup(settings_menu, speed_menu, "Speed");
+        for (volume_percent = 0; volume_percent <= 200; volume_percent += 20) {
+            AppendMenuA(volume_menu, MF_OWNERDRAW, IDM_VOLUME_0 + (volume_percent / 10), volume_menu_label_for_id(IDM_VOLUME_0 + (volume_percent / 10)));
+        }
+        append_darkable_menu_popup(settings_menu, volume_menu, "Volume");
+        append_darkable_menu_item(settings_menu, IDM_TAG_FADE_ENABLED, "Fade at tag time");
+        append_darkable_menu_separator(settings_menu);
         append_darkable_menu_item(settings_menu, IDM_KEYBOARD, "Keyboard");
         append_darkable_menu_item(settings_menu, IDM_PLAYBACK_ONLY, "Playback only");
-        append_darkable_menu_item(settings_menu, IDM_TAG_FADE_ENABLED, "Fade at tag time");
+        append_darkable_menu_item(settings_menu, IDM_TIMBRE_SCAN, "Samples Scan");
+        append_darkable_menu_item(settings_menu, IDM_DEBUG_EDIT_CONTROLS, "Debug");
+        append_darkable_menu_item(settings_menu, IDM_FRAME_ADVANCE, "Frame Advance");
+        append_darkable_menu_separator(settings_menu);
         append_darkable_menu_item(settings_menu, IDM_FONT_SELECT, "Font...");
         append_darkable_menu_item(theme_menu, IDM_THEME_SYSTEM, "System");
         append_darkable_menu_item(theme_menu, IDM_THEME_LIGHT, "Light");
         append_darkable_menu_item(theme_menu, IDM_THEME_DARK, "Dark");
-        append_darkable_menu_popup(settings_menu, theme_menu, "Dark Theme");
-        append_darkable_menu_separator(settings_menu);
-        for (volume_percent = 0; volume_percent <= 200; volume_percent += 10) {
-            AppendMenuA(volume_menu, MF_OWNERDRAW, IDM_VOLUME_0 + (volume_percent / 10), volume_menu_label_for_id(IDM_VOLUME_0 + (volume_percent / 10)));
-        }
-        append_darkable_menu_popup(settings_menu, volume_menu, "Volume");
-        append_darkable_menu_item(performance_menu, IDM_PERF_LOW, "Low spec");
-        append_darkable_menu_item(performance_menu, IDM_PERF_MIDDLE, "Middle spec");
-        append_darkable_menu_item(performance_menu, IDM_PERF_HIGH, "High spec");
-        append_darkable_menu_popup(settings_menu, performance_menu, "Performance");
+        append_darkable_menu_popup(settings_menu, theme_menu, "Theme");
         append_darkable_menu_item(env_color_menu, IDM_ENV_COLOR_GREEN, "Green");
         append_darkable_menu_item(env_color_menu, IDM_ENV_COLOR_BLUE, "Blue");
         append_darkable_menu_item(env_color_menu, IDM_ENV_COLOR_CYAN, "Cyan");
@@ -16748,6 +18330,13 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         append_darkable_menu_separator(lr_color_menu);
         append_darkable_menu_item(lr_color_menu, IDM_LR_COLOR_CUSTOM, "Custom...");
         append_darkable_menu_popup(settings_menu, lr_color_menu, "L/R color");
+        append_darkable_menu_separator(settings_menu);
+        AppendMenuA(settings_menu, MF_OWNERDRAW | MF_CHECKED, IDM_MAIN_ENABLED, "Main");
+        AppendMenuA(settings_menu, MF_OWNERDRAW | MF_CHECKED, IDM_REVERB_ENABLED, "Reverb");
+        append_darkable_menu_item(performance_menu, IDM_PERF_LOW, "Low spec");
+        append_darkable_menu_item(performance_menu, IDM_PERF_MIDDLE, "Middle spec");
+        append_darkable_menu_item(performance_menu, IDM_PERF_HIGH, "High spec");
+        append_darkable_menu_popup(settings_menu, performance_menu, "Performance");
         append_darkable_menu_bar_popup(menu, settings_menu, "Settings");
         append_darkable_menu_item(help_menu, IDM_ABOUT, "About");
         append_darkable_menu_bar_popup(menu, help_menu, "Help");
@@ -16763,18 +18352,28 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             122, 4, 58, 20, hwnd, (HMENU)(UINT_PTR)IDC_PAUSE, NULL, NULL);
         state->stop_button = CreateWindowA("BUTTON", "Stop", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
             184, 4, 54, 20, hwnd, (HMENU)(UINT_PTR)IDC_STOP, NULL, NULL);
-        state->speed_slider = CreateWindowA(TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
+        state->speed_slider = CreateWindowA(TRACKBAR_CLASSA, "",
+            WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
             252, 1, 136, 26, hwnd, (HMENU)(UINT_PTR)IDC_SPEED, NULL, NULL);
-        state->speed_label = CreateWindowA("STATIC", "Speed 100%", WS_CHILD | WS_VISIBLE | SS_NOTIFY,
+        state->speed_label = CreateWindowA("STATIC", "Speed 100%",
+            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTERIMAGE,
             394, 6, 94, 16, hwnd, (HMENU)(UINT_PTR)IDC_SPEED_LABEL, NULL, NULL);
-        state->volume_label = CreateWindowA("STATIC", "Vol 100%", WS_CHILD | WS_VISIBLE | SS_NOTIFY,
+        state->volume_label = CreateWindowA("STATIC", "Vol 100%",
+            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTERIMAGE,
             492, 6, 68, 16, hwnd, (HMENU)(UINT_PTR)IDC_VOLUME_LABEL, NULL, NULL);
         state->main_check = CreateWindowA("BUTTON", "Main", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
             564, 4, 58, 20, hwnd, (HMENU)(UINT_PTR)IDC_MAIN_CHECK, NULL, NULL);
         state->reverb_check = CreateWindowA("BUTTON", "Reverb", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
             626, 4, 70, 20, hwnd, (HMENU)(UINT_PTR)IDC_REVERB_CHECK, NULL, NULL);
-        state->time_label = CreateWindowA("STATIC", "00:00.0 / --:--.-", WS_CHILD | WS_VISIBLE | SS_NOTIFY,
-            702, 6, 100, 16, hwnd, (HMENU)(UINT_PTR)IDC_TIME_LABEL, NULL, NULL);
+        state->time_label = CreateWindowA("STATIC", "00:00.0 / --:--.-",
+            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTERIMAGE,
+            702, 6, TIME_LABEL_MIN_WIDTH, 16,
+            hwnd, (HMENU)(UINT_PTR)IDC_TIME_LABEL, NULL, NULL);
+        state->voice_scrollbar = CreateWindowA("SCROLLBAR", "",
+            WS_CHILD | SBS_VERT,
+            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100,
+            hwnd, NULL, NULL, NULL);
+        apply_voice_scrollbar_theme(state);
         if (state->speed_slider != NULL) {
             SendMessageA(state->speed_slider, TBM_SETRANGE, TRUE, MAKELPARAM(10, 200));
             SendMessageA(state->speed_slider, TBM_SETTICFREQ, 10, 0);
@@ -16784,9 +18383,9 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         }
         set_speed_percent(hwnd, state, state->speed_percent);
         set_volume_percent(hwnd, state, state->volume_percent, 0);
+        apply_ui_font_to_window(hwnd, state->ui_font);
         update_main_reverb_controls(state);
         update_time_label(state);
-        apply_ui_font_to_window(hwnd, state->ui_font);
         DragAcceptFiles(hwnd, TRUE);
 
         update_scrollbar(hwnd, state);
@@ -16802,6 +18401,10 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             playlist_process_pending_play(hwnd, state);
             return 0;
         }
+        if (state != NULL && wparam == PLAYER_DIRECT_RETRY_TIMER_ID) {
+            process_direct_start_retry(hwnd, state);
+            return 0;
+        }
         if (state != NULL && wparam == PLAYER_TIMER_ID) {
             if (state->playlist_play_in_progress) {
                 playlist_process_pending_play(hwnd, state);
@@ -16812,6 +18415,41 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
     case PLAYER_WM_WORKER_UPDATE:
         if (state != NULL && state->timbre_hwnd != NULL) {
             timbre_refresh_listbox(state);
+        }
+        if (state != NULL && state->direct_start_retry_armed &&
+            !get_playing(state)) {
+            SetTimer(hwnd, PLAYER_DIRECT_RETRY_TIMER_ID,
+                PLAYER_DIRECT_RETRY_TIMER_MS, NULL);
+        }
+        return 0;
+    case PLAYER_WM_AUDIO_STARTING:
+        if (state != NULL && state->playing && state->audio_started &&
+            state->wave == (HWAVEOUT)(UINT_PTR)lparam) {
+            RECT header_rect;
+            int line_height = state->meter_line_height > 0 ?
+                state->meter_line_height : 16;
+
+            GetClientRect(hwnd, &header_rect);
+            header_rect.top = CONTROLS_HEIGHT;
+            header_rect.bottom = 2 + CONTROLS_HEIGHT + line_height * 2;
+            InvalidateRect(hwnd, IsZoomed(hwnd) ? NULL : &header_rect, FALSE);
+            UpdateWindow(hwnd);
+            cancel_direct_start_retry(hwnd, state);
+        }
+        return 0;
+    case PLAYER_WM_AUDIO_BUFFER_DONE:
+        if (state != NULL && state->playing && state->audio_started &&
+            state->wave == (HWAVEOUT)(UINT_PTR)lparam &&
+            sync_audible_display_after_sequence(state, (uint64_t)wparam)) {
+            RECT header_rect;
+            int line_height = state->meter_line_height > 0 ?
+                state->meter_line_height : 16;
+
+            GetClientRect(hwnd, &header_rect);
+            header_rect.top = CONTROLS_HEIGHT;
+            header_rect.bottom = 2 + CONTROLS_HEIGHT + line_height * 2;
+            InvalidateRect(hwnd, IsZoomed(hwnd) ? NULL : &header_rect, FALSE);
+            UpdateWindow(hwnd);
         }
         return 0;
     case PLAYER_WM_PLAYBACK_ENDED:
@@ -16882,7 +18520,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
                             break;
                         }
                     } else if (is_psf_music_path(path)) {
-                        start_playback(hwnd, state, path);
+                        start_direct_playback(hwnd, state, path);
                         break;
                     }
                 }
@@ -16914,7 +18552,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
                 set_status(state, "Playing direct");
                 InvalidateRect(hwnd, NULL, TRUE);
             } else if (state->input_path[0] != '\0') {
-                start_playback(hwnd, state, state->input_path);
+                start_direct_playback(hwnd, state, state->input_path);
             } else {
                 open_direct_file_dialog(hwnd, state);
             }
@@ -16925,6 +18563,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             return 0;
         }
         if (state != NULL && LOWORD(wparam) == IDC_STOP) {
+            cancel_direct_start_retry(hwnd, state);
             playlist_cancel_pending_play(hwnd, state);
             stop_playback(state);
             reset_stopped_display(state);
@@ -17045,6 +18684,12 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             set_lr_custom_color(hwnd, state);
             return 0;
         }
+        if (state != NULL && LOWORD(wparam) >= IDM_SPEED_PRESET_FIRST &&
+            LOWORD(wparam) <= IDM_SPEED_PRESET_LAST) {
+            unsigned speed_index = (unsigned)(LOWORD(wparam) - IDM_SPEED_PRESET_FIRST);
+            set_speed_percent(hwnd, state, g_speed_menu_values[speed_index]);
+            return 0;
+        }
         if (state != NULL && LOWORD(wparam) >= IDM_VOLUME_0 && LOWORD(wparam) <= IDM_VOLUME_200) {
             set_volume_percent(hwnd, state, (int)(LOWORD(wparam) - IDM_VOLUME_0) * 10, 1);
             return 0;
@@ -17072,6 +18717,17 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         }
         if (state != NULL && wparam == '1') {
             set_all_voice_mutes(hwnd, state, 1);
+            return 0;
+        }
+        if (state != NULL &&
+            (wparam == VK_UP || wparam == VK_DOWN) &&
+            player_voice_scroll_enabled(hwnd, state)) {
+            int line_height = state->meter_line_height > 0 ?
+                state->meter_line_height : get_player_display_line_height(hwnd);
+            int step = line_height + PSF1_TRACK_KEYBOARD_HEIGHT;
+
+            adjust_player_voice_scroll(hwnd, state,
+                wparam == VK_UP ? -step : step);
             return 0;
         }
         if (state != NULL && wparam == VK_LEFT) {
@@ -17212,6 +18868,20 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         if (state != NULL && state->pending_click_active && state->pending_click_button == 1) {
             if (state->pending_click_repeating) {
                 cancel_pending_numeric_click(hwnd, state);
+            }
+            return 0;
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        if (state != NULL && player_voice_scroll_enabled(hwnd, state)) {
+            int wheel_steps = GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA;
+            int line_height = state->meter_line_height > 0 ?
+                state->meter_line_height : get_player_display_line_height(hwnd);
+            int step = (line_height + PSF1_TRACK_KEYBOARD_HEIGHT) * 3;
+
+            if (wheel_steps != 0) {
+                adjust_player_voice_scroll(hwnd, state,
+                    -wheel_steps * step);
             }
             return 0;
         }
@@ -17387,8 +19057,77 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             set_speed_percent(hwnd, state, speed);
         }
         return 0;
+    case WM_VSCROLL:
+        if (state != NULL && (HWND)lparam == state->voice_scrollbar &&
+            player_voice_scroll_enabled(hwnd, state)) {
+            SCROLLINFO info;
+            int line_height = state->meter_line_height > 0 ?
+                state->meter_line_height : get_player_display_line_height(hwnd);
+            int row_step = line_height + PSF1_TRACK_KEYBOARD_HEIGHT;
+            int target = state->scroll_y;
+
+            ZeroMemory(&info, sizeof(info));
+            info.cbSize = sizeof(info);
+            info.fMask = SIF_ALL;
+            GetScrollInfo(state->voice_scrollbar, SB_CTL, &info);
+            switch (LOWORD(wparam)) {
+            case SB_LINEUP:
+                target -= row_step;
+                break;
+            case SB_LINEDOWN:
+                target += row_step;
+                break;
+            case SB_PAGEUP:
+                target -= (int)info.nPage;
+                break;
+            case SB_PAGEDOWN:
+                target += (int)info.nPage;
+                break;
+            case SB_THUMBPOSITION:
+            case SB_THUMBTRACK:
+                target = info.nTrackPos;
+                break;
+            case SB_TOP:
+                target = 0;
+                break;
+            case SB_BOTTOM:
+                target = player_voice_scroll_max(hwnd, state);
+                break;
+            default:
+                return 0;
+            }
+            set_player_voice_scroll(hwnd, state, target);
+            return 0;
+        }
+        break;
     case WM_SIZE:
+        if (wparam == SIZE_MAXIMIZED) {
+            if (!g_main_window_was_maximized) {
+                WINDOWPLACEMENT placement;
+
+                ZeroMemory(&placement, sizeof(placement));
+                placement.length = sizeof(placement);
+                if (GetWindowPlacement(hwnd, &placement)) {
+                    g_main_restore_x = placement.rcNormalPosition.left;
+                    g_main_restore_y = placement.rcNormalPosition.top;
+                    g_main_restore_position_valid = 1;
+                }
+            }
+            g_main_window_was_maximized = 1;
+            layout_player_controls(hwnd, state);
+        } else if (wparam == SIZE_RESTORED && g_main_window_was_maximized) {
+            g_main_window_was_maximized = 0;
+            g_main_restore_position_active = 1;
+            apply_psf_window_mode(hwnd, state,
+                state != NULL ? state->psf_version : load_last_psf_version());
+            g_main_restore_position_active = 0;
+            g_main_restore_position_valid = 0;
+        } else if (wparam == SIZE_RESTORED) {
+            update_player_base_client_metrics(hwnd);
+            layout_player_controls(hwnd, state);
+        }
         update_scrollbar(hwnd, state);
+        InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     case WM_SETTINGCHANGE:
         if (state != NULL && normalize_theme_mode(state->theme_mode) == THEME_SYSTEM) {
@@ -17403,8 +19142,6 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             g_window_fixed_height : PLAYER_DEFAULT_HEIGHT;
         minmax->ptMinTrackSize.x = fixed_width;
         minmax->ptMinTrackSize.y = fixed_height;
-        minmax->ptMaxTrackSize.x = fixed_width;
-        minmax->ptMaxTrackSize.y = fixed_height;
         return 0;
     }
     case WM_PAINT: {
@@ -17423,6 +19160,54 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
                 fill_player_background(hdc, &ps.rcPaint, state);
                 EndPaint(hwnd, &ps);
                 return 0;
+            }
+            {
+                PlayerScaleLayout layout;
+
+                get_player_content_scale_layout(hwnd, state, &layout);
+                if (layout.scaled && ensure_player_backbuffer(
+                        state, hdc,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top)) {
+                    int saved_screen_dc;
+                    int saved_buffer_dc;
+
+                    saved_screen_dc = SaveDC(hdc);
+                    saved_buffer_dc = SaveDC(state->paint_dc);
+                    SelectClipRgn(hdc, NULL);
+                    SelectClipRgn(state->paint_dc, NULL);
+                    state->gauge_only_paint_pending = 0;
+                    SetMapMode(state->paint_dc, MM_TEXT);
+                    SetViewportOrgEx(state->paint_dc, 0, 0, NULL);
+                    SetWindowOrgEx(state->paint_dc, 0, 0, NULL);
+                    fill_player_background(state->paint_dc, &rect, state);
+                    SetMapMode(state->paint_dc, MM_ANISOTROPIC);
+                    SetWindowExtEx(state->paint_dc,
+                        layout.base_width, layout.base_height, NULL);
+                    SetViewportExtEx(state->paint_dc,
+                        layout.dest_width, layout.dest_height, NULL);
+                    SetViewportOrgEx(state->paint_dc,
+                        layout.dest_x, layout.dest_y, NULL);
+                    paint_player(hwnd, state->paint_dc, state, 0);
+                    state->paint_frame_initialized = 1;
+                    if (saved_buffer_dc != 0) {
+                        RestoreDC(state->paint_dc, saved_buffer_dc);
+                    }
+                    BitBlt(hdc,
+                        0,
+                        0,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        state->paint_dc,
+                        0,
+                        0,
+                        SRCCOPY);
+                    if (saved_screen_dc != 0) {
+                        RestoreDC(hdc, saved_screen_dc);
+                    }
+                    EndPaint(hwnd, &ps);
+                    return 0;
+                }
             }
             if (ensure_player_backbuffer(
                     state, hdc, rect.right - rect.left, rect.bottom - rect.top)) {
@@ -17480,6 +19265,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         break;
     case WM_CLOSE:
         if (state != NULL) {
+            cancel_direct_start_retry(hwnd, state);
             save_window_bounds(hwnd, state);
             stop_playback(state);
             if (state->playlist_hwnd != NULL) {
@@ -17503,6 +19289,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         DragAcceptFiles(hwnd, FALSE);
         KillTimer(hwnd, PLAYER_CLICK_TIMER_ID);
         KillTimer(hwnd, PLAYER_PLAYLIST_SWITCH_TIMER_ID);
+        KillTimer(hwnd, PLAYER_DIRECT_RETRY_TIMER_ID);
         if (state != NULL) {
             stop_playback(state);
             destroy_player_paint_resources(state);
@@ -17545,6 +19332,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     int window_y;
     int window_width;
     int window_height;
+    int start_maximized;
 
     (void)prev_instance;
 
@@ -17593,6 +19381,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     state.playlist_random_state = (uint32_t)GetTickCount();
     state.playlist_current = -1;
     state.playlist_pending_play_index = -1;
+    state.direct_start_retry_playlist_index = -1;
     state.preview_active_note = -1;
     state.env_color_index = 0;
     state.lr_color_index = 0;
@@ -17651,6 +19440,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
 
     load_window_bounds(
         &state, &window_x, &window_y, &window_width, &window_height);
+    start_maximized = load_window_maximized();
     g_window_fixed_width = window_width;
     g_window_fixed_height = window_height;
     timer_period_result = timeBeginPeriod(1u);
@@ -17659,7 +19449,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         0,
         "Psf2Spu2PlayerWindow",
         "PSF SPU Player " PSF2_PLAYER_VERSION_DISPLAY,
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+            WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
         window_x,
         window_y,
         window_width,
@@ -17677,8 +19468,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         return 1;
     }
 
+    state.meter_line_height = get_player_display_line_height(hwnd);
     apply_psf_window_mode(hwnd, &state, state.psf_version);
-    ShowWindow(hwnd, show_cmd);
+    ShowWindow(hwnd, start_maximized ? SW_SHOWMAXIMIZED : show_cmd);
     UpdateWindow(hwnd);
     if (state.timbre_scan_enabled) {
         show_timbre_window(hwnd, &state);
@@ -17699,12 +19491,20 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
                     show_playlist_window(hwnd, &state);
                 }
             } else {
-                start_playback(hwnd, &state, path);
+                start_direct_playback(hwnd, &state, path);
             }
         }
     }
 
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+        if (msg.message == WM_SYSKEYDOWN && msg.wParam == VK_RETURN &&
+            ((HIWORD(msg.lParam) & KF_ALTDOWN) != 0 ||
+             (GetKeyState(VK_MENU) & 0x8000) != 0)) {
+            if (!preview_keyboard_is_active(&state)) {
+                toggle_player_maximized(hwnd);
+            }
+            continue;
+        }
         if (state.playlist_hwnd != NULL && state.playlist_listbox != NULL &&
             (msg.hwnd == state.playlist_hwnd || IsChild(state.playlist_hwnd, msg.hwnd)) &&
             msg.message == WM_KEYDOWN &&
@@ -17789,6 +19589,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         }
         if (msg.message == WM_KEYDOWN &&
             (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT ||
+             msg.wParam == VK_UP || msg.wParam == VK_DOWN ||
              msg.wParam == 'M' || msg.wParam == 'R' || msg.wParam == 'P' ||
              msg.wParam == 'V' || msg.wParam == 'K' || msg.wParam == 'F' ||
              msg.wParam == '0' || msg.wParam == '1' ||
@@ -17808,6 +19609,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
         unlock_state(&state);
         DeleteCriticalSection(&state.lock);
         state.lock_ready = 0;
+    }
+    if (state.maximized_ui_font != NULL) {
+        DeleteObject(state.maximized_ui_font);
+        state.maximized_ui_font = NULL;
     }
     if (state.ui_font != NULL) {
         DeleteObject(state.ui_font);

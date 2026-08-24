@@ -319,6 +319,18 @@ int32_t psf_start(uint8_t *buffer, uint32_t length)
 		}
 	}
 
+	/* Two Chocobo Racing rips call a function whose body was stripped to zeroes.
+	 * Let the missing optional setup routine return instead of falling through
+	 * into an unrelated epilogue and branching to a corrupted return address. */
+	if (!strcmp(c->inf_game, "Chocobo Racing") &&
+		psx_ram[0x46818/4] == LE32(0x00000000) &&
+		psx_ram[0x47b18/4] == LE32(0x8fbf00a8) &&
+		psx_ram[0x4be80/4] == LE32(0x0c011a06))
+	{
+		psx_ram[0x46818/4] = LE32(0x03e00008);
+		psx_ram[0x4681c/4] = LE32(0x00000000);
+	}
+
 //	psx_ram[0x118b8/4] = LE32(0);	// crash 2 hack
 
 	// backup the initial state for restart

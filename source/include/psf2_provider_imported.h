@@ -7,6 +7,26 @@
 extern "C" {
 #endif
 
+enum {
+    PSF1_MUSIC_DRIVER_NONE = 0,
+    PSF1_MUSIC_DRIVER_AKAO_EARLY = 1,
+    PSF1_MUSIC_DRIVER_AKAO_LATE = 2,
+    PSF1_MUSIC_DRIVER_SONY_SEQ = 3
+};
+
+typedef struct Psf1AkaoPlaybackState {
+    uint32_t tempo;
+    uint16_t beats_per_measure;
+    uint16_t ticks_per_beat;
+    uint16_t current_beat;
+    uint16_t current_tick;
+    uint16_t measure;
+    uint16_t beat_denominator;
+    uint8_t detected;
+    uint8_t early_format;
+    uint8_t driver_type;
+} Psf1AkaoPlaybackState;
+
 const Psf2CoreProvider *psf2log_get_imported_provider(void);
 void psf2log_set_imported_tempo_percent(int tempo_percent);
 void psf2log_set_imported_frame_advance_mode(int enabled);
@@ -26,6 +46,9 @@ uint32_t psf2log_copy_imported_sample(
     uint32_t capacity,
     uint32_t *out_loop_offset,
     uint32_t *out_end_flags);
+int psf2log_get_imported_ps1_akao_state(
+    Psf2CoreBridge *core,
+    Psf1AkaoPlaybackState *out_state);
 void psf2log_set_imported_reverb_enabled(int enabled);
 void psf2log_set_imported_main_enabled(int enabled);
 void psf2log_set_imported_text_log_enabled(int enabled);

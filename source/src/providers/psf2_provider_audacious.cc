@@ -23,6 +23,13 @@
 #define AUDACIOUS_PSF1_TIMBRE_SCAN_CPU_DIVIDER 128u
 #define AUDACIOUS_SAMPLE_END_CACHE_SIZE 1024u
 #define AUDACIOUS_SPU2_RAM_BYTES (2u * 1024u * 1024u)
+#define AUDACIOUS_PSX_RAM_BYTES (2u * 1024u * 1024u)
+#define AUDACIOUS_AKAO_MAX_SEQUENCES 128u
+#define AUDACIOUS_AKAO_MAX_TEMPOS 256u
+#define AUDACIOUS_AKAO_FAST_COUNTER_RETRIES 8u
+#define AUDACIOUS_SONY_SEQ_HEADER_SIZE 15u
+#define AUDACIOUS_SONY_SEQ_TABLE_SIZE 176u
+#define AUDACIOUS_SONY_SEQ_TABLE_SCAN_ATTEMPTS 16u
 #define AUDACIOUS_SPU2_P_MVOLL(core) ((0x28u * (uint32_t)(core)) + 0x760u)
 #define AUDACIOUS_SPU2_P_MVOLR(core) ((0x28u * (uint32_t)(core)) + 0x762u)
 
@@ -30,6 +37,50 @@ typedef enum AudaciousPsfMode {
     AUDACIOUS_PSF_MODE_PSF1 = 1,
     AUDACIOUS_PSF_MODE_PSF2 = 2
 } AudaciousPsfMode;
+
+typedef struct AudaciousAkaoRange {
+    uint32_t start;
+    uint32_t end;
+} AudaciousAkaoRange;
+
+typedef struct AudaciousAkaoMonitor {
+    Psf1AkaoPlaybackState state;
+    AudaciousAkaoRange sequence_ranges[AUDACIOUS_AKAO_MAX_SEQUENCES];
+    uint16_t tempo_values[AUDACIOUS_AKAO_MAX_TEMPOS];
+    uint8_t tempo_formats[AUDACIOUS_AKAO_MAX_TEMPOS];
+    uint32_t sequence_count;
+    uint32_t tempo_count;
+    uint32_t counter_base;
+    uint32_t tempo_address;
+    uint16_t last_beat;
+    uint16_t last_tick;
+    uint16_t last_measure;
+    uint64_t next_sequence_scan_sample;
+    uint64_t next_counter_scan_sample;
+    uint8_t sequences_scanned;
+    uint8_t sequence_scan_attempts;
+    uint8_t counter_scan_attempts;
+    uint8_t confidence;
+    uint8_t early_format;
+} AudaciousAkaoMonitor;
+
+typedef struct AudaciousSonySeqMonitor {
+    Psf1AkaoPlaybackState state;
+    uint32_t sequence_address;
+    uint32_t table_address;
+    uint32_t division;
+    uint32_t tempo_us;
+    uint32_t numerator;
+    uint32_t denominator;
+    uint32_t table_initial_tempo_bpm;
+    uint64_t elapsed_slices;
+    uint64_t next_table_scan_sample;
+    uint8_t table_scan_attempts;
+    uint8_t header_valid;
+    uint8_t table_valid;
+    uint8_t valid;
+    uint8_t started;
+} AudaciousSonySeqMonitor;
 
 typedef struct AudaciousPsf2Core {
     Psf2CoreCallbacks callbacks;
@@ -44,6 +95,8 @@ typedef struct AudaciousPsf2Core {
     uint64_t next_snapshot_sample;
     uint32_t sample_end_cache_start[AUDACIOUS_SAMPLE_END_CACHE_SIZE];
     uint32_t sample_end_cache_value[AUDACIOUS_SAMPLE_END_CACHE_SIZE];
+    AudaciousAkaoMonitor akao;
+    AudaciousSonySeqMonitor sony_seq;
     int16_t *pcm;
     uint32_t requested_frames;
     uint32_t rendered_frames;
@@ -64,6 +117,711 @@ static uint32_t g_pmod_force_off_masks[2];
 static uint32_t g_adsr_force_masks[2];
 
 bool stop_flag = false;
+
+static uint16_t audacious_psx_ram_u16(uint32_t offset)
+{
+    const uint8_t *ram = (const uint8_t *)psx_ram;
+
+    if (offset + 1u >= AUDACIOUS_PSX_RAM_BYTES) {
+        return 0;
+    }
+    return (uint16_t)((uint16_t)ram[offset] | ((uint16_t)ram[offset + 1u] << 8));
+}
+
+static uint32_t audacious_psx_ram_u32(uint32_t offset)
+{
+    return (uint32_t)audacious_psx_ram_u16(offset) |
+        ((uint32_t)audacious_psx_ram_u16(offset + 2u) << 16);
+}
+
+static uint16_t audacious_psx_ram_be16(uint32_t offset)
+{
+    const uint8_t *ram = (const uint8_t *)psx_ram;
+
+    if (offset + 1u >= AUDACIOUS_PSX_RAM_BYTES) {
+        return 0;
+    }
+    return (uint16_t)(((uint16_t)ram[offset] << 8) | (uint16_t)ram[offset + 1u]);
+}
+
+static uint32_t audacious_psx_ram_be24(uint32_t offset)
+{
+    const uint8_t *ram = (const uint8_t *)psx_ram;
+
+    if (offset + 2u >= AUDACIOUS_PSX_RAM_BYTES) {
+        return 0;
+    }
+    return ((uint32_t)ram[offset] << 16) |
+        ((uint32_t)ram[offset + 1u] << 8) |
+        (uint32_t)ram[offset + 2u];
+}
+
+static uint32_t audacious_psx_ram_be32(uint32_t offset)
+{
+    return ((uint32_t)audacious_psx_ram_be16(offset) << 16) |
+        (uint32_t)audacious_psx_ram_be16(offset + 2u);
+}
+
+static int audacious_psx_pointer_offset(uint32_t pointer, uint32_t *out_offset)
+{
+    uint32_t segment = pointer & 0xe0000000u;
+    uint32_t offset;
+
+    if (segment != 0x80000000u && segment != 0xa0000000u) {
+        return 0;
+    }
+    offset = pointer & 0x001fffffu;
+    if (offset >= AUDACIOUS_PSX_RAM_BYTES) {
+        return 0;
+    }
+    if (out_offset != nullptr) {
+        *out_offset = offset;
+    }
+    return 1;
+}
+
+static uint32_t audacious_sony_seq_table_tempo_bpm(uint32_t table_address)
+{
+    uint32_t tempo = audacious_psx_ram_u32(table_address + 0x94u);
+
+    if (tempo < 20u || tempo > 400u) {
+        tempo = audacious_psx_ram_u32(table_address + 0x8cu);
+    }
+    return tempo >= 20u && tempo <= 400u ? tempo : 0u;
+}
+
+static int audacious_sony_seq_table_valid(uint32_t table_address)
+{
+    const uint8_t *ram = (const uint8_t *)psx_ram;
+    uint32_t sequence_pointer;
+    uint32_t initial_pointer;
+    uint32_t repeat_pointer;
+    uint32_t base_pointer;
+    uint32_t sequence_offset;
+    uint32_t division;
+    uint32_t numerator;
+    uint32_t denominator_power;
+    uint32_t index;
+
+    if (table_address + AUDACIOUS_SONY_SEQ_TABLE_SIZE > AUDACIOUS_PSX_RAM_BYTES) {
+        return 0;
+    }
+    sequence_pointer = audacious_psx_ram_u32(table_address);
+    initial_pointer = audacious_psx_ram_u32(table_address + 4u);
+    repeat_pointer = audacious_psx_ram_u32(table_address + 8u);
+    base_pointer = audacious_psx_ram_u32(table_address + 12u);
+    if (!audacious_psx_pointer_offset(sequence_pointer, &sequence_offset) ||
+        !audacious_psx_pointer_offset(initial_pointer, nullptr) ||
+        !audacious_psx_pointer_offset(repeat_pointer, nullptr) ||
+        !audacious_psx_pointer_offset(base_pointer, nullptr) ||
+        initial_pointer != repeat_pointer || repeat_pointer != base_pointer) {
+        return 0;
+    }
+    if (ram[table_address + 0x14u] > 1u ||
+        ram[table_address + 0x26u] > 15u) {
+        return 0;
+    }
+    numerator = ram[table_address + 0x24u];
+    denominator_power = ram[table_address + 0x25u];
+    division = audacious_psx_ram_u16(table_address + 0x50u);
+    if (numerator == 0u || numerator > 32u || denominator_power > 7u ||
+        division < 12u || division > 1920u ||
+        audacious_sony_seq_table_tempo_bpm(table_address) == 0u ||
+        audacious_psx_ram_u16(table_address + 0x58u) > 127u ||
+        audacious_psx_ram_u16(table_address + 0x5au) > 127u ||
+        audacious_psx_ram_u32(table_address + 0x98u) >= 0x10000u) {
+        return 0;
+    }
+    for (index = 0; index < 16u; ++index) {
+        if (ram[table_address + 0x27u + index] > 127u ||
+            ram[table_address + 0x37u + index] > 127u ||
+            audacious_psx_ram_u16(table_address + 0x60u + index * 2u) > 127u) {
+            return 0;
+        }
+    }
+    return sequence_offset < AUDACIOUS_PSX_RAM_BYTES;
+}
+
+static int audacious_sony_seq_find_table(AudaciousSonySeqMonitor *monitor)
+{
+    uint32_t offset;
+
+    if (monitor == nullptr) {
+        return 0;
+    }
+    for (offset = 0;
+         offset + AUDACIOUS_SONY_SEQ_TABLE_SIZE <= AUDACIOUS_PSX_RAM_BYTES;
+         offset += 4u) {
+        if (!audacious_sony_seq_table_valid(offset)) {
+            continue;
+        }
+        monitor->table_address = offset;
+        monitor->table_valid = 1u;
+        return 1;
+    }
+    return 0;
+}
+
+static void audacious_sony_seq_apply_table(AudaciousSonySeqMonitor *monitor)
+{
+    const uint8_t *ram = (const uint8_t *)psx_ram;
+    uint32_t tempo_bpm;
+    uint32_t denominator_power;
+    uint32_t sequence_offset;
+
+    if (monitor == nullptr || !monitor->table_valid ||
+        !audacious_sony_seq_table_valid(monitor->table_address)) {
+        return;
+    }
+    tempo_bpm = audacious_sony_seq_table_tempo_bpm(monitor->table_address);
+    denominator_power = ram[monitor->table_address + 0x25u];
+    monitor->division = audacious_psx_ram_u16(monitor->table_address + 0x50u);
+    monitor->numerator = ram[monitor->table_address + 0x24u];
+    monitor->denominator = 1u << denominator_power;
+    if (monitor->table_initial_tempo_bpm == 0u) {
+        monitor->table_initial_tempo_bpm = tempo_bpm;
+    }
+    if (!monitor->header_valid || tempo_bpm != monitor->table_initial_tempo_bpm) {
+        monitor->tempo_us = (60000000u + tempo_bpm / 2u) / tempo_bpm;
+    }
+    if (!monitor->header_valid &&
+        audacious_psx_pointer_offset(
+            audacious_psx_ram_u32(monitor->table_address + 4u),
+            &sequence_offset)) {
+        monitor->sequence_address = sequence_offset;
+    }
+    monitor->valid = 1u;
+}
+
+static void audacious_sony_seq_scan(AudaciousPsf2Core *core)
+{
+    const uint8_t *ram = (const uint8_t *)psx_ram;
+    AudaciousSonySeqMonitor *monitor;
+    uint32_t offset;
+
+    if (core == nullptr || core->mode != AUDACIOUS_PSF_MODE_PSF1) {
+        return;
+    }
+    monitor = &core->sony_seq;
+    memset(monitor, 0, sizeof(*monitor));
+    for (offset = 0;
+         offset + AUDACIOUS_SONY_SEQ_HEADER_SIZE <= AUDACIOUS_PSX_RAM_BYTES;
+         ++offset) {
+        uint32_t version;
+        uint32_t division;
+        uint32_t tempo_us;
+        uint32_t numerator;
+        uint32_t denominator_power;
+
+        if (ram[offset] != 'p' || ram[offset + 1u] != 'Q' ||
+            ram[offset + 2u] != 'E' || ram[offset + 3u] != 'S') {
+            continue;
+        }
+        version = audacious_psx_ram_be32(offset + 4u);
+        division = audacious_psx_ram_be16(offset + 8u);
+        tempo_us = audacious_psx_ram_be24(offset + 10u);
+        numerator = ram[offset + 13u];
+        denominator_power = ram[offset + 14u];
+        if (version != 1u || division == 0u || division > 0x7fffu ||
+            tempo_us < 10000u || tempo_us > 10000000u ||
+            numerator == 0u || numerator > 32u || denominator_power > 7u) {
+            continue;
+        }
+        monitor->sequence_address = offset;
+        monitor->division = division;
+        monitor->tempo_us = tempo_us;
+        monitor->numerator = numerator;
+        monitor->denominator = 1u << denominator_power;
+        monitor->header_valid = 1u;
+        monitor->valid = 1u;
+        monitor->state.tempo = tempo_us;
+        monitor->state.beats_per_measure = (uint16_t)numerator;
+        monitor->state.ticks_per_beat = (uint16_t)((division * 4u) /
+            monitor->denominator);
+        monitor->state.beat_denominator = (uint16_t)monitor->denominator;
+        monitor->state.driver_type = PSF1_MUSIC_DRIVER_SONY_SEQ;
+        break;
+    }
+    if (audacious_sony_seq_find_table(monitor)) {
+        audacious_sony_seq_apply_table(monitor);
+    }
+    if (!monitor->valid) {
+        monitor->table_scan_attempts = 1u;
+        monitor->next_table_scan_sample = core->sample_rate / 4u;
+    }
+}
+
+static void audacious_sony_seq_rescan_table(AudaciousPsf2Core *core)
+{
+    AudaciousSonySeqMonitor *monitor;
+
+    if (core == nullptr || core->mode != AUDACIOUS_PSF_MODE_PSF1) {
+        return;
+    }
+    monitor = &core->sony_seq;
+    if (monitor->valid ||
+        monitor->table_scan_attempts >= AUDACIOUS_SONY_SEQ_TABLE_SCAN_ATTEMPTS ||
+        core->sample_pos < monitor->next_table_scan_sample) {
+        return;
+    }
+    ++monitor->table_scan_attempts;
+    monitor->next_table_scan_sample = core->sample_pos + core->sample_rate / 4u;
+    if (audacious_sony_seq_find_table(monitor)) {
+        audacious_sony_seq_apply_table(monitor);
+    }
+}
+
+static void audacious_sony_seq_start(AudaciousPsf2Core *core)
+{
+    AudaciousSonySeqMonitor *monitor;
+
+    if (core == nullptr || core->mode != AUDACIOUS_PSF_MODE_PSF1) {
+        return;
+    }
+    monitor = &core->sony_seq;
+    if (!monitor->valid || monitor->started) {
+        return;
+    }
+    monitor->started = 1u;
+    monitor->elapsed_slices = 0;
+    monitor->state.detected = 1u;
+}
+
+static void audacious_sony_seq_advance(AudaciousPsf2Core *core, uint32_t slices)
+{
+    if (core == nullptr || !core->sony_seq.valid ||
+        !core->sony_seq.started || slices == 0u) {
+        return;
+    }
+    core->sony_seq.elapsed_slices += slices;
+}
+
+static void audacious_sony_seq_update(AudaciousPsf2Core *core)
+{
+    AudaciousSonySeqMonitor *monitor;
+    uint64_t ticks_per_beat;
+    uint64_t ticks_per_measure;
+    uint64_t total_ticks;
+    double exact_ticks;
+    uint64_t measure;
+
+    if (core == nullptr || core->mode != AUDACIOUS_PSF_MODE_PSF1) {
+        return;
+    }
+    monitor = &core->sony_seq;
+    audacious_sony_seq_apply_table(monitor);
+    if (!monitor->valid || !monitor->started || core->sample_rate == 0u ||
+        monitor->tempo_us == 0u || monitor->denominator == 0u) {
+        return;
+    }
+    ticks_per_beat = ((uint64_t)monitor->division * 4u) / monitor->denominator;
+    if (ticks_per_beat == 0u) {
+        return;
+    }
+    ticks_per_measure = ticks_per_beat * monitor->numerator;
+    exact_ticks = ((double)monitor->elapsed_slices * 1000000.0 *
+        (double)monitor->division) /
+        ((double)core->sample_rate * (double)monitor->tempo_us);
+    total_ticks = exact_ticks > 0.0 ? (uint64_t)exact_ticks : 0u;
+    measure = ticks_per_measure != 0u ? total_ticks / ticks_per_measure : 0u;
+    monitor->state.tempo = monitor->tempo_us;
+    monitor->state.beats_per_measure = (uint16_t)monitor->numerator;
+    monitor->state.ticks_per_beat = (uint16_t)ticks_per_beat;
+    monitor->state.current_beat = (uint16_t)((total_ticks / ticks_per_beat) %
+        monitor->numerator);
+    monitor->state.current_tick = (uint16_t)(total_ticks % ticks_per_beat);
+    monitor->state.measure = (uint16_t)(measure > 0xffffu ? 0xffffu : measure);
+    monitor->state.beat_denominator = (uint16_t)monitor->denominator;
+    monitor->state.detected = 1u;
+    monitor->state.early_format = 0u;
+    monitor->state.driver_type = PSF1_MUSIC_DRIVER_SONY_SEQ;
+}
+
+static unsigned audacious_popcount32(uint32_t value)
+{
+    unsigned count = 0;
+
+    while (value != 0) {
+        value &= value - 1u;
+        ++count;
+    }
+    return count;
+}
+
+static void audacious_akao_add_tempo(
+    AudaciousAkaoMonitor *monitor,
+    uint16_t value,
+    uint8_t format)
+{
+    uint32_t index;
+
+    if (monitor == nullptr || value == 0) {
+        return;
+    }
+    for (index = 0; index < monitor->tempo_count &&
+         monitor->tempo_values[index] < value; ++index) {
+    }
+    if (index < monitor->tempo_count && monitor->tempo_values[index] == value) {
+        monitor->tempo_formats[index] |= format;
+        return;
+    }
+    if (monitor->tempo_count < AUDACIOUS_AKAO_MAX_TEMPOS) {
+        memmove(&monitor->tempo_values[index + 1u],
+            &monitor->tempo_values[index],
+            (monitor->tempo_count - index) * sizeof(monitor->tempo_values[0]));
+        memmove(&monitor->tempo_formats[index + 1u],
+            &monitor->tempo_formats[index],
+            (monitor->tempo_count - index) * sizeof(monitor->tempo_formats[0]));
+        monitor->tempo_values[index] = value;
+        monitor->tempo_formats[index] = format;
+        ++monitor->tempo_count;
+    }
+}
+
+static uint8_t audacious_akao_tempo_format(
+    const AudaciousAkaoMonitor *monitor,
+    uint16_t value)
+{
+    uint32_t low = 0;
+    uint32_t high;
+
+    if (monitor == nullptr || value == 0) {
+        return 0;
+    }
+    high = monitor->tempo_count;
+    while (low < high) {
+        uint32_t middle = low + (high - low) / 2u;
+        if (monitor->tempo_values[middle] == value) {
+            return monitor->tempo_formats[middle];
+        }
+        if (monitor->tempo_values[middle] < value) {
+            low = middle + 1u;
+        } else {
+            high = middle;
+        }
+    }
+    return 0;
+}
+
+static int audacious_akao_in_sequence(
+    const AudaciousAkaoMonitor *monitor,
+    uint32_t address)
+{
+    uint32_t index;
+
+    for (index = 0; index < monitor->sequence_count; ++index) {
+        if (address >= monitor->sequence_ranges[index].start &&
+            address < monitor->sequence_ranges[index].end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void audacious_akao_scan_sequences(AudaciousAkaoMonitor *monitor)
+{
+    const uint8_t *ram = (const uint8_t *)psx_ram;
+    uint32_t offset;
+
+    if (monitor == nullptr) {
+        return;
+    }
+    monitor->sequence_count = 0;
+    monitor->tempo_count = 0;
+    memset(monitor->tempo_formats, 0, sizeof(monitor->tempo_formats));
+    for (offset = 0; offset + 0x48u < AUDACIOUS_PSX_RAM_BYTES; ++offset) {
+        uint32_t size;
+        uint32_t sequence_end;
+        uint32_t early_mask;
+        uint32_t late_mask;
+        uint32_t early_start = 0;
+        uint32_t late_start = 0;
+        uint32_t late_table_end = 0;
+        uint32_t late_first_track_start = 0;
+        int tempo_found = 0;
+
+        if (ram[offset] != 'A' || ram[offset + 1u] != 'K' ||
+            ram[offset + 2u] != 'A' || ram[offset + 3u] != 'O') {
+            continue;
+        }
+        size = audacious_psx_ram_u16(offset + 6u);
+        if (size < 8u || size > 0x10000u ||
+            offset + size + 0x10u > AUDACIOUS_PSX_RAM_BYTES) {
+            continue;
+        }
+        sequence_end = offset + size + 0x10u;
+        early_mask = audacious_psx_ram_u32(offset + 0x10u);
+        late_mask = audacious_psx_ram_u32(offset + 0x20u);
+
+        if (early_mask != 0 && (early_mask & 0xff000000u) == 0 &&
+            audacious_popcount32(early_mask) <= 24u) {
+            uint32_t field = offset + 0x14u;
+            uint32_t relative = audacious_psx_ram_u16(field);
+            uint32_t start = field + 2u + relative;
+
+            if (start >= offset + 0x14u && start < sequence_end) {
+                early_start = start;
+            }
+        }
+        if (late_mask != 0) {
+            unsigned first_channel = 0;
+            unsigned last_channel = 31u;
+            unsigned channel;
+            uint32_t field;
+            uint32_t relative;
+            uint32_t start;
+
+            while (first_channel < 32u && (late_mask & (1u << first_channel)) == 0) {
+                ++first_channel;
+            }
+            if (first_channel < 32u) {
+                field = offset + 0x40u + first_channel * 2u;
+                relative = audacious_psx_ram_u16(field);
+                start = field + relative;
+                if (start >= offset + 0x40u && start < sequence_end) {
+                    late_start = start;
+                }
+            }
+            while (last_channel > 0u && (late_mask & (1u << last_channel)) == 0) {
+                --last_channel;
+            }
+            late_table_end = offset + 0x40u + (last_channel + 1u) * 2u;
+            for (channel = 0; channel <= last_channel; ++channel) {
+                uint32_t command_limit;
+                uint32_t command;
+
+                if ((late_mask & (1u << channel)) == 0) {
+                    continue;
+                }
+                field = offset + 0x40u + channel * 2u;
+                relative = audacious_psx_ram_u16(field);
+                start = field + relative;
+                if (start >= late_table_end && start < sequence_end &&
+                    (late_first_track_start == 0 || start < late_first_track_start)) {
+                    late_first_track_start = start;
+                }
+                if (start < late_table_end || start >= sequence_end) {
+                    continue;
+                }
+                command_limit = start + 256u;
+                if (command_limit > sequence_end) {
+                    command_limit = sequence_end;
+                }
+                for (command = start; command + 3u < command_limit; ++command) {
+                    if (ram[command] == 0xfeu && ram[command + 1u] == 0x00u) {
+                        audacious_akao_add_tempo(
+                            monitor, audacious_psx_ram_u16(command + 2u), 2u);
+                        tempo_found = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (late_table_end != 0 && late_first_track_start > late_table_end) {
+            uint32_t command_limit = late_first_track_start;
+            uint32_t command;
+
+            if (command_limit > late_table_end + 1024u) {
+                command_limit = late_table_end + 1024u;
+            }
+            for (command = late_table_end; command + 3u < command_limit; ++command) {
+                if (ram[command] == 0xfeu && ram[command + 1u] == 0x00u) {
+                    audacious_akao_add_tempo(
+                        monitor, audacious_psx_ram_u16(command + 2u), 2u);
+                    tempo_found = 1;
+                    break;
+                }
+            }
+        }
+        if (late_start != 0) {
+            uint32_t command_limit = late_start + 256u;
+            uint32_t command;
+            if (command_limit > sequence_end) {
+                command_limit = sequence_end;
+            }
+            for (command = late_start; command + 3u < command_limit; ++command) {
+                if (ram[command] == 0xfeu && ram[command + 1u] == 0x00u) {
+                    audacious_akao_add_tempo(
+                        monitor, audacious_psx_ram_u16(command + 2u), 2u);
+                    tempo_found = 1;
+                    break;
+                }
+            }
+        }
+        if (early_start != 0) {
+            uint32_t command_limit = early_start + 256u;
+            uint32_t command;
+            if (command_limit > sequence_end) {
+                command_limit = sequence_end;
+            }
+            for (command = early_start; command + 2u < command_limit; ++command) {
+                if (ram[command] == 0xe8u) {
+                    audacious_akao_add_tempo(
+                        monitor, audacious_psx_ram_u16(command + 1u), 1u);
+                    tempo_found = 1;
+                    break;
+                }
+            }
+        }
+        if (tempo_found && monitor->sequence_count < AUDACIOUS_AKAO_MAX_SEQUENCES) {
+            monitor->sequence_ranges[monitor->sequence_count].start = offset;
+            monitor->sequence_ranges[monitor->sequence_count].end = sequence_end;
+            ++monitor->sequence_count;
+        }
+    }
+    monitor->sequences_scanned = monitor->sequence_count != 0 && monitor->tempo_count != 0;
+}
+
+static int audacious_akao_counter_fields_valid(uint32_t base)
+{
+    uint16_t beats_per_measure;
+    uint16_t current_beat;
+    uint16_t ticks_per_beat;
+    uint16_t current_tick;
+
+    if (base < 0x80u || base + 8u > AUDACIOUS_PSX_RAM_BYTES) {
+        return 0;
+    }
+    beats_per_measure = audacious_psx_ram_u16(base - 2u);
+    current_beat = audacious_psx_ram_u16(base);
+    ticks_per_beat = audacious_psx_ram_u16(base + 2u);
+    current_tick = audacious_psx_ram_u16(base + 4u);
+    return beats_per_measure >= 1u && beats_per_measure <= 16u &&
+        current_beat < beats_per_measure &&
+        ticks_per_beat >= 12u && ticks_per_beat <= 192u &&
+        current_tick < ticks_per_beat;
+}
+
+static int audacious_akao_find_counter(AudaciousAkaoMonitor *monitor)
+{
+    uint32_t tempo_address;
+    uint32_t best_base = 0;
+    uint32_t best_tempo_address = 0;
+    uint8_t best_tempo_format = 0;
+    int best_score = -1;
+
+    if (monitor == nullptr || !monitor->sequences_scanned) {
+        return 0;
+    }
+    for (tempo_address = 0; tempo_address + 2u <= AUDACIOUS_PSX_RAM_BYTES;
+         tempo_address += 2u) {
+        uint32_t distance;
+        uint8_t tempo_format = audacious_akao_tempo_format(
+            monitor, audacious_psx_ram_u16(tempo_address));
+
+        if (tempo_format == 0) {
+            continue;
+        }
+        for (distance = 0x20u; distance <= 0x60u; distance += 2u) {
+            uint32_t base = tempo_address + distance;
+            int score;
+
+            if (base + 8u > AUDACIOUS_PSX_RAM_BYTES ||
+                !audacious_akao_counter_fields_valid(base) ||
+                audacious_akao_in_sequence(monitor, base)) {
+                continue;
+            }
+            score = 1000 - (int)(distance > 0x3cu ?
+                distance - 0x3cu : 0x3cu - distance) * 8;
+            if (audacious_psx_ram_u16(base - 2u) == 4u) {
+                score += 20;
+            }
+            if (audacious_psx_ram_u16(base + 2u) == 0x30u) {
+                score += 20;
+            }
+            if (score > best_score) {
+                best_score = score;
+                best_base = base;
+                best_tempo_address = tempo_address;
+                best_tempo_format = tempo_format;
+            }
+        }
+    }
+    if (best_base == 0 || best_tempo_address == 0) {
+        return 0;
+    }
+    monitor->counter_base = best_base;
+    monitor->tempo_address = best_tempo_address;
+    monitor->early_format =
+        (best_tempo_format & 1u) != 0 && (best_tempo_format & 2u) == 0;
+    monitor->last_beat = audacious_psx_ram_u16(best_base);
+    monitor->last_tick = audacious_psx_ram_u16(best_base + 4u);
+    monitor->last_measure = audacious_psx_ram_u16(best_base + 6u);
+    monitor->confidence = 1;
+    return 1;
+}
+
+static void audacious_akao_update(AudaciousPsf2Core *core)
+{
+    AudaciousAkaoMonitor *monitor;
+    uint16_t beat;
+    uint16_t tick;
+    uint16_t measure;
+
+    if (core == nullptr || core->mode != AUDACIOUS_PSF_MODE_PSF1) {
+        return;
+    }
+    monitor = &core->akao;
+    if (!monitor->sequences_scanned) {
+        if (monitor->sequence_scan_attempts >= 16u ||
+            core->sample_pos < monitor->next_sequence_scan_sample) {
+            return;
+        }
+        ++monitor->sequence_scan_attempts;
+        audacious_akao_scan_sequences(monitor);
+        monitor->next_sequence_scan_sample = core->sample_pos + core->sample_rate / 4u;
+    }
+    if (!monitor->sequences_scanned) {
+        return;
+    }
+    if (monitor->counter_base == 0) {
+        if (monitor->counter_scan_attempts >= 16u ||
+            core->sample_pos < monitor->next_counter_scan_sample) {
+            return;
+        }
+        ++monitor->counter_scan_attempts;
+        monitor->next_counter_scan_sample = core->sample_pos +
+            (monitor->counter_scan_attempts < AUDACIOUS_AKAO_FAST_COUNTER_RETRIES ?
+                AUDACIOUS_SNAPSHOT_INTERVAL_FRAMES : core->sample_rate / 4u);
+        if (!audacious_akao_find_counter(monitor)) {
+            return;
+        }
+    }
+    if (!audacious_akao_counter_fields_valid(monitor->counter_base)) {
+        monitor->counter_base = 0;
+        monitor->tempo_address = 0;
+        monitor->confidence = 0;
+        memset(&monitor->state, 0, sizeof(monitor->state));
+        return;
+    }
+
+    beat = audacious_psx_ram_u16(monitor->counter_base);
+    tick = audacious_psx_ram_u16(monitor->counter_base + 4u);
+    measure = audacious_psx_ram_u16(monitor->counter_base + 6u);
+    if (beat != monitor->last_beat || tick != monitor->last_tick ||
+        measure != monitor->last_measure) {
+        if (monitor->confidence < 3u) {
+            ++monitor->confidence;
+        }
+    }
+    monitor->last_beat = beat;
+    monitor->last_tick = tick;
+    monitor->last_measure = measure;
+    monitor->state.tempo = audacious_psx_ram_u16(monitor->tempo_address);
+    monitor->state.beats_per_measure =
+        audacious_psx_ram_u16(monitor->counter_base - 2u);
+    monitor->state.ticks_per_beat =
+        audacious_psx_ram_u16(monitor->counter_base + 2u);
+    monitor->state.current_beat = beat;
+    monitor->state.current_tick = tick;
+    monitor->state.measure = measure;
+    monitor->state.beat_denominator = monitor->state.ticks_per_beat != 0u ?
+        (uint16_t)(192u / monitor->state.ticks_per_beat) : 0u;
+    monitor->state.detected = 1u;
+    monitor->state.early_format = monitor->early_format;
+    monitor->state.driver_type = monitor->early_format ?
+        PSF1_MUSIC_DRIVER_AKAO_EARLY : PSF1_MUSIC_DRIVER_AKAO_LATE;
+}
 
 static void audacious_emit_internal_snapshots(AudaciousPsf2Core *core);
 static void audacious_emit_internal_snapshots_masked(
@@ -637,6 +1395,36 @@ extern "C" uint32_t psf2log_copy_imported_sample(
     return length;
 }
 
+extern "C" int psf2log_get_imported_ps1_akao_state(
+    Psf2CoreBridge *bridge,
+    Psf1AkaoPlaybackState *out_state)
+{
+    AudaciousPsf2Core *core = (AudaciousPsf2Core *)bridge;
+
+    if (out_state == nullptr) {
+        return 0;
+    }
+    memset(out_state, 0, sizeof(*out_state));
+    if (core == nullptr || core->mode != AUDACIOUS_PSF_MODE_PSF1) {
+        return 0;
+    }
+    audacious_sony_seq_rescan_table(core);
+    if (core->sony_seq.valid) {
+        audacious_sony_seq_update(core);
+        if (!core->sony_seq.state.detected) {
+            return 0;
+        }
+        *out_state = core->sony_seq.state;
+        return 1;
+    }
+    audacious_akao_update(core);
+    if (!core->akao.state.detected) {
+        return 0;
+    }
+    *out_state = core->akao.state;
+    return 1;
+}
+
 static int effective_mask_bit(uint32_t original, uint32_t force_on, uint32_t force_off, uint8_t voice)
 {
     uint32_t bit = 1u << voice;
@@ -774,6 +1562,12 @@ static void audacious_emit_internal_snapshots_masked(
     }
 
     if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
+        audacious_sony_seq_rescan_table(core);
+        if (core->sony_seq.valid) {
+            audacious_sony_seq_update(core);
+        } else {
+            audacious_akao_update(core);
+        }
         psf2log_peops_emit_snapshots(
             core->callbacks.user,
             core->sample_pos,
@@ -922,6 +1716,7 @@ extern "C" Psf2CoreBridgeResult psf2log_scan_imported_timbres(
             }
             cpu_step = core->sample_pos < 44100u * 2u ? step : (step + 7u) / 8u;
             psx_hw_scan_slice(step, cpu_step);
+            audacious_sony_seq_advance(core, step);
         } else {
             ps2_hw_slice();
         }
@@ -952,8 +1747,10 @@ extern "C" Psf2CoreBridgeResult psf2log_scan_imported_timbres(
 static void audacious_audio_update(const void *data, int bytes)
 {
     AudaciousPsf2Core *core = g_rendering_core;
+    const int16_t *samples = (const int16_t *)data;
     uint32_t frames;
     uint32_t remaining;
+    uint32_t sample_index;
 
     if (core == nullptr || data == nullptr || bytes <= 0) {
         return;
@@ -966,6 +1763,18 @@ static void audacious_audio_update(const void *data, int bytes)
     }
 
     if (frames != 0) {
+        if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
+            audacious_sony_seq_rescan_table(core);
+        }
+        if (core->mode == AUDACIOUS_PSF_MODE_PSF1 &&
+            core->sony_seq.valid && !core->sony_seq.started) {
+            for (sample_index = 0; sample_index < frames * 2u; ++sample_index) {
+                if (samples[sample_index] != 0) {
+                    audacious_sony_seq_start(core);
+                    break;
+                }
+            }
+        }
         memcpy(core->pcm + core->rendered_frames * 2u, data, frames * 2u * sizeof(int16_t));
         core->rendered_frames += frames;
         core->sample_pos += frames;
@@ -1026,6 +1835,7 @@ static Psf2CoreBridgeResult audacious_open(
             return PSF2_CORE_BRIDGE_ERROR_OPEN_FAILED;
         }
         setendless(1);
+        audacious_sony_seq_scan(core);
     } else if (core->mode == AUDACIOUS_PSF_MODE_PSF2) {
         setendless2(1);
         if (psf2_start(data, size) != 1) {
@@ -1075,6 +1885,7 @@ static void audacious_run_cpu_for_output_sample(AudaciousPsf2Core *core)
         spu2log_audacious_debug_set_stage(3);
         if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
             psx_hw_slice();
+            audacious_sony_seq_advance(core, 1u);
         } else {
             ps2_hw_slice();
         }
