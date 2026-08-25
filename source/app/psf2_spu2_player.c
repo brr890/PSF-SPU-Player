@@ -132,7 +132,6 @@
 #define IDM_THEME_LIGHT 1085
 #define IDM_THEME_DARK 1086
 #define IDM_TIMBRE_SCAN 1087
-#define IDM_KEYBOARD 1088
 #define IDM_OPEN_FOLDER 1090
 #define IDM_PLAYLIST_SHOW 1091
 #define IDM_PLAYLIST_LOAD 1092
@@ -144,6 +143,9 @@
 #define IDM_PLAYLIST_ORDER_SINGLE 1098
 #define IDM_SPEED_PRESET_FIRST 1100
 #define IDM_SPEED_PRESET_LAST 1108
+#define IDM_KEYBOARD_VALUES 1110
+#define IDM_KEYBOARD_VALUES_AND_KEYS 1111
+#define IDM_KEYBOARD_KEYS_ONLY 1112
 #define SPEED_PRESET_COUNT 9u
 #define MENU_SEPARATOR_MAGIC ((ULONG_PTR)0x5053465355505345ull)
 #define MENU_BAR_ITEM_MAGIC ((ULONG_PTR)0x5053465355424152ull)
@@ -203,12 +205,13 @@
 #define TIME_LABEL_MIN_WIDTH 112
 #define PLAYER_DEFAULT_WIDTH 1688
 #define PLAYER_DEFAULT_HEIGHT 563
-#define PLAYER_PSF1_WIDTH 854
+#define PLAYER_PSF1_WIDTH 890
 #define PLAYER_PSF1_HEIGHT 1080
 #define PLAYER_PSF1_KEYBOARD_ONLY_HEIGHT 679
 #define PLAYER_FULLSCREEN_CHROME_PERCENT 85
 #define PLAYER_PSF2_FULLSCREEN_CONTENT_PERCENT 98
 #define PLAYER_PSF2_FULLSCREEN_VERTICAL_PERCENT 108
+#define PLAYER_WINDOW_SNAP_DISTANCE 12
 #define PLAYER_MIN_WIDTH PLAYER_PSF1_WIDTH
 #define PLAYER_MIN_HEIGHT PLAYER_DEFAULT_HEIGHT
 #define CORE_PANEL_WIDTH 832
@@ -289,10 +292,6 @@ static const int g_speed_menu_values[SPEED_PRESET_COUNT] = {
 static const char *const g_speed_menu_labels[SPEED_PRESET_COUNT] = {
     "10%", "25%", "50%", "75%", "100%", "125%", "150%", "175%", "200%"
 };
-
-static const char g_psf1_values_fixed_header[] =
-    "active:00/24  ADSR:00/00/00/00  rv:0x0000/0x0000 "
-    "nclk:00000Hz tempo:0x000000(000.000) 000/000 beat:00 bar:0000";
 
 typedef struct PreviewSample {
     uint32_t key;
@@ -384,6 +383,9 @@ typedef struct PlayerState {
     CRITICAL_SECTION lock;
     int lock_ready;
     HWND hwnd;
+    HMENU keyboard_parent_menu;
+    HMENU keyboard_submenu;
+    UINT keyboard_parent_position;
     HDC paint_dc;
     HBITMAP paint_bitmap;
     HBITMAP paint_old_bitmap;
@@ -431,6 +433,11 @@ typedef struct PlayerState {
     int tab_speed_active;
     int scroll_y;
     int content_height;
+    int window_move_drag_active;
+    int window_move_cursor_offset_x;
+    int window_move_cursor_offset_y;
+    int window_move_width;
+    int window_move_height;
     int hide_inactive;
     int main_enabled;
     int reverb_enabled;
@@ -602,6 +609,9 @@ typedef struct PlayerState {
     HFONT maximized_ui_font;
     int maximized_ui_font_scale;
     int time_label_base_width;
+    int time_label_base_x;
+    int time_label_base_y;
+    int time_label_base_height;
     char ui_font_path[MAX_PATH];
     char ui_font_face[LF_FACESIZE];
     int ui_font_size;
@@ -657,6 +667,7 @@ static void preview_stop_standalone_audio(PlayerState *state);
 static int read_font_family_from_file(const char *font_path, char *out_face, size_t out_size);
 static void rebuild_ui_font(PlayerState *state);
 static void apply_ui_font_to_window(HWND hwnd, HFONT font);
+static HFONT create_ui_font_from_face(const char *face, int point_size);
 static void layout_player_controls(HWND hwnd, PlayerState *state);
 static void restore_debug_edits_to_saved_values(HWND hwnd, PlayerState *state);
 static int get_player_display_line_height(HWND hwnd);
@@ -773,8 +784,10 @@ static void load_ui_font_settings(PlayerState *state)
     state->ui_font_path[0] = '\0';
     GetPrivateProfileStringA("Font", "Face", "", state->ui_font_face, sizeof(state->ui_font_face), path);
     state->ui_font_size = GetPrivateProfileIntA("Font", "Size", state->ui_font_size, path);
-    if (state->ui_font_size < 8 || state->ui_font_size > 24) {
+    if (state->ui_font_size < 8) {
         state->ui_font_size = 9;
+    } else if (state->ui_font_size > 16) {
+        state->ui_font_size = 16;
     }
 }
 
@@ -1823,8 +1836,6 @@ static void update_speed_menu_check(HWND hwnd, const PlayerState *state)
 
 static void set_speed_percent(HWND hwnd, PlayerState *state, int speed_percent)
 {
-    char label[32];
-
     if (state == NULL) {
         return;
     }
@@ -1843,9 +1854,8 @@ static void set_speed_percent(HWND hwnd, PlayerState *state, int speed_percent)
     unlock_state(state);
 
     apply_effective_speed_percent(state);
-    snprintf(label, sizeof(label), "Speed %d%%", speed_percent);
     if (state->speed_label != NULL) {
-        SetWindowTextA(state->speed_label, label);
+        InvalidateRect(state->speed_label, NULL, TRUE);
     }
     if (state->speed_slider != NULL &&
         (int)SendMessageA(state->speed_slider, TBM_GETPOS, 0, 0) != speed_percent) {
@@ -1915,8 +1925,6 @@ static int get_volume_percent(PlayerState *state)
 
 static void set_volume_percent(HWND hwnd, PlayerState *state, int volume_percent, int save_setting)
 {
-    char label[32];
-
     if (state == NULL) {
         return;
     }
@@ -1929,9 +1937,8 @@ static void set_volume_percent(HWND hwnd, PlayerState *state, int volume_percent
     if (save_setting) {
         save_volume_percent(volume_percent);
     }
-    snprintf(label, sizeof(label), "Vol %d%%", volume_percent);
     if (state->volume_label != NULL) {
-        SetWindowTextA(state->volume_label, label);
+        InvalidateRect(state->volume_label, NULL, TRUE);
     }
     update_settings_menu_check(hwnd, state);
     InvalidateRect(hwnd, NULL, FALSE);
@@ -2521,6 +2528,64 @@ static LRESULT themed_dialog_control_color(WPARAM wparam, const PlayerState *sta
     return 0;
 }
 
+static int draw_header_percent_label(LPARAM lparam, const PlayerState *state)
+{
+    DRAWITEMSTRUCT *draw = (DRAWITEMSTRUCT *)lparam;
+    RECT label_rect;
+    RECT value_rect;
+    SIZE value_size;
+    const char *label;
+    char value[16];
+    HBRUSH background;
+    HFONT font;
+    HFONT old_font = NULL;
+    COLORREF old_text;
+    int old_bk;
+
+    if (draw == NULL || state == NULL || draw->CtlType != ODT_STATIC ||
+        (draw->CtlID != IDC_SPEED_LABEL && draw->CtlID != IDC_VOLUME_LABEL)) {
+        return 0;
+    }
+
+    label = draw->CtlID == IDC_SPEED_LABEL ? "Speed" : "Vol";
+    snprintf(value, sizeof(value), "%d%%",
+        draw->CtlID == IDC_SPEED_LABEL ? state->speed_percent : state->volume_percent);
+    background = is_dark_theme_active(state) ?
+        (HBRUSH)GetStockObject(BLACK_BRUSH) : GetSysColorBrush(COLOR_BTNFACE);
+    FillRect(draw->hDC, &draw->rcItem, background);
+
+    font = (HFONT)SendMessageA(draw->hwndItem, WM_GETFONT, 0, 0);
+    if (font != NULL) {
+        old_font = (HFONT)SelectObject(draw->hDC, font);
+    }
+    old_text = SetTextColor(draw->hDC,
+        is_dark_theme_active(state) ? RGB(255, 255, 255) : GetSysColor(COLOR_BTNTEXT));
+    old_bk = SetBkMode(draw->hDC, TRANSPARENT);
+
+    label_rect = draw->rcItem;
+    DrawTextA(draw->hDC, label, -1, &label_rect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    ZeroMemory(&value_size, sizeof(value_size));
+    GetTextExtentPoint32A(draw->hDC, value, (int)strlen(value), &value_size);
+    value_rect = draw->rcItem;
+    value_rect.left = value_rect.right - value_size.cx - 2;
+    if (value_rect.left < value_rect.right && value_rect.left < draw->rcItem.left) {
+        value_rect.left = draw->rcItem.left;
+    }
+    FillRect(draw->hDC, &value_rect, background);
+    value_rect.right -= 1;
+    DrawTextA(draw->hDC, value, -1, &value_rect,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    SetBkMode(draw->hDC, old_bk);
+    SetTextColor(draw->hDC, old_text);
+    if (old_font != NULL && old_font != HGDI_ERROR) {
+        SelectObject(draw->hDC, old_font);
+    }
+    return 1;
+}
+
 static int draw_owner_button(LPARAM lparam, const PlayerState *state)
 {
     DRAWITEMSTRUCT *draw = (DRAWITEMSTRUCT *)lparam;
@@ -2712,6 +2777,7 @@ static int draw_owner_menu_item(LPARAM lparam, const PlayerState *state)
     RECT line_rect;
     int y;
     int menu_bar = 0;
+    int disabled;
 
     if (draw == NULL || draw->CtlType != ODT_MENU) {
         return 0;
@@ -2747,15 +2813,23 @@ static int draw_owner_menu_item(LPARAM lparam, const PlayerState *state)
     if (label == NULL || label[0] == '\0') {
         return 0;
     }
+    disabled = (draw->itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
     brush = CreateSolidBrush(is_dark_theme_active(state) ?
-        ((draw->itemState & ODS_SELECTED) ? RGB(32, 32, 32) : RGB(0, 0, 0)) :
-        ((draw->itemState & ODS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHT) : RGB(255, 255, 255)));
+        ((!disabled && (draw->itemState & ODS_SELECTED)) ?
+            RGB(32, 32, 32) : RGB(0, 0, 0)) :
+        ((!disabled && (draw->itemState & ODS_SELECTED)) ?
+            GetSysColor(COLOR_HIGHLIGHT) : RGB(255, 255, 255)));
     if (brush != NULL) {
         FillRect(draw->hDC, &draw->rcItem, brush);
         DeleteObject(brush);
     }
-    text_color = is_dark_theme_active(state) ? RGB(255, 255, 255) :
-        ((draw->itemState & ODS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_MENUTEXT));
+    text_color = disabled ?
+        (is_dark_theme_active(state) ? RGB(128, 128, 128) :
+            GetSysColor(COLOR_GRAYTEXT)) :
+        (is_dark_theme_active(state) ? RGB(255, 255, 255) :
+            ((draw->itemState & ODS_SELECTED) ?
+                GetSysColor(COLOR_HIGHLIGHTTEXT) :
+                GetSysColor(COLOR_MENUTEXT)));
     SetTextColor(draw->hDC, text_color);
     SetBkMode(draw->hDC, TRANSPARENT);
     if (draw->itemState & ODS_CHECKED) {
@@ -2897,6 +2971,7 @@ static void update_playlist_settings_menu_check(const PlayerState *state)
 static void update_settings_menu_check(HWND hwnd, const PlayerState *state)
 {
     HMENU menu;
+    HMENU keyboard_menu;
 
     if (hwnd == NULL || state == NULL) {
         return;
@@ -2906,6 +2981,8 @@ static void update_settings_menu_check(HWND hwnd, const PlayerState *state)
     if (menu == NULL) {
         return;
     }
+    keyboard_menu = state->keyboard_submenu != NULL ?
+        state->keyboard_submenu : menu;
 
     CheckMenuItem(menu, IDM_REVERB_ENABLED,
         MF_BYCOMMAND | (state->reverb_enabled ? MF_CHECKED : MF_UNCHECKED));
@@ -2921,11 +2998,37 @@ static void update_settings_menu_check(HWND hwnd, const PlayerState *state)
         MF_BYCOMMAND | (state->tag_fade_enabled ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_TIMBRE_SCAN,
         MF_BYCOMMAND | (state->timbre_scan_enabled ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(menu, IDM_KEYBOARD,
-        MF_BYCOMMAND | (normalize_psf1_display_mode(state->psf1_display_mode) !=
+    CheckMenuItem(keyboard_menu, IDM_KEYBOARD_VALUES,
+        MF_BYCOMMAND | (normalize_psf1_display_mode(state->psf1_display_mode) ==
             PSF1_DISPLAY_VALUES ? MF_CHECKED : MF_UNCHECKED));
-    EnableMenuItem(menu, IDM_KEYBOARD,
+    CheckMenuItem(keyboard_menu, IDM_KEYBOARD_VALUES_AND_KEYS,
+        MF_BYCOMMAND | (normalize_psf1_display_mode(state->psf1_display_mode) ==
+            PSF1_DISPLAY_VALUES_KEYBOARD ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(keyboard_menu, IDM_KEYBOARD_KEYS_ONLY,
+        MF_BYCOMMAND | (normalize_psf1_display_mode(state->psf1_display_mode) ==
+            PSF1_DISPLAY_KEYBOARD_ONLY ? MF_CHECKED : MF_UNCHECKED));
+    EnableMenuItem(keyboard_menu, IDM_KEYBOARD_VALUES,
         MF_BYCOMMAND | (state->psf_version == 0x01u ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(keyboard_menu, IDM_KEYBOARD_VALUES_AND_KEYS,
+        MF_BYCOMMAND | (state->psf_version == 0x01u ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(keyboard_menu, IDM_KEYBOARD_KEYS_ONLY,
+        MF_BYCOMMAND | (state->psf_version == 0x01u ? MF_ENABLED : MF_GRAYED));
+    if (state->keyboard_parent_menu != NULL) {
+        MENUITEMINFOA item;
+        int should_attach = state->psf_version == 0x01u;
+
+        ZeroMemory(&item, sizeof(item));
+        item.cbSize = sizeof(item);
+        item.fMask = MIIM_STATE | MIIM_SUBMENU;
+        item.fState = should_attach ?
+            MFS_ENABLED : (MFS_DISABLED | MFS_GRAYED);
+        item.hSubMenu = should_attach ? state->keyboard_submenu : NULL;
+        SetMenuItemInfoA(
+            state->keyboard_parent_menu,
+            state->keyboard_parent_position,
+            TRUE,
+            &item);
+    }
     CheckMenuItem(menu, IDM_THEME_SYSTEM,
         MF_BYCOMMAND | (normalize_theme_mode(state->theme_mode) == THEME_SYSTEM ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_THEME_LIGHT,
@@ -2963,6 +3066,7 @@ static void update_settings_menu_check(HWND hwnd, const PlayerState *state)
         }
     }
     update_playlist_settings_menu_check(state);
+    DrawMenuBar(hwnd);
 }
 
 static void set_tag_fade_enabled(HWND hwnd, PlayerState *state, int enabled)
@@ -3039,7 +3143,7 @@ static void recreate_speed_slider(HWND hwnd, PlayerState *state)
     }
     DestroyWindow(state->speed_slider);
     state->speed_slider = CreateWindowA(TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
-        252, 1, 136, 26, hwnd, (HMENU)(UINT_PTR)IDC_SPEED, NULL, NULL);
+        252, 1, 128, 26, hwnd, (HMENU)(UINT_PTR)IDC_SPEED, NULL, NULL);
     if (state->speed_slider != NULL) {
         SendMessageA(state->speed_slider, TBM_SETRANGE, TRUE, MAKELPARAM(10, 200));
         SendMessageA(state->speed_slider, TBM_SETTICFREQ, 10, 0);
@@ -5617,6 +5721,7 @@ static void set_lr_color_index(HWND hwnd, PlayerState *state, int color_index)
 
 typedef struct FontDialogState {
     PlayerState *player;
+    HFONT dialog_font;
     char selected_face[LF_FACESIZE];
     int selected_size;
     int done;
@@ -5681,7 +5786,7 @@ static void populate_font_size_combo(HWND combo, int current_size)
         return;
     }
     SendMessageA(combo, CB_RESETCONTENT, 0, 0);
-    for (size = 8; size <= 24; ++size) {
+    for (size = 8; size <= 16; ++size) {
         char text[8];
         snprintf(text, sizeof(text), "%d", size);
         SendMessageA(combo, CB_ADDSTRING, 0, (LPARAM)text);
@@ -5715,6 +5820,42 @@ static int font_dialog_get_selection(HWND hwnd, FontDialogState *dialog)
     return 1;
 }
 
+static void apply_fixed_font_to_font_dialog(
+    HWND hwnd,
+    FontDialogState *dialog,
+    const char *face)
+{
+    HFONT new_font;
+    HFONT old_font;
+
+    if (hwnd == NULL || dialog == NULL) {
+        return;
+    }
+    new_font = create_ui_font_from_face(face, 10);
+    if (new_font == NULL) {
+        return;
+    }
+    old_font = dialog->dialog_font;
+    dialog->dialog_font = new_font;
+    apply_ui_font_to_window(hwnd, dialog->dialog_font);
+    if (old_font != NULL) {
+        DeleteObject(old_font);
+    }
+}
+
+static void refresh_header_after_font_change(PlayerState *state)
+{
+    if (state == NULL || state->hwnd == NULL) {
+        return;
+    }
+    layout_player_controls(state->hwnd, state);
+    state->time_label_base_width = 0;
+    state->time_label_cache_valid = 0;
+    state->time_label_text[0] = '\0';
+    update_time_label(state);
+    layout_player_controls(state->hwnd, state);
+}
+
 static void apply_font_dialog_selection(HWND hwnd, FontDialogState *dialog)
 {
     if (dialog == NULL || dialog->player == NULL) {
@@ -5729,8 +5870,9 @@ static void apply_font_dialog_selection(HWND hwnd, FontDialogState *dialog)
     rebuild_ui_font(dialog->player);
     save_ui_font_settings(dialog->player);
     apply_ui_font_to_window(dialog->player->hwnd, dialog->player->ui_font);
-    layout_player_controls(dialog->player->hwnd, dialog->player);
-    apply_ui_font_to_window(hwnd, dialog->player->ui_font);
+    refresh_header_after_font_change(dialog->player);
+    apply_fixed_font_to_font_dialog(
+        hwnd, dialog, dialog->player->ui_font_face);
     if (dialog->player->playlist_hwnd != NULL) {
         apply_ui_font_to_window(dialog->player->playlist_hwnd, dialog->player->ui_font);
     }
@@ -5764,7 +5906,8 @@ static LRESULT CALLBACK font_dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             236, 280, 74, 24, hwnd, (HMENU)(UINT_PTR)IDC_FONT_CANCEL, NULL, NULL);
         if (dialog != NULL) {
             apply_window_dark_title(hwnd, dialog->player);
-            apply_ui_font_to_window(hwnd, dialog->player->ui_font);
+            apply_fixed_font_to_font_dialog(
+                hwnd, dialog, dialog->player->ui_font_face);
             populate_installed_font_list(listbox, dialog->player->ui_font_face);
             populate_font_size_combo(combo, dialog->player->ui_font_size);
         }
@@ -5824,6 +5967,12 @@ static LRESULT CALLBACK font_dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         }
         save_font_dialog_bounds(hwnd);
         DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        if (dialog != NULL && dialog->dialog_font != NULL) {
+            DeleteObject(dialog->dialog_font);
+            dialog->dialog_font = NULL;
+        }
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wparam, lparam);
@@ -6137,10 +6286,7 @@ static HFONT create_ui_font_from_face(const char *face, int point_size)
     HFONT default_font;
     HDC hdc;
 
-    if (face == NULL || face[0] == '\0') {
-        return NULL;
-    }
-    if (point_size < 8 || point_size > 24) {
+    if (point_size < 8 || point_size > 16) {
         point_size = 9;
     }
     ZeroMemory(&logfont, sizeof(logfont));
@@ -6157,7 +6303,9 @@ static HFONT create_ui_font_from_face(const char *face, int point_size)
     }
     logfont.lfWeight = FW_NORMAL;
     logfont.lfCharSet = DEFAULT_CHARSET;
-    snprintf(logfont.lfFaceName, sizeof(logfont.lfFaceName), "%s", face);
+    if (face != NULL && face[0] != '\0') {
+        snprintf(logfont.lfFaceName, sizeof(logfont.lfFaceName), "%s", face);
+    }
     return CreateFontIndirectA(&logfont);
 }
 
@@ -9416,6 +9564,84 @@ static void position_scaled_control(
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
 }
 
+static void snap_moving_window_to_monitor(PlayerState *state, RECT *window_rect)
+{
+    MONITORINFO monitor_info;
+    HMONITOR monitor;
+    POINT cursor;
+    LONG left_distance;
+    LONG right_distance;
+    LONG top_distance;
+    LONG bottom_distance;
+    LONG offset_x = 0;
+    LONG offset_y = 0;
+
+    if (state == NULL || window_rect == NULL) {
+        return;
+    }
+    if (GetCursorPos(&cursor)) {
+        if (!state->window_move_drag_active) {
+            state->window_move_drag_active = 1;
+            state->window_move_cursor_offset_x = cursor.x - window_rect->left;
+            state->window_move_cursor_offset_y = cursor.y - window_rect->top;
+            state->window_move_width = window_rect->right - window_rect->left;
+            state->window_move_height = window_rect->bottom - window_rect->top;
+        }
+        if (state->window_move_width > 0 && state->window_move_height > 0) {
+            window_rect->left = cursor.x - state->window_move_cursor_offset_x;
+            window_rect->top = cursor.y - state->window_move_cursor_offset_y;
+            window_rect->right = window_rect->left + state->window_move_width;
+            window_rect->bottom = window_rect->top + state->window_move_height;
+        }
+    }
+    monitor = MonitorFromRect(window_rect, MONITOR_DEFAULTTONEAREST);
+    if (monitor == NULL) {
+        return;
+    }
+    ZeroMemory(&monitor_info, sizeof(monitor_info));
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (!GetMonitorInfoA(monitor, &monitor_info)) {
+        return;
+    }
+
+    left_distance = window_rect->left - monitor_info.rcWork.left;
+    if (left_distance < 0) {
+        left_distance = -left_distance;
+    }
+    right_distance = window_rect->right - monitor_info.rcWork.right;
+    if (right_distance < 0) {
+        right_distance = -right_distance;
+    }
+    top_distance = window_rect->top - monitor_info.rcWork.top;
+    if (top_distance < 0) {
+        top_distance = -top_distance;
+    }
+    bottom_distance = window_rect->bottom - monitor_info.rcWork.bottom;
+    if (bottom_distance < 0) {
+        bottom_distance = -bottom_distance;
+    }
+
+    if (left_distance <= PLAYER_WINDOW_SNAP_DISTANCE ||
+        right_distance <= PLAYER_WINDOW_SNAP_DISTANCE) {
+        if (left_distance <= right_distance) {
+            offset_x = monitor_info.rcWork.left - window_rect->left;
+        } else {
+            offset_x = monitor_info.rcWork.right - window_rect->right;
+        }
+    }
+    if (top_distance <= PLAYER_WINDOW_SNAP_DISTANCE ||
+        bottom_distance <= PLAYER_WINDOW_SNAP_DISTANCE) {
+        if (top_distance <= bottom_distance) {
+            offset_y = monitor_info.rcWork.top - window_rect->top;
+        } else {
+            offset_y = monitor_info.rcWork.bottom - window_rect->bottom;
+        }
+    }
+    if (offset_x != 0 || offset_y != 0) {
+        OffsetRect(window_rect, offset_x, offset_y);
+    }
+}
+
 static HFONT player_control_font_for_scale(
     PlayerState *state,
     int scale_milli)
@@ -9461,6 +9687,44 @@ static HFONT player_control_font_for_scale(
         state->maximized_ui_font : base_font;
 }
 
+static int logical_text_width(
+    HDC hdc,
+    const char *text,
+    int scale_milli,
+    int fallback)
+{
+    SIZE size;
+
+    if (hdc == NULL || text == NULL || text[0] == '\0' ||
+        !GetTextExtentPoint32A(hdc, text, (int)strlen(text), &size)) {
+        return fallback;
+    }
+    if (scale_milli <= 0) {
+        return size.cx;
+    }
+    return (size.cx * 1000 + scale_milli / 2) / scale_milli;
+}
+
+static int control_text_width(
+    HDC hdc,
+    HWND control,
+    const char *fallback_text,
+    int scale_milli,
+    int fallback_width)
+{
+    char text[128];
+
+    text[0] = '\0';
+    if (control != NULL) {
+        GetWindowTextA(control, text, sizeof(text));
+    }
+    if (text[0] == '\0' && fallback_text != NULL) {
+        snprintf(text, sizeof(text), "%s", fallback_text);
+    }
+    return logical_text_width(
+        hdc, text, scale_milli, fallback_width);
+}
+
 static void layout_player_controls(HWND hwnd, PlayerState *state)
 {
     PlayerScaleLayout layout;
@@ -9475,31 +9739,208 @@ static void layout_player_controls(HWND hwnd, PlayerState *state)
     if (layout.base_width <= 0 || layout.base_height <= 0) {
         return;
     }
-    time_width = state->time_label_base_width > 0 ?
-        state->time_label_base_width : TIME_LABEL_MIN_WIDTH;
-    spacing_step = IsZoomed(hwnd) ? 2 : 0;
-    position_scaled_control(state->open_button, &layout, 6, 4, 54, 20);
-    position_scaled_control(state->play_button, &layout,
-        64 + spacing_step, 4, 54, 20);
-    position_scaled_control(state->pause_button, &layout,
-        122 + spacing_step * 2, 4, 58, 20);
-    position_scaled_control(state->stop_button, &layout,
-        184 + spacing_step * 3, 4, 54, 20);
-    position_scaled_control(state->speed_slider, &layout,
-        252 + spacing_step * 4, 1, 136, 26);
-    position_scaled_control(state->speed_label, &layout,
-        394 + spacing_step * 5, 6, 94, 16);
-    position_scaled_control(state->volume_label, &layout,
-        492 + spacing_step * 6, 6, 68, 16);
-    position_scaled_control(state->main_check, &layout,
-        564 + spacing_step * 7, 4, 58, 20);
-    position_scaled_control(state->reverb_check, &layout,
-        626 + spacing_step * 8, 4, 70, 20);
-    position_scaled_control(state->time_label, &layout,
-        702 + spacing_step * 9, 6, time_width, 16);
     control_font = player_control_font_for_scale(state, layout.scale_milli);
     if (control_font != NULL) {
         apply_ui_font_to_window(hwnd, control_font);
+    }
+    time_width = state->time_label_base_width > 0 ?
+        state->time_label_base_width : TIME_LABEL_MIN_WIDTH;
+    if (state->ui_font_size <= 12 || state->psf_version == 0x02u) {
+        spacing_step = IsZoomed(hwnd) ? 2 : 0;
+        position_scaled_control(state->open_button, &layout, 6, 4, 54, 20);
+        position_scaled_control(state->play_button, &layout,
+            64 + spacing_step, 4, 54, 20);
+        position_scaled_control(state->pause_button, &layout,
+            122 + spacing_step * 2, 4, 58, 20);
+        position_scaled_control(state->stop_button, &layout,
+            184 + spacing_step * 3, 4, 54, 20);
+        position_scaled_control(state->speed_slider, &layout,
+            252 + spacing_step * 4, 1, 128, 26);
+        position_scaled_control(state->speed_label, &layout,
+            386 + spacing_step * 5, 6, 94, 16);
+        position_scaled_control(state->volume_label, &layout,
+            484 + spacing_step * 6, 6, 68, 16);
+        position_scaled_control(state->main_check, &layout,
+            556 + spacing_step * 7, 4, 58, 20);
+        position_scaled_control(state->reverb_check, &layout,
+            618 + spacing_step * 8, 4, 70, 20);
+        state->time_label_base_x = 694 + spacing_step * 9;
+        state->time_label_base_y = 6;
+        state->time_label_base_height = 16;
+        position_scaled_control(state->time_label, &layout,
+            state->time_label_base_x, state->time_label_base_y,
+            time_width, state->time_label_base_height);
+    } else {
+        HDC hdc = GetDC(hwnd);
+        HFONT old_font = NULL;
+        TEXTMETRICA metrics;
+        int text_height = 16;
+        int open_width;
+        int play_width;
+        int pause_width;
+        int stop_width;
+        int speed_width;
+        int volume_width;
+        int speed_value_width;
+        int volume_value_width;
+        int main_width;
+        int reverb_width;
+        int fixed_width;
+        int inner_width;
+        int gap = 4;
+        int slider_width = 128;
+        int button_height;
+        int label_height;
+        int slider_height;
+        int button_y;
+        int label_y;
+        int slider_y;
+        int x = 6;
+        int transition_step = state->ui_font_size - 12;
+
+        if (transition_step < 1) {
+            transition_step = 1;
+        } else if (transition_step > 4) {
+            transition_step = 4;
+        }
+
+        ZeroMemory(&metrics, sizeof(metrics));
+        if (hdc != NULL && control_font != NULL) {
+            old_font = (HFONT)SelectObject(hdc, control_font);
+        }
+        if (hdc != NULL && GetTextMetricsA(hdc, &metrics)) {
+            text_height = layout.scale_milli > 0 ?
+                (metrics.tmHeight * 1000 + layout.scale_milli / 2) /
+                    layout.scale_milli : metrics.tmHeight;
+        }
+        open_width = control_text_width(
+            hdc, state->open_button, "Open", layout.scale_milli, 44) + 10;
+        play_width = control_text_width(
+            hdc, state->play_button, "Play", layout.scale_milli, 44) + 10;
+        pause_width = control_text_width(
+            hdc, state->pause_button, "Pause", layout.scale_milli, 48) + 10;
+        stop_width = control_text_width(
+            hdc, state->stop_button, "Stop", layout.scale_milli, 44) + 10;
+        speed_width = 94;
+        volume_width = 68;
+        speed_value_width = logical_text_width(
+            hdc, "200%", layout.scale_milli, 38) + 2;
+        volume_value_width = speed_value_width;
+        main_width = control_text_width(
+            hdc, state->main_check, "Main", layout.scale_milli, 38) + 20;
+        reverb_width = control_text_width(
+            hdc, state->reverb_check, "Reverb", layout.scale_milli, 50) + 20;
+        time_width = control_text_width(
+            hdc, state->time_label, "00:00.0 / --:--.-",
+            layout.scale_milli, TIME_LABEL_MIN_WIDTH) + 2;
+        if (old_font != NULL && old_font != HGDI_ERROR) {
+            SelectObject(hdc, old_font);
+        }
+        if (hdc != NULL) {
+            ReleaseDC(hwnd, hdc);
+        }
+
+        fixed_width = open_width + play_width + pause_width + stop_width +
+            speed_width + volume_width + main_width + reverb_width +
+            time_width;
+        inner_width = layout.base_width - 12;
+        gap = (inner_width - fixed_width - slider_width) / 9;
+        if (gap > 4) {
+            gap = 4;
+        } else if (gap < 0) {
+            gap = 0;
+        }
+        if (fixed_width + slider_width + gap * 9 > inner_width) {
+            open_width -= 6;
+            play_width -= 6;
+            pause_width -= 6;
+            stop_width -= 6;
+            speed_width -= 3;
+            volume_width -= 3;
+            main_width -= 4;
+            reverb_width -= 4;
+            fixed_width = open_width + play_width + pause_width + stop_width +
+                speed_width + volume_width + main_width + reverb_width +
+                time_width;
+        }
+        if (fixed_width + slider_width > inner_width) {
+            int overflow = fixed_width + slider_width - inner_width;
+            int reducible = speed_width - speed_value_width;
+            int reduction = overflow < reducible ? overflow : reducible;
+
+            speed_width -= reduction;
+            overflow -= reduction;
+            if (overflow > 0) {
+                reducible = volume_width - volume_value_width;
+                reduction = overflow < reducible ? overflow : reducible;
+                volume_width -= reduction;
+            }
+            fixed_width = open_width + play_width + pause_width + stop_width +
+                speed_width + volume_width + main_width + reverb_width +
+                time_width;
+        }
+        {
+            int row_width = fixed_width + slider_width + gap * 9;
+            if (row_width < inner_width) {
+                int centered_offset = (inner_width - row_width) / 2;
+                x += (centered_offset * transition_step + 2) / 4;
+            }
+        }
+
+        button_height = text_height + 6;
+        if (button_height < 20) {
+            button_height = 20;
+        } else if (button_height > CONTROLS_HEIGHT) {
+            button_height = CONTROLS_HEIGHT;
+        }
+        label_height = text_height + 2;
+        if (label_height < 16) {
+            label_height = 16;
+        } else if (label_height > CONTROLS_HEIGHT) {
+            label_height = CONTROLS_HEIGHT;
+        }
+        slider_height = button_height > 26 ? button_height : 26;
+        if (slider_height > CONTROLS_HEIGHT) {
+            slider_height = CONTROLS_HEIGHT;
+        }
+        button_y = (CONTROLS_HEIGHT - button_height) / 2;
+        label_y = (CONTROLS_HEIGHT - label_height) / 2;
+        slider_y = (CONTROLS_HEIGHT - slider_height) / 2;
+
+#define PLACE_HEADER_CONTROL(control, width, y_pos, height) \
+        do { \
+            position_scaled_control((control), &layout, x, (y_pos), \
+                (width), (height)); \
+            x += (width) + gap; \
+        } while (0)
+        PLACE_HEADER_CONTROL(state->open_button, open_width,
+            button_y, button_height);
+        PLACE_HEADER_CONTROL(state->play_button, play_width,
+            button_y, button_height);
+        PLACE_HEADER_CONTROL(state->pause_button, pause_width,
+            button_y, button_height);
+        PLACE_HEADER_CONTROL(state->stop_button, stop_width,
+            button_y, button_height);
+        PLACE_HEADER_CONTROL(state->speed_slider, slider_width,
+            slider_y, slider_height);
+        position_scaled_control(state->speed_label, &layout,
+            x, label_y, speed_width, label_height);
+        x += speed_width + gap;
+        position_scaled_control(state->volume_label, &layout,
+            x, label_y, volume_width, label_height);
+        x += volume_width + gap;
+        PLACE_HEADER_CONTROL(state->main_check, main_width,
+            button_y, button_height);
+        PLACE_HEADER_CONTROL(state->reverb_check, reverb_width,
+            button_y, button_height);
+#undef PLACE_HEADER_CONTROL
+        state->time_label_base_x = x;
+        state->time_label_base_y = label_y;
+        state->time_label_base_height = label_height;
+        state->time_label_base_width = time_width;
+        position_scaled_control(state->time_label, &layout,
+            state->time_label_base_x, state->time_label_base_y,
+            time_width, state->time_label_base_height);
     }
     RedrawWindow(hwnd, NULL, NULL,
         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
@@ -9580,21 +10021,41 @@ static void toggle_player_maximized(HWND hwnd)
     ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
 }
 
-static void cycle_psf1_display_mode(HWND hwnd, PlayerState *state)
+static void set_psf1_display_mode(
+    HWND hwnd,
+    PlayerState *state,
+    int display_mode)
 {
+    display_mode = normalize_psf1_display_mode(display_mode);
     if (state == NULL || state->psf_version != 0x01u) {
         return;
     }
+    if (display_mode == normalize_psf1_display_mode(
+            state->psf1_display_mode)) {
+        update_settings_menu_check(hwnd, state);
+        return;
+    }
     save_psf1_mode_window_bounds(hwnd, state->psf1_display_mode);
-    state->psf1_display_mode =
-        (normalize_psf1_display_mode(state->psf1_display_mode) + 1) %
-        PSF1_DISPLAY_MODE_COUNT;
+    state->psf1_display_mode = display_mode;
     save_psf1_display_mode(state->psf1_display_mode);
     update_settings_menu_check(hwnd, state);
     state->scroll_y = 0;
     apply_psf_window_mode(hwnd, state, state->psf_version);
     update_scrollbar(hwnd, state);
     InvalidateRect(hwnd, NULL, TRUE);
+}
+
+static void cycle_psf1_display_mode(HWND hwnd, PlayerState *state)
+{
+    int display_mode;
+
+    if (state == NULL) {
+        return;
+    }
+    display_mode =
+        (normalize_psf1_display_mode(state->psf1_display_mode) + 1) %
+        PSF1_DISPLAY_MODE_COUNT;
+    set_psf1_display_mode(hwnd, state, display_mode);
 }
 
 static void update_time_label(PlayerState *state)
@@ -9647,6 +10108,7 @@ static void update_time_label(PlayerState *state)
         HGDIOBJ previous_font = NULL;
         SIZE text_size;
         int measured_width = TIME_LABEL_MIN_WIDTH;
+        int relayout_needed = 0;
 
         snprintf(state->time_label_text, sizeof(state->time_label_text), "%s", label);
         hdc = GetDC(state->time_label);
@@ -9668,10 +10130,21 @@ static void update_time_label(PlayerState *state)
                 if (measured_width < 1) {
                     measured_width = 1;
                 }
-                state->time_label_base_width = measured_width;
-                position_scaled_control(state->time_label, &layout,
-                    702 + (IsZoomed(state->hwnd) ? 18 : 0), 6,
-                    state->time_label_base_width, 16);
+                if (measured_width > state->time_label_base_width) {
+                    state->time_label_base_width = measured_width;
+                    relayout_needed = state->ui_font_size > 12;
+                }
+                if (!relayout_needed) {
+                    position_scaled_control(state->time_label, &layout,
+                        state->time_label_base_x > 0 ?
+                            state->time_label_base_x :
+                            694 + (IsZoomed(state->hwnd) ? 18 : 0),
+                        state->time_label_base_height > 0 ?
+                            state->time_label_base_y : 6,
+                        state->time_label_base_width,
+                        state->time_label_base_height > 0 ?
+                            state->time_label_base_height : 16);
+                }
             }
             if (previous_font != NULL && previous_font != HGDI_ERROR) {
                 SelectObject(hdc, previous_font);
@@ -9679,6 +10152,9 @@ static void update_time_label(PlayerState *state)
             ReleaseDC(state->time_label, hdc);
         }
         SetWindowTextA(state->time_label, label);
+        if (relayout_needed) {
+            layout_player_controls(state->hwnd, state);
+        }
         RedrawWindow(state->time_label, NULL, NULL,
             RDW_INVALIDATE | RDW_ERASE);
     }
@@ -10848,6 +11324,34 @@ static uint32_t first_nonzero_pcm_frame(const int16_t *pcm, uint32_t frames)
     return frames;
 }
 
+static int song_voice_activity_present(PlayerState *state)
+{
+    unsigned core;
+    unsigned voice;
+    unsigned core_count;
+    int active = 0;
+
+    if (state == NULL) {
+        return 0;
+    }
+
+    lock_state(state);
+    core_count = state->psf_version == 0x01u ? 1u : 2u;
+    for (core = 0; core < core_count && !active; ++core) {
+        for (voice = 0; voice < 24u; ++voice) {
+            const Spu2LogVoiceSnapshot *snapshot =
+                &state->live.voices[core][voice];
+
+            if (snapshot->active || snapshot->envx != 0) {
+                active = 1;
+                break;
+            }
+        }
+    }
+    unlock_state(state);
+    return active;
+}
+
 static void start_timeline_at_first_audible_frame(
     PlayerState *state,
     const int16_t *pcm,
@@ -10870,6 +11374,12 @@ static void start_timeline_at_first_audible_frame(
     }
 
     first_audible = first_nonzero_pcm_frame(pcm, frames);
+    /* Voice and timbre solo are applied in the mixer. The SPU/SPU2 voice
+       state still describes the original song, so do not make elapsed time
+       wait for the selected voice to produce non-zero output. */
+    if (first_audible >= frames && song_voice_activity_present(state)) {
+        first_audible = 0;
+    }
     if (first_audible >= frames) {
         return;
     }
@@ -10907,7 +11417,7 @@ static uint32_t first_ps2_song_frame(
 
     if (state != NULL) {
         lock_state(state);
-        use_origin = state->timbre_solo_enabled && state->ps2_startup_origin_valid;
+        use_origin = state->ps2_startup_origin_valid;
         origin_sample = state->ps2_startup_origin_sample;
         unlock_state(state);
     }
@@ -16392,6 +16902,34 @@ static void frame_advance_tick(HWND hwnd, PlayerState *state, int delta_ticks)
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+static int player_core_panel_x(
+    HWND hwnd,
+    const PlayerState *state,
+    uint8_t psf_version,
+    unsigned core)
+{
+    RECT client_rect;
+    int logical_width;
+    int panel_x;
+
+    if (psf_version != 0x01u || core != 0u || hwnd == NULL) {
+        return core == 0u ? CORE0_X : CORE1_X;
+    }
+
+    if (IsZoomed(hwnd)) {
+        PlayerScaleLayout layout;
+
+        get_player_content_scale_layout(hwnd, state, &layout);
+        logical_width = layout.base_width;
+    } else if (GetClientRect(hwnd, &client_rect)) {
+        logical_width = client_rect.right - client_rect.left;
+    } else {
+        logical_width = CORE_PANEL_WIDTH + (CORE0_X * 2);
+    }
+    panel_x = (logical_width - CORE_PANEL_WIDTH) / 2;
+    return panel_x > 0 ? panel_x : 0;
+}
+
 static void render_playback_tick(HWND hwnd, PlayerState *state)
 {
     RECT redraw_rect;
@@ -16401,6 +16939,7 @@ static void render_playback_tick(HWND hwnd, PlayerState *state)
     int same_render_state;
     int skip_draw;
     int line_height;
+    int core0_x;
     uint8_t psf_version;
 
     if (state == NULL) {
@@ -16451,10 +16990,11 @@ static void render_playback_tick(HWND hwnd, PlayerState *state)
 
     GetClientRect(hwnd, &redraw_rect);
     if (gauge_only) {
-        redraw_rect.left = CORE0_X + COL_ENV_BAR_X;
+        core0_x = player_core_panel_x(hwnd, state, psf_version, 0u);
+        redraw_rect.left = core0_x + COL_ENV_BAR_X;
         redraw_rect.top = 2 + CONTROLS_HEIGHT + (line_height * 2);
         redraw_rect.right = psf_version == 0x01u ?
-            CORE0_X + COL_VOL_BAR_X + 100 :
+            core0_x + COL_VOL_BAR_X + 100 :
             CORE1_X + COL_VOL_BAR_X + 100;
     } else {
         redraw_rect.top = CONTROLS_HEIGHT;
@@ -16949,14 +17489,9 @@ static void paint_core_panel(
             IsZoomed(player_state->hwnd)) {
             PlayerScaleLayout header_layout;
             SIZE text_size;
-            const char *alignment_line = line;
             int saved_dc;
             int active_header_x = x;
 
-            if (normalize_psf1_display_mode(player_state->psf1_display_mode) ==
-                PSF1_DISPLAY_VALUES) {
-                alignment_line = g_psf1_values_fixed_header;
-            }
             get_fullscreen_reference_layout(
                 player_state->hwnd, player_state, &header_layout);
             saved_dc = SaveDC(hdc);
@@ -16972,8 +17507,7 @@ static void paint_core_panel(
                     SelectObject(hdc, player_state->meter_font);
                 }
                 if (GetTextExtentPoint32A(
-                        hdc, alignment_line,
-                        (int)strlen(alignment_line), &text_size)) {
+                        hdc, line, (int)strlen(line), &text_size)) {
                     active_header_x = x +
                         (CORE_PANEL_WIDTH - text_size.cx) / 2;
                 }
@@ -16984,13 +17518,24 @@ static void paint_core_panel(
                 if (saved_dc != 0) {
                     RestoreDC(hdc, saved_dc);
                 }
-                TextOutA(hdc,
-                    x + (show_core_label ? COL_TEXT_X : 0), y,
+                if (GetTextExtentPoint32A(
+                        hdc, line, (int)strlen(line), &text_size)) {
+                    active_header_x = x +
+                        (CORE_PANEL_WIDTH - text_size.cx) / 2;
+                }
+                TextOutA(hdc, active_header_x, y,
                     line, (int)strlen(line));
             }
         } else {
-            TextOutA(hdc,
-                x + (show_core_label ? COL_TEXT_X : 0), y,
+            SIZE text_size;
+            int active_header_x = x;
+
+            if (GetTextExtentPoint32A(
+                    hdc, line, (int)strlen(line), &text_size)) {
+                active_header_x = x +
+                    (CORE_PANEL_WIDTH - text_size.cx) / 2;
+            }
+            TextOutA(hdc, active_header_x, y,
                 line, (int)strlen(line));
         }
         y += active_header_line_height;
@@ -17304,6 +17849,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     Psf1AkaoPlaybackState akao;
     unsigned display_core_count;
     unsigned note_voice;
+    int core0_x;
     int voice_rows_target_bottom;
     int active_header_line_height;
     int voice_scroll_y;
@@ -17467,6 +18013,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, active_text_color);
+    core0_x = player_core_panel_x(hwnd, state, psf_version, 0u);
 
     if (psf_version == 0x01u &&
         psf1_keyboard_height_for_state(state, psf_version) > 0) {
@@ -17480,7 +18027,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
             state, hdc, dark_keyboard, keyboard_width);
     }
 
-    paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, &akao, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE0_X, y, line_height, active_header_line_height, voice_scroll_y, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
+    paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, &akao, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, core0_x, y, line_height, active_header_line_height, voice_scroll_y, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
     if (psf_version != 0x01u) {
         paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, NULL, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, active_header_line_height, 0, 1, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
     }
@@ -17831,7 +18378,7 @@ static int hit_test_voice_text_column(HWND hwnd, PlayerState *state, int mouse_x
 
     if (psf_version == 0x01u) {
         core = 0;
-        panel_x = CORE0_X;
+        panel_x = player_core_panel_x(hwnd, state, psf_version, core);
     } else if (mouse_x >= CORE1_X) {
         core = 1;
         panel_x = CORE1_X;
@@ -17892,7 +18439,7 @@ static int hit_test_voice_env_column(HWND hwnd, PlayerState *state, int mouse_x,
 
     if (psf_version == 0x01u) {
         core = 0;
-        panel_x = CORE0_X;
+        panel_x = player_core_panel_x(hwnd, state, psf_version, core);
     } else if (mouse_x >= CORE1_X) {
         core = 1;
         panel_x = CORE1_X;
@@ -17938,7 +18485,7 @@ static int hit_test_voice_flag_column(HWND hwnd, PlayerState *state, int mouse_x
 
     if (psf_version == 0x01u) {
         core = 0;
-        panel_x = CORE0_X;
+        panel_x = player_core_panel_x(hwnd, state, psf_version, core);
     } else if (mouse_x >= CORE1_X) {
         core = 1;
         panel_x = CORE1_X;
@@ -17985,11 +18532,12 @@ static void format_core_header_line(
     unsigned core,
     uint8_t psf_version,
     int show_core_label,
+    const Psf1AkaoPlaybackState *akao,
     char *line,
     size_t line_size)
 {
     const Spu2LogCoreSnapshot *core_state = &live->cores[core];
-    int active_count = active_voice_count(live, core);
+    int active_count;
     int attack_count;
     int decay_count;
     int sustain_count;
@@ -17997,7 +18545,14 @@ static void format_core_header_line(
     unsigned noise_clock = noise_clock_from_core_flags(core_state->flags);
     unsigned noise_hz = noise_clock_frequency_hz(noise_clock);
 
-    adsr_phase_counts(live, core, &attack_count, &decay_count, &sustain_count, &release_count);
+    voice_status_counts(
+        live,
+        core,
+        &active_count,
+        &attack_count,
+        &decay_count,
+        &sustain_count,
+        &release_count);
     if (show_core_label) {
         snprintf(line, line_size,
             "Core %u  active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X  nclk:%5uHz",
@@ -18010,8 +18565,49 @@ static void format_core_header_line(
             core_state->reverb_l,
             core_state->reverb_r,
             noise_hz);
+    } else if (psf_version == 0x01u && akao != NULL && akao->detected) {
+        unsigned denominator = akao->beat_denominator != 0u ?
+            akao->beat_denominator :
+            (akao->ticks_per_beat != 0 ? 192u / akao->ticks_per_beat : 0u);
+
+        if (akao->driver_type == PSF1_MUSIC_DRIVER_SONY_SEQ) {
+            snprintf(line, line_size,
+                "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%06lX(%7.3f) %u/%u beat:%02u bar:%04u",
+                active_count,
+                attack_count,
+                decay_count,
+                sustain_count,
+                release_count,
+                core_state->reverb_l,
+                core_state->reverb_r,
+                noise_hz,
+                (unsigned long)akao->tempo,
+                psf1_tempo_bpm(
+                    akao->tempo, akao->early_format, akao->driver_type),
+                akao->beats_per_measure,
+                denominator,
+                (unsigned)akao->current_beat + 1u,
+                akao->measure);
+        } else {
+            snprintf(line, line_size,
+                "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%04lX(%7.3f) %u/%u beat:%02u bar:%04u",
+                active_count,
+                attack_count,
+                decay_count,
+                sustain_count,
+                release_count,
+                core_state->reverb_l,
+                core_state->reverb_r,
+                noise_hz,
+                (unsigned long)akao->tempo,
+                psf1_tempo_bpm(
+                    akao->tempo, akao->early_format, akao->driver_type),
+                akao->beats_per_measure,
+                denominator,
+                (unsigned)akao->current_beat + 1u,
+                akao->measure);
+        }
     } else {
-        (void)psf_version;
         snprintf(line, line_size,
             "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz",
             active_count,
@@ -18061,6 +18657,7 @@ static void active_header_logical_point(
 static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core, unsigned *out_side)
 {
     Spu2LogLiveState live;
+    Psf1AkaoPlaybackState akao;
     uint8_t psf_version;
     int char_width;
     int line_height;
@@ -18069,7 +18666,6 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
     int rel_x;
     unsigned core;
     char line[256];
-    const char *alignment_line;
     const char *marker;
     const char *slash;
     int left_index;
@@ -18082,6 +18678,7 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
 
     lock_state(state);
     live = state->live;
+    akao = state->akao;
     psf_version = state->psf_version;
     unlock_state(state);
 
@@ -18094,7 +18691,7 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
 
     if (psf_version == 0x01u) {
         core = 0;
-        panel_x = CORE0_X;
+        panel_x = player_core_panel_x(hwnd, state, psf_version, core);
     } else if (mouse_x >= CORE1_X) {
         core = 1;
         panel_x = CORE1_X;
@@ -18106,7 +18703,9 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
         return 0;
     }
 
-    format_core_header_line(&live, core, psf_version, psf_version != 0x01u, line, sizeof(line));
+    format_core_header_line(
+        &live, core, psf_version, psf_version != 0x01u,
+        &akao, line, sizeof(line));
     marker = strstr(line, "rv:0x");
     if (marker == NULL) {
         return 0;
@@ -18118,17 +18717,8 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
 
     char_width = get_player_display_char_width(hwnd);
     header_x = panel_x;
-    alignment_line = line;
-    if (psf_version == 0x01u && IsZoomed(hwnd)) {
-        if (normalize_psf1_display_mode(state->psf1_display_mode) ==
-            PSF1_DISPLAY_VALUES) {
-            alignment_line = g_psf1_values_fixed_header;
-        }
-        header_x += (CORE_PANEL_WIDTH -
-            (int)strlen(alignment_line) * char_width) / 2;
-    } else if (psf_version != 0x01u) {
-        header_x += COL_TEXT_X;
-    }
+    header_x += (CORE_PANEL_WIDTH -
+        (int)strlen(line) * char_width) / 2;
     rel_x = (mouse_x - header_x) / char_width;
     marker_index = (int)(marker - line);
     left_index = (int)((marker - line) + 5);
@@ -18154,6 +18744,7 @@ static int hit_test_core_reverb_value(HWND hwnd, PlayerState *state, int mouse_x
 static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core)
 {
     Spu2LogLiveState live;
+    Psf1AkaoPlaybackState akao;
     uint8_t psf_version;
     int char_width;
     int line_height;
@@ -18162,7 +18753,6 @@ static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mo
     int rel_x;
     unsigned core;
     char line[256];
-    const char *alignment_line;
     const char *marker;
     int value_index;
 
@@ -18172,6 +18762,7 @@ static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mo
 
     lock_state(state);
     live = state->live;
+    akao = state->akao;
     psf_version = state->psf_version;
     unlock_state(state);
 
@@ -18184,7 +18775,7 @@ static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mo
 
     if (psf_version == 0x01u) {
         core = 0;
-        panel_x = CORE0_X;
+        panel_x = player_core_panel_x(hwnd, state, psf_version, core);
     } else if (mouse_x >= CORE1_X) {
         core = 1;
         panel_x = CORE1_X;
@@ -18196,7 +18787,9 @@ static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mo
         return 0;
     }
 
-    format_core_header_line(&live, core, psf_version, psf_version != 0x01u, line, sizeof(line));
+    format_core_header_line(
+        &live, core, psf_version, psf_version != 0x01u,
+        &akao, line, sizeof(line));
     marker = strstr(line, "nclk:");
     if (marker == NULL) {
         return 0;
@@ -18204,17 +18797,8 @@ static int hit_test_core_noise_clock_value(HWND hwnd, PlayerState *state, int mo
 
     char_width = get_player_display_char_width(hwnd);
     header_x = panel_x;
-    alignment_line = line;
-    if (psf_version == 0x01u && IsZoomed(hwnd)) {
-        if (normalize_psf1_display_mode(state->psf1_display_mode) ==
-            PSF1_DISPLAY_VALUES) {
-            alignment_line = g_psf1_values_fixed_header;
-        }
-        header_x += (CORE_PANEL_WIDTH -
-            (int)strlen(alignment_line) * char_width) / 2;
-    } else if (psf_version != 0x01u) {
-        header_x += COL_TEXT_X;
-    }
+    header_x += (CORE_PANEL_WIDTH -
+        (int)strlen(line) * char_width) / 2;
     rel_x = (mouse_x - header_x) / char_width;
     value_index = (int)(marker - line) + (int)strlen("nclk:");
     if (rel_x >= value_index && rel_x < value_index + 7) {
@@ -18269,6 +18853,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         HMENU volume_menu = CreatePopupMenu();
         HMENU performance_menu = CreatePopupMenu();
         HMENU theme_menu = CreatePopupMenu();
+        HMENU keyboard_menu = CreatePopupMenu();
         HMENU help_menu = CreatePopupMenu();
         unsigned speed_index;
         unsigned volume_percent;
@@ -18297,12 +18882,22 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         append_darkable_menu_popup(settings_menu, volume_menu, "Volume");
         append_darkable_menu_item(settings_menu, IDM_TAG_FADE_ENABLED, "Fade at tag time");
         append_darkable_menu_separator(settings_menu);
-        append_darkable_menu_item(settings_menu, IDM_KEYBOARD, "Keyboard");
-        append_darkable_menu_item(settings_menu, IDM_PLAYBACK_ONLY, "Playback only");
         append_darkable_menu_item(settings_menu, IDM_TIMBRE_SCAN, "Samples Scan");
         append_darkable_menu_item(settings_menu, IDM_DEBUG_EDIT_CONTROLS, "Debug");
         append_darkable_menu_item(settings_menu, IDM_FRAME_ADVANCE, "Frame Advance");
         append_darkable_menu_separator(settings_menu);
+        append_darkable_menu_item(settings_menu, IDM_PLAYBACK_ONLY, "Playback Only");
+        append_darkable_menu_item(
+            keyboard_menu, IDM_KEYBOARD_VALUES, "Values");
+        append_darkable_menu_item(
+            keyboard_menu, IDM_KEYBOARD_VALUES_AND_KEYS,
+            "Values + Keyboard");
+        append_darkable_menu_item(
+            keyboard_menu, IDM_KEYBOARD_KEYS_ONLY, "Keyboard Only");
+        state->keyboard_parent_menu = settings_menu;
+        state->keyboard_submenu = keyboard_menu;
+        state->keyboard_parent_position = (UINT)GetMenuItemCount(settings_menu);
+        append_darkable_menu_popup(settings_menu, keyboard_menu, "Keyboard");
         append_darkable_menu_item(settings_menu, IDM_FONT_SELECT, "Font...");
         append_darkable_menu_item(theme_menu, IDM_THEME_SYSTEM, "System");
         append_darkable_menu_item(theme_menu, IDM_THEME_LIGHT, "Light");
@@ -18354,20 +18949,20 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             184, 4, 54, 20, hwnd, (HMENU)(UINT_PTR)IDC_STOP, NULL, NULL);
         state->speed_slider = CreateWindowA(TRACKBAR_CLASSA, "",
             WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
-            252, 1, 136, 26, hwnd, (HMENU)(UINT_PTR)IDC_SPEED, NULL, NULL);
-        state->speed_label = CreateWindowA("STATIC", "Speed 100%",
-            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTERIMAGE,
-            394, 6, 94, 16, hwnd, (HMENU)(UINT_PTR)IDC_SPEED_LABEL, NULL, NULL);
-        state->volume_label = CreateWindowA("STATIC", "Vol 100%",
-            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTERIMAGE,
-            492, 6, 68, 16, hwnd, (HMENU)(UINT_PTR)IDC_VOLUME_LABEL, NULL, NULL);
+            252, 1, 128, 26, hwnd, (HMENU)(UINT_PTR)IDC_SPEED, NULL, NULL);
+        state->speed_label = CreateWindowA("STATIC", "Speed",
+            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_OWNERDRAW,
+            386, 6, 94, 16, hwnd, (HMENU)(UINT_PTR)IDC_SPEED_LABEL, NULL, NULL);
+        state->volume_label = CreateWindowA("STATIC", "Vol",
+            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_OWNERDRAW,
+            484, 6, 68, 16, hwnd, (HMENU)(UINT_PTR)IDC_VOLUME_LABEL, NULL, NULL);
         state->main_check = CreateWindowA("BUTTON", "Main", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            564, 4, 58, 20, hwnd, (HMENU)(UINT_PTR)IDC_MAIN_CHECK, NULL, NULL);
+            556, 4, 58, 20, hwnd, (HMENU)(UINT_PTR)IDC_MAIN_CHECK, NULL, NULL);
         state->reverb_check = CreateWindowA("BUTTON", "Reverb", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            626, 4, 70, 20, hwnd, (HMENU)(UINT_PTR)IDC_REVERB_CHECK, NULL, NULL);
+            618, 4, 70, 20, hwnd, (HMENU)(UINT_PTR)IDC_REVERB_CHECK, NULL, NULL);
         state->time_label = CreateWindowA("STATIC", "00:00.0 / --:--.-",
             WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTERIMAGE,
-            702, 6, TIME_LABEL_MIN_WIDTH, 16,
+            694, 6, TIME_LABEL_MIN_WIDTH, 16,
             hwnd, (HMENU)(UINT_PTR)IDC_TIME_LABEL, NULL, NULL);
         state->voice_scrollbar = CreateWindowA("SCROLLBAR", "",
             WS_CHILD | SBS_VERT,
@@ -18479,6 +19074,9 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         break;
     case WM_DRAWITEM:
         if (draw_owner_menu_item(lparam, state)) {
+            return TRUE;
+        }
+        if (draw_header_percent_label(lparam, state)) {
             return TRUE;
         }
         if (draw_owner_button(lparam, state)) {
@@ -18648,8 +19246,18 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             toggle_timbre_scan_mode(hwnd, state);
             return 0;
         }
-        if (state != NULL && LOWORD(wparam) == IDM_KEYBOARD) {
-            cycle_psf1_display_mode(hwnd, state);
+        if (state != NULL && LOWORD(wparam) == IDM_KEYBOARD_VALUES) {
+            set_psf1_display_mode(hwnd, state, PSF1_DISPLAY_VALUES);
+            return 0;
+        }
+        if (state != NULL && LOWORD(wparam) ==
+                IDM_KEYBOARD_VALUES_AND_KEYS) {
+            set_psf1_display_mode(
+                hwnd, state, PSF1_DISPLAY_VALUES_KEYBOARD);
+            return 0;
+        }
+        if (state != NULL && LOWORD(wparam) == IDM_KEYBOARD_KEYS_ONLY) {
+            set_psf1_display_mode(hwnd, state, PSF1_DISPLAY_KEYBOARD_ONLY);
             return 0;
         }
         if (state != NULL && LOWORD(wparam) == IDM_FONT_SELECT) {
@@ -19100,6 +19708,32 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             return 0;
         }
         break;
+    case WM_ENTERSIZEMOVE:
+        if (state != NULL && !IsZoomed(hwnd) && !IsIconic(hwnd)) {
+            RECT window_rect;
+            POINT cursor;
+
+            state->window_move_drag_active = 0;
+            if (GetWindowRect(hwnd, &window_rect) && GetCursorPos(&cursor)) {
+                state->window_move_drag_active = 1;
+                state->window_move_cursor_offset_x = cursor.x - window_rect.left;
+                state->window_move_cursor_offset_y = cursor.y - window_rect.top;
+                state->window_move_width = window_rect.right - window_rect.left;
+                state->window_move_height = window_rect.bottom - window_rect.top;
+            }
+        }
+        break;
+    case WM_MOVING:
+        if (state != NULL && !IsZoomed(hwnd) && !IsIconic(hwnd)) {
+            snap_moving_window_to_monitor(state, (RECT *)lparam);
+            return TRUE;
+        }
+        break;
+    case WM_EXITSIZEMOVE:
+        if (state != NULL) {
+            state->window_move_drag_active = 0;
+        }
+        break;
     case WM_SIZE:
         if (wparam == SIZE_MAXIMIZED) {
             if (!g_main_window_was_maximized) {
@@ -19215,7 +19849,8 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
 
                 gauges_only = state->gauge_only_paint_pending &&
                     state->paint_frame_initialized &&
-                    ps.rcPaint.left >= CORE0_X + COL_ENV_BAR_X &&
+                    ps.rcPaint.left >= player_core_panel_x(
+                        hwnd, state, state->psf_version, 0u) + COL_ENV_BAR_X &&
                     ps.rcPaint.top >= voice_top;
                 state->gauge_only_paint_pending = 0;
                 if (saved_dc != 0) {
