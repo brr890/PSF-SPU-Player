@@ -51,6 +51,7 @@
 #define PLAYER_WM_PLAYBACK_ENDED (WM_APP + 3u)
 #define PLAYER_WM_AUDIO_BUFFER_DONE (WM_APP + 4u)
 #define PLAYER_WM_AUDIO_STARTING (WM_APP + 5u)
+#define PLAYER_WM_SEEK_PROGRESS (WM_APP + 6u)
 #define PLAYER_AUDIO_BUFFERS 16u
 #define PLAYER_AUDIO_PREBUFFER_BUFFERS 8u
 #define PLAYER_STARTUP_SILENCE_BUFFERS 3u
@@ -196,8 +197,12 @@
 #define IDC_TIME_LABEL 2010
 #define IDI_APP_ICON 101
 
+#define PLAYER_METER_FONT_FACE "Consolas"
+#define PLAYER_METER_FONT_HEIGHT 14
+#define PLAYER_METER_CHAR_WIDTH 8
+#define PLAYER_FULLSCREEN_NUMBER_GAP 2
 #define COL_TEXT_X 8
-#define COL_ENV_TEXT_X 296
+#define COL_ENV_TEXT_X 292
 #define COL_ENV_BAR_X 330
 #define COL_VOL_BAR_X 510
 #define COL_FLAGS_X 622
@@ -308,6 +313,10 @@ typedef struct PreviewSample {
     uint8_t noise_clock;
     uint8_t loop_enabled;
     uint8_t tuning_attempted;
+    uint8_t *encoded;
+    uint32_t encoded_bytes;
+    uint32_t encoded_loop_offset;
+    uint32_t encoded_end_flags;
     int16_t *pcm;
     uint32_t pcm_frames;
     uint32_t loop_frame;
@@ -369,6 +378,7 @@ typedef struct PlayerState {
     AudioDisplaySnapshot audio_display_snapshots[PLAYER_AUDIO_BUFFERS];
     AudioDisplaySnapshot audible_display_snapshot;
     int audible_display_valid;
+    int suppress_ps1_music_header;
     unsigned audio_queued_buffers;
     unsigned audio_queue_low_water;
     int audio_started;
@@ -399,6 +409,10 @@ typedef struct PlayerState {
     int psf1_keyboard_width;
     HFONT meter_font;
     HFONT meter_bold_font;
+    HFONT meter_number_font;
+    int meter_number_font_height;
+    int meter_number_cell_width;
+    ABC meter_number_metrics[16];
     int meter_line_height;
     int paint_width;
     int paint_height;
@@ -426,9 +440,17 @@ typedef struct PlayerState {
     int ps2_startup_origin_valid;
     uint64_t ps2_startup_origin_sample;
     int timbre_prescanning;
+    Psf2CoreBridge *timbre_scan_core;
     int timbre_list_locked;
     int seek_request;
     uint64_t seek_target_sample;
+    int seek_display_hold_active;
+    int seek_display_release_on_audio_start;
+    uint64_t seek_display_sample_pos;
+    uint64_t seek_display_target_pos;
+    uint32_t seek_display_generation;
+    Psf1AkaoPlaybackState seek_akao_hold;
+    int seek_akao_hold_valid;
     int speed_percent;
     int tab_speed_active;
     int scroll_y;
@@ -1643,9 +1665,8 @@ static void toggle_pause_playback(HWND hwnd, PlayerState *state)
     }
     set_status(state, paused ? "Paused" : "Playing direct");
     update_pause_button_label(state);
-    if (!paused) {
-        state->has_last_output = 0;
-    }
+    /* waveOut resumes the queued PCM; preserve its tail so the next chunk
+       does not introduce a second, mid-stream startup fade. */
     InvalidateRect(hwnd, NULL, TRUE);
 }
 
@@ -1727,6 +1748,13 @@ static void reset_stopped_display(PlayerState *state)
     lock_state(state);
     ZeroMemory(&state->live, sizeof(state->live));
     ZeroMemory(&state->akao, sizeof(state->akao));
+    ZeroMemory(&state->seek_akao_hold, sizeof(state->seek_akao_hold));
+    state->seek_display_hold_active = 0;
+    state->seek_display_release_on_audio_start = 0;
+    state->seek_display_sample_pos = 0;
+    state->seek_display_target_pos = 0;
+    state->seek_display_generation = 0;
+    state->seek_akao_hold_valid = 0;
     state->live.version = SPU2LOG_VERSION;
     state->live.sample_rate = PLAYER_SAMPLE_RATE;
     state->stopped_display = 1;
@@ -2582,6 +2610,82 @@ static int draw_header_percent_label(LPARAM lparam, const PlayerState *state)
     SetTextColor(draw->hDC, old_text);
     if (old_font != NULL && old_font != HGDI_ERROR) {
         SelectObject(draw->hDC, old_font);
+    }
+    return 1;
+}
+
+static int draw_header_time_label(LPARAM lparam, const PlayerState *state)
+{
+    DRAWITEMSTRUCT *draw = (DRAWITEMSTRUCT *)lparam;
+    RECT text_rect;
+    HBRUSH background;
+    HDC paint_dc;
+    HDC buffer_dc = NULL;
+    HBITMAP buffer_bitmap = NULL;
+    HBITMAP old_bitmap = NULL;
+    HFONT font;
+    HFONT old_font = NULL;
+    COLORREF old_text;
+    int old_bk;
+    int width;
+    int height;
+    const char *text;
+
+    if (draw == NULL || state == NULL || draw->CtlType != ODT_STATIC ||
+        draw->CtlID != IDC_TIME_LABEL) {
+        return 0;
+    }
+
+    paint_dc = draw->hDC;
+    text_rect = draw->rcItem;
+    width = draw->rcItem.right - draw->rcItem.left;
+    height = draw->rcItem.bottom - draw->rcItem.top;
+    if (width > 0 && height > 0) {
+        buffer_dc = CreateCompatibleDC(draw->hDC);
+        if (buffer_dc != NULL) {
+            buffer_bitmap = CreateCompatibleBitmap(draw->hDC, width, height);
+            if (buffer_bitmap != NULL) {
+                old_bitmap = (HBITMAP)SelectObject(buffer_dc, buffer_bitmap);
+                if (old_bitmap != NULL && old_bitmap != HGDI_ERROR) {
+                    paint_dc = buffer_dc;
+                    SetRect(&text_rect, 0, 0, width, height);
+                } else {
+                    DeleteObject(buffer_bitmap);
+                    buffer_bitmap = NULL;
+                }
+            }
+        }
+    }
+
+    background = is_dark_theme_active(state) ?
+        (HBRUSH)GetStockObject(BLACK_BRUSH) : GetSysColorBrush(COLOR_BTNFACE);
+    FillRect(paint_dc, &text_rect, background);
+
+    font = (HFONT)SendMessageA(draw->hwndItem, WM_GETFONT, 0, 0);
+    if (font != NULL) {
+        old_font = (HFONT)SelectObject(paint_dc, font);
+    }
+    old_text = SetTextColor(paint_dc,
+        is_dark_theme_active(state) ? RGB(255, 255, 255) : GetSysColor(COLOR_BTNTEXT));
+    old_bk = SetBkMode(paint_dc, TRANSPARENT);
+    text = state->time_label_text[0] != '\0' ?
+        state->time_label_text : "00:00.0 / --:--.-";
+    DrawTextA(paint_dc, text, -1, &text_rect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    SetBkMode(paint_dc, old_bk);
+    SetTextColor(paint_dc, old_text);
+    if (old_font != NULL && old_font != HGDI_ERROR) {
+        SelectObject(paint_dc, old_font);
+    }
+    if (paint_dc == buffer_dc && buffer_bitmap != NULL) {
+        BitBlt(draw->hDC, draw->rcItem.left, draw->rcItem.top,
+            width, height, buffer_dc, 0, 0, SRCCOPY);
+        SelectObject(buffer_dc, old_bitmap);
+        DeleteObject(buffer_bitmap);
+    }
+    if (buffer_dc != NULL) {
+        DeleteDC(buffer_dc);
     }
     return 1;
 }
@@ -3521,6 +3625,8 @@ static void preview_free_samples_locked(PlayerState *state)
     }
     preview_stop_all_locked(state);
     for (i = 0; i < state->preview_sample_count; ++i) {
+        free(state->preview_samples[i].encoded);
+        state->preview_samples[i].encoded = NULL;
         free(state->preview_samples[i].pcm);
         state->preview_samples[i].pcm = NULL;
     }
@@ -3634,15 +3740,19 @@ static void preview_cache_sample_locked(
     uint32_t loop_addr)
 {
     PreviewSample *sample;
+    Psf2CoreBridge *sample_core;
     uint8_t *encoded;
     uint32_t length;
     uint32_t loop_offset = 0;
     uint32_t end_flags = 0;
-    uint32_t decoded_frames = 0;
-    uint32_t loop_frame = 0;
     int found;
 
-    if (state == NULL || voice == NULL || state->core == NULL || key == 0) {
+    if (state == NULL || voice == NULL || key == 0) {
+        return;
+    }
+    sample_core = state->timbre_prescanning ?
+        state->timbre_scan_core : state->core;
+    if (sample_core == NULL) {
         return;
     }
     found = preview_find_sample_locked(state, key);
@@ -3661,7 +3771,7 @@ static void preview_cache_sample_locked(
         return;
     }
     length = psf2log_copy_imported_sample(
-        state->core,
+        sample_core,
         voice->ssa & 0x000fffffu,
         loop_addr,
         NULL,
@@ -3676,7 +3786,7 @@ static void preview_cache_sample_locked(
         return;
     }
     if (psf2log_copy_imported_sample(
-            state->core,
+            sample_core,
             voice->ssa & 0x000fffffu,
             loop_addr,
             encoded,
@@ -3687,18 +3797,10 @@ static void preview_cache_sample_locked(
         return;
     }
     sample = &state->preview_samples[state->preview_sample_count];
-    sample->pcm = preview_decode_adpcm(
-        encoded,
-        length,
-        loop_offset,
-        &decoded_frames,
-        &loop_frame);
-    free(encoded);
-    if (sample->pcm == NULL || decoded_frames == 0) {
-        free(sample->pcm);
-        ZeroMemory(sample, sizeof(*sample));
-        return;
-    }
+    sample->encoded = encoded;
+    sample->encoded_bytes = length;
+    sample->encoded_loop_offset = loop_offset;
+    sample->encoded_end_flags = end_flags;
     sample->key = key;
     sample->ssa = voice->ssa & 0x000fffffu;
     sample->lsa = loop_addr;
@@ -3710,10 +3812,46 @@ static void preview_cache_sample_locked(
     sample->pitch_min = voice->pitch;
     sample->pitch_max = voice->pitch;
     sample->noise_clock = voice->noise_clock;
+    state->preview_sample_count++;
+}
+
+static int preview_decode_sample_locked(PreviewSample *sample)
+{
+    uint32_t decoded_frames = 0;
+    uint32_t loop_frame = 0;
+    int16_t *pcm;
+
+    if (sample == NULL) {
+        return 0;
+    }
+    if (sample->pcm != NULL && sample->pcm_frames != 0) {
+        return 1;
+    }
+    if (sample->encoded == NULL || sample->encoded_bytes < 16u) {
+        return 0;
+    }
+
+    pcm = preview_decode_adpcm(
+        sample->encoded,
+        sample->encoded_bytes,
+        sample->encoded_loop_offset,
+        &decoded_frames,
+        &loop_frame);
+    if (pcm == NULL || decoded_frames == 0) {
+        free(pcm);
+        return 0;
+    }
+    sample->pcm = pcm;
     sample->pcm_frames = decoded_frames;
     sample->loop_frame = loop_frame < decoded_frames ? loop_frame : 0;
-    sample->loop_enabled = ((end_flags & 7u) == 3u && sample->loop_frame < decoded_frames) ? 1u : 0u;
-    state->preview_sample_count++;
+    sample->loop_enabled =
+        ((sample->encoded_end_flags & 7u) == 3u && sample->loop_frame < decoded_frames) ? 1u : 0u;
+    free(sample->encoded);
+    sample->encoded = NULL;
+    sample->encoded_bytes = 0;
+    sample->encoded_loop_offset = 0;
+    sample->encoded_end_flags = 0;
+    return 1;
 }
 
 static void reset_timbre_list_locked(PlayerState *state)
@@ -7832,6 +7970,17 @@ static double psf1_tempo_bpm(
     return (double)sequence_tempo / divisor;
 }
 
+static int psf1_music_header_state_supported(
+    const Psf1AkaoPlaybackState *state)
+{
+    if (state == NULL || !state->detected) {
+        return 0;
+    }
+    return state->driver_type == PSF1_MUSIC_DRIVER_AKAO_EARLY ||
+        state->driver_type == PSF1_MUSIC_DRIVER_AKAO_LATE ||
+        state->driver_type == PSF1_MUSIC_DRIVER_SONY_SEQ;
+}
+
 static uint32_t effective_voice_flags(
     uint32_t flags,
     uint32_t reverb_on_mask,
@@ -9081,6 +9230,26 @@ static void read_psf_title_tags(const char *path, char *game, size_t game_size, 
     free(tags);
 }
 
+static int is_ff1_game_tag(const char *game)
+{
+    static const char *const names[] = {
+        "Final Fantasy Origins - FF1",
+        "Final Fantasy I",
+        "Final Fantasy 1"
+    };
+    unsigned i;
+
+    if (game == NULL || game[0] == '\0') {
+        return 0;
+    }
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        if (lstrcmpiA(game, names[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static uint8_t read_psf_version(const char *path)
 {
     PsfFileInfo info;
@@ -9725,6 +9894,109 @@ static int control_text_width(
         hdc, text, scale_milli, fallback_width);
 }
 
+static int measure_time_label_width(
+    const PlayerState *state,
+    const PlayerScaleLayout *layout)
+{
+    HDC hdc;
+    HFONT font;
+    HFONT previous_font = NULL;
+    SIZE text_size;
+    char stable_text[80];
+    int width = TIME_LABEL_MIN_WIDTH;
+    const char *text;
+
+    if (state == NULL || state->time_label == NULL || layout == NULL) {
+        return width;
+    }
+    text = state->time_label_text[0] != '\0' ?
+        state->time_label_text : "00:00.0 / --:--.-";
+    hdc = GetDC(state->time_label);
+    if (hdc == NULL) {
+        return width;
+    }
+    font = (HFONT)SendMessageA(state->time_label, WM_GETFONT, 0, 0);
+    if (font != NULL) {
+        previous_font = (HFONT)SelectObject(hdc, font);
+    }
+    if (state->hwnd != NULL && IsZoomed(state->hwnd)) {
+        SIZE digit_size;
+        int widest_digit = '0';
+        int widest_width = 0;
+        unsigned index;
+
+        for (index = 0; index < 10u; ++index) {
+            char digit = (char)('0' + index);
+
+            if (GetTextExtentPoint32A(hdc, &digit, 1, &digit_size) &&
+                digit_size.cx > widest_width) {
+                widest_width = digit_size.cx;
+                widest_digit = digit;
+            }
+        }
+        snprintf(stable_text, sizeof(stable_text), "%s", text);
+        for (index = 0; stable_text[index] != '\0'; ++index) {
+            if (stable_text[index] >= '0' && stable_text[index] <= '9') {
+                stable_text[index] = (char)widest_digit;
+            }
+        }
+        text = stable_text;
+    }
+    if (GetTextExtentPoint32A(hdc, text, (int)strlen(text), &text_size)) {
+        width = layout->scale_milli > 0 ?
+            ((text_size.cx + 2) * 1000 + layout->scale_milli / 2) /
+                layout->scale_milli : text_size.cx + 2;
+        if (width < 1) {
+            width = 1;
+        }
+    }
+    if (previous_font != NULL && previous_font != HGDI_ERROR) {
+        SelectObject(hdc, previous_font);
+    }
+    ReleaseDC(state->time_label, hdc);
+    return width;
+}
+
+static void position_time_label(
+    PlayerState *state,
+    const PlayerScaleLayout *layout,
+    int width)
+{
+    RECT previous_rect;
+    RECT next_rect;
+    RECT uncovered_rect;
+    int previous_valid;
+    int x;
+    int y;
+    int height;
+
+    if (state == NULL || state->time_label == NULL || layout == NULL) {
+        return;
+    }
+    x = state->time_label_base_x > 0 ? state->time_label_base_x : 694;
+    y = state->time_label_base_height > 0 ? state->time_label_base_y : 6;
+    height = state->time_label_base_height > 0 ?
+        state->time_label_base_height : 16;
+    next_rect.left = layout->dest_x + scale_player_value(x, layout->scale_milli);
+    next_rect.top = layout->dest_y + scale_player_value(y, layout->scale_milli);
+    next_rect.right = next_rect.left + scale_player_value(width, layout->scale_milli);
+    next_rect.bottom = next_rect.top + scale_player_value(height, layout->scale_milli);
+    previous_valid = GetWindowRect(state->time_label, &previous_rect);
+    if (previous_valid) {
+        MapWindowPoints(NULL, state->hwnd, (POINT *)&previous_rect, 2);
+        if (EqualRect(&previous_rect, &next_rect)) {
+            return;
+        }
+    }
+    if (SetWindowPos(state->time_label, NULL, next_rect.left, next_rect.top,
+            next_rect.right - next_rect.left, next_rect.bottom - next_rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW) && previous_valid &&
+        SubtractRect(&uncovered_rect, &previous_rect, &next_rect)) {
+        /* A shrinking owner-drawn label must also clear its old background. */
+        InvalidateRect(state->hwnd, &uncovered_rect, FALSE);
+    }
+}
+
 static void layout_player_controls(HWND hwnd, PlayerState *state)
 {
     PlayerScaleLayout layout;
@@ -9743,9 +10015,51 @@ static void layout_player_controls(HWND hwnd, PlayerState *state)
     if (control_font != NULL) {
         apply_ui_font_to_window(hwnd, control_font);
     }
-    time_width = state->time_label_base_width > 0 ?
-        state->time_label_base_width : TIME_LABEL_MIN_WIDTH;
+    time_width = measure_time_label_width(state, &layout);
+    state->time_label_base_width = time_width;
     if (state->ui_font_size <= 12 || state->psf_version == 0x02u) {
+        int speed_width = 94;
+        int volume_width = 68;
+        int reverb_width = 70;
+        int speed_x;
+        int volume_x;
+        int main_x;
+        int reverb_x;
+
+        if (state->ui_font_size == 12 || state->ui_font_size == 13) {
+            HDC hdc = GetDC(hwnd);
+            HFONT old_font = NULL;
+            int required_width;
+
+            if (hdc != NULL && control_font != NULL) {
+                old_font = (HFONT)SelectObject(hdc, control_font);
+            }
+            required_width = logical_text_width(
+                hdc, "Speed", layout.scale_milli, 38) +
+                logical_text_width(hdc, "200%", layout.scale_milli, 38) + 6;
+            if (speed_width < required_width) {
+                speed_width = required_width;
+            }
+            required_width = logical_text_width(
+                hdc, "Vol", layout.scale_milli, 22) +
+                logical_text_width(hdc, "100%", layout.scale_milli, 38) + 6;
+            if (volume_width < required_width) {
+                volume_width = required_width;
+            }
+            if (state->ui_font_size == 12) {
+                reverb_width = logical_text_width(
+                    hdc, "Reverb", layout.scale_milli, 50) + 22;
+                if (reverb_width < 70) {
+                    reverb_width = 70;
+                }
+            }
+            if (old_font != NULL && old_font != HGDI_ERROR) {
+                SelectObject(hdc, old_font);
+            }
+            if (hdc != NULL) {
+                ReleaseDC(hwnd, hdc);
+            }
+        }
         spacing_step = IsZoomed(hwnd) ? 2 : 0;
         position_scaled_control(state->open_button, &layout, 6, 4, 54, 20);
         position_scaled_control(state->play_button, &layout,
@@ -9756,20 +10070,23 @@ static void layout_player_controls(HWND hwnd, PlayerState *state)
             184 + spacing_step * 3, 4, 54, 20);
         position_scaled_control(state->speed_slider, &layout,
             252 + spacing_step * 4, 1, 128, 26);
+        speed_x = 386 + spacing_step * 5;
+        volume_x = speed_x + speed_width + 4 + spacing_step;
+        main_x = volume_x + volume_width + 4 + spacing_step;
+        reverb_x = main_x + 58 + 4 + spacing_step;
         position_scaled_control(state->speed_label, &layout,
-            386 + spacing_step * 5, 6, 94, 16);
+            speed_x, 6, speed_width, 16);
         position_scaled_control(state->volume_label, &layout,
-            484 + spacing_step * 6, 6, 68, 16);
+            volume_x, 6, volume_width, 16);
         position_scaled_control(state->main_check, &layout,
-            556 + spacing_step * 7, 4, 58, 20);
+            main_x, 4, 58, 20);
         position_scaled_control(state->reverb_check, &layout,
-            618 + spacing_step * 8, 4, 70, 20);
-        state->time_label_base_x = 694 + spacing_step * 9;
+            reverb_x, 4, reverb_width, 20);
+        state->time_label_base_x =
+            reverb_x + reverb_width + 6 + spacing_step;
         state->time_label_base_y = 6;
         state->time_label_base_height = 16;
-        position_scaled_control(state->time_label, &layout,
-            state->time_label_base_x, state->time_label_base_y,
-            time_width, state->time_label_base_height);
+        position_time_label(state, &layout, time_width);
     } else {
         HDC hdc = GetDC(hwnd);
         HFONT old_font = NULL;
@@ -9783,6 +10100,8 @@ static void layout_player_controls(HWND hwnd, PlayerState *state)
         int volume_width;
         int speed_value_width;
         int volume_value_width;
+        int speed_min_width;
+        int volume_min_width;
         int main_width;
         int reverb_width;
         int fixed_width;
@@ -9826,13 +10145,24 @@ static void layout_player_controls(HWND hwnd, PlayerState *state)
         speed_value_width = logical_text_width(
             hdc, "200%", layout.scale_milli, 38) + 2;
         volume_value_width = speed_value_width;
+        speed_min_width = speed_value_width;
+        volume_min_width = volume_value_width;
+        if (state->ui_font_size == 13) {
+            speed_min_width = logical_text_width(
+                hdc, "Speed", layout.scale_milli, 38) + speed_value_width + 4;
+            volume_min_width = logical_text_width(
+                hdc, "Vol", layout.scale_milli, 22) + volume_value_width + 4;
+            if (speed_width < speed_min_width) {
+                speed_width = speed_min_width;
+            }
+            if (volume_width < volume_min_width) {
+                volume_width = volume_min_width;
+            }
+        }
         main_width = control_text_width(
             hdc, state->main_check, "Main", layout.scale_milli, 38) + 20;
         reverb_width = control_text_width(
             hdc, state->reverb_check, "Reverb", layout.scale_milli, 50) + 20;
-        time_width = control_text_width(
-            hdc, state->time_label, "00:00.0 / --:--.-",
-            layout.scale_milli, TIME_LABEL_MIN_WIDTH) + 2;
         if (old_font != NULL && old_font != HGDI_ERROR) {
             SelectObject(hdc, old_font);
         }
@@ -9855,8 +10185,10 @@ static void layout_player_controls(HWND hwnd, PlayerState *state)
             play_width -= 6;
             pause_width -= 6;
             stop_width -= 6;
-            speed_width -= 3;
-            volume_width -= 3;
+            if (state->ui_font_size != 13) {
+                speed_width -= 3;
+                volume_width -= 3;
+            }
             main_width -= 4;
             reverb_width -= 4;
             fixed_width = open_width + play_width + pause_width + stop_width +
@@ -9865,14 +10197,22 @@ static void layout_player_controls(HWND hwnd, PlayerState *state)
         }
         if (fixed_width + slider_width > inner_width) {
             int overflow = fixed_width + slider_width - inner_width;
-            int reducible = speed_width - speed_value_width;
+            int reducible = speed_width - speed_min_width;
             int reduction = overflow < reducible ? overflow : reducible;
 
+            if (reducible < 0) {
+                reducible = 0;
+                reduction = 0;
+            }
             speed_width -= reduction;
             overflow -= reduction;
             if (overflow > 0) {
-                reducible = volume_width - volume_value_width;
+                reducible = volume_width - volume_min_width;
                 reduction = overflow < reducible ? overflow : reducible;
+                if (reducible < 0) {
+                    reducible = 0;
+                    reduction = 0;
+                }
                 volume_width -= reduction;
             }
             fixed_width = open_width + play_width + pause_width + stop_width +
@@ -9938,12 +10278,36 @@ static void layout_player_controls(HWND hwnd, PlayerState *state)
         state->time_label_base_y = label_y;
         state->time_label_base_height = label_height;
         state->time_label_base_width = time_width;
-        position_scaled_control(state->time_label, &layout,
-            state->time_label_base_x, state->time_label_base_y,
-            time_width, state->time_label_base_height);
+        position_time_label(state, &layout, time_width);
     }
     RedrawWindow(hwnd, NULL, NULL,
-        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+static void redraw_player_header_controls(const PlayerState *state)
+{
+    HWND controls[10];
+    unsigned i;
+
+    if (state == NULL) {
+        return;
+    }
+    controls[0] = state->open_button;
+    controls[1] = state->play_button;
+    controls[2] = state->pause_button;
+    controls[3] = state->stop_button;
+    controls[4] = state->speed_slider;
+    controls[5] = state->speed_label;
+    controls[6] = state->volume_label;
+    controls[7] = state->main_check;
+    controls[8] = state->reverb_check;
+    controls[9] = state->time_label;
+    for (i = 0; i < sizeof(controls) / sizeof(controls[0]); ++i) {
+        if (controls[i] != NULL && IsWindowVisible(controls[i])) {
+            RedrawWindow(controls[i], NULL, NULL,
+                RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+        }
+    }
 }
 
 static void apply_psf_window_mode(HWND hwnd, const PlayerState *state, uint8_t psf_version)
@@ -10058,12 +10422,14 @@ static void cycle_psf1_display_mode(HWND hwnd, PlayerState *state)
     set_psf1_display_mode(hwnd, state, display_mode);
 }
 
-static void update_time_label(PlayerState *state)
+static void update_time_label_position(
+    PlayerState *state,
+    uint64_t sample_pos,
+    int force_update)
 {
     char elapsed[32];
     char total[32];
     char label[80];
-    uint64_t sample_pos;
     uint64_t total_samples;
     uint64_t displayed_tenths;
 
@@ -10072,19 +10438,10 @@ static void update_time_label(PlayerState *state)
     }
 
     lock_state(state);
-    if (state->frame_advance && state->frame_live_valid) {
-        sample_pos = timeline_sample_at_locked(state, state->frame_live.last_sample_pos);
-    } else if (state->audible_display_valid) {
-        sample_pos = state->audible_display_snapshot.timeline_sample_pos;
-    } else if (state->playing) {
-        sample_pos = 0;
-    } else {
-        sample_pos = timeline_sample_at_locked(state, state->live.last_sample_pos);
-    }
     total_samples = state->total_samples;
     displayed_tenths = ((sample_pos * 10u) + (PLAYER_SAMPLE_RATE / 2u)) /
         PLAYER_SAMPLE_RATE;
-    if (state->time_label_cache_valid &&
+    if (!force_update && state->time_label_cache_valid &&
         state->time_label_tenths == displayed_tenths &&
         state->time_label_total_samples == total_samples) {
         unlock_state(state);
@@ -10103,61 +10460,42 @@ static void update_time_label(PlayerState *state)
         snprintf(label, sizeof(label), "%s / --:--.-", elapsed);
     }
     if (strcmp(state->time_label_text, label) != 0) {
-        HDC hdc;
-        HFONT label_font;
-        HGDIOBJ previous_font = NULL;
-        SIZE text_size;
-        int measured_width = TIME_LABEL_MIN_WIDTH;
-        int relayout_needed = 0;
+        PlayerScaleLayout layout;
 
         snprintf(state->time_label_text, sizeof(state->time_label_text), "%s", label);
-        hdc = GetDC(state->time_label);
-        if (hdc != NULL) {
-            label_font = (HFONT)SendMessageA(
-                state->time_label, WM_GETFONT, 0, 0);
-            if (label_font != NULL) {
-                previous_font = SelectObject(hdc, label_font);
-            }
-            if (GetTextExtentPoint32A(hdc, label, (int)strlen(label), &text_size)) {
-                PlayerScaleLayout layout;
-
-                get_player_chrome_scale_layout(
-                    state->hwnd, state, &layout);
-                measured_width = layout.scale_milli > 0 ?
-                    ((text_size.cx + 2) * 1000 + layout.scale_milli / 2) /
-                        layout.scale_milli :
-                    text_size.cx + 2;
-                if (measured_width < 1) {
-                    measured_width = 1;
-                }
-                if (measured_width > state->time_label_base_width) {
-                    state->time_label_base_width = measured_width;
-                    relayout_needed = state->ui_font_size > 12;
-                }
-                if (!relayout_needed) {
-                    position_scaled_control(state->time_label, &layout,
-                        state->time_label_base_x > 0 ?
-                            state->time_label_base_x :
-                            694 + (IsZoomed(state->hwnd) ? 18 : 0),
-                        state->time_label_base_height > 0 ?
-                            state->time_label_base_y : 6,
-                        state->time_label_base_width,
-                        state->time_label_base_height > 0 ?
-                            state->time_label_base_height : 16);
-                }
-            }
-            if (previous_font != NULL && previous_font != HGDI_ERROR) {
-                SelectObject(hdc, previous_font);
-            }
-            ReleaseDC(state->time_label, hdc);
-        }
-        SetWindowTextA(state->time_label, label);
-        if (relayout_needed) {
-            layout_player_controls(state->hwnd, state);
-        }
+        get_player_chrome_scale_layout(state->hwnd, state, &layout);
+        state->time_label_base_width = measure_time_label_width(state, &layout);
+        position_time_label(state, &layout, state->time_label_base_width);
         RedrawWindow(state->time_label, NULL, NULL,
-            RDW_INVALIDATE | RDW_ERASE);
+            RDW_INVALIDATE | RDW_NOERASE |
+            (GetCurrentThreadId() == GetWindowThreadProcessId(
+                state->time_label, NULL) ? RDW_UPDATENOW : 0));
     }
+}
+
+static void update_time_label(PlayerState *state)
+{
+    uint64_t sample_pos;
+
+    if (state == NULL || state->time_label == NULL) {
+        return;
+    }
+
+    lock_state(state);
+    if (state->seek_display_hold_active) {
+        sample_pos = state->seek_display_sample_pos;
+    } else if (state->frame_advance && state->frame_live_valid) {
+        sample_pos = timeline_sample_at_locked(state, state->frame_live.last_sample_pos);
+    } else if (state->audible_display_valid) {
+        sample_pos = state->audible_display_snapshot.timeline_sample_pos;
+    } else if (state->playing) {
+        sample_pos = timeline_sample_at_locked(state, state->live.last_sample_pos);
+    } else {
+        sample_pos = timeline_sample_at_locked(state, state->live.last_sample_pos);
+    }
+    unlock_state(state);
+
+    update_time_label_position(state, sample_pos, 0);
 }
 
 static void draw_bar(
@@ -10738,22 +11076,14 @@ static Spu2LogResult player_voice_snapshot(
     merged = *snapshot;
     merged.flags = (merged.flags & ~0x3f00u) | ((((snapshot->flags & 0x3f00u) >> 8) & NOISE_CLOCK_MAX) << 8);
     lock_state(state);
-    if (state->startup_silence_trim) {
-        unlock_state(state);
-        return SPU2LOG_OK;
-    }
     if (state->timbre_prescanning) {
-        if (state->psf_version == 0x02u && !state->ps2_startup_origin_valid &&
-            merged.active && merged.ssa != 0 &&
-            (merged.adsr1 != 0 || merged.adsr2 != 0)) {
-            state->ps2_startup_origin_sample = sample_pos;
-            state->ps2_startup_origin_valid = 1;
-        }
         update_timbre_list = timbre_list_add_voice_locked(state, &merged);
         unlock_state(state);
-        if (update_timbre_list && state->timbre_hwnd != NULL) {
-            PostMessageA(state->hwnd, PLAYER_WM_WORKER_UPDATE, 1, 0);
-        }
+        (void)update_timbre_list;
+        return SPU2LOG_OK;
+    }
+    if (state->startup_silence_trim) {
+        unlock_state(state);
         return SPU2LOG_OK;
     }
     if (state->seek_discarding) {
@@ -10979,10 +11309,25 @@ static void capture_audio_display_snapshot(PlayerState *state, unsigned index, u
     if (state->core != NULL) {
         (void)psf2log_get_imported_ps1_akao_state(state->core, &akao);
     }
+    if (state->suppress_ps1_music_header) {
+        ZeroMemory(&akao, sizeof(akao));
+    }
+    if (!psf1_music_header_state_supported(&akao)) {
+        ZeroMemory(&akao, sizeof(akao));
+    }
     snapshot = &state->audio_display_snapshots[index];
     lock_state(state);
+    if (!psf1_music_header_state_supported(&akao) &&
+        state->seek_akao_hold_valid) {
+        akao = state->seek_akao_hold;
+    } else if (psf1_music_header_state_supported(&akao) &&
+        state->audio_started &&
+        !state->seek_display_hold_active) {
+        ZeroMemory(&state->seek_akao_hold, sizeof(state->seek_akao_hold));
+        state->seek_akao_hold_valid = 0;
+    }
     state->akao = akao;
-    if (akao.detected) {
+    if (psf1_music_header_state_supported(&akao)) {
         for (queued_index = 0; queued_index < PLAYER_AUDIO_BUFFERS; ++queued_index) {
             if (state->audio_display_snapshots[queued_index].valid &&
                 !state->audio_display_snapshots[queued_index].akao.detected) {
@@ -11047,6 +11392,10 @@ static void sync_audible_display_to_queue(PlayerState *state)
         lock_state(state);
         state->audible_display_snapshot = state->audio_display_snapshots[oldest];
         state->audible_display_valid = 1;
+        if (state->seek_display_release_on_audio_start) {
+            state->seek_display_hold_active = 0;
+            state->seek_display_release_on_audio_start = 0;
+        }
         unlock_state(state);
     }
 }
@@ -13503,6 +13852,14 @@ static DWORD WINAPI playback_thread_proc(void *user)
                         break;
                     }
                 }
+                lock_state(state);
+                state->seek_display_sample_pos =
+                    state->seek_display_target_pos;
+                state->seek_display_release_on_audio_start = 1;
+                unlock_state(state);
+                if (state->hwnd != NULL) {
+                    PostMessageA(state->hwnd, PLAYER_WM_SEEK_PROGRESS, 0, 0);
+                }
                 set_status(state, "Playing direct");
                 continue;
             }
@@ -15167,7 +15524,9 @@ static void show_preview_keyboard(PlayerState *state, unsigned group, int sample
     }
     for (k = first; k < limit; ++k) {
         int cache_index = preview_find_sample_locked(state, state->timbre_list_keys[group][k]);
-        if (cache_index >= 0 && state->preview_selected_sample_count < TIMBRE_SOLO_MAX_KEYS) {
+        if (cache_index >= 0 &&
+            state->preview_selected_sample_count < TIMBRE_SOLO_MAX_KEYS &&
+            preview_decode_sample_locked(&state->preview_samples[cache_index])) {
             preview_prepare_sample_tuning_locked(&state->preview_samples[cache_index]);
             state->preview_selected_samples[state->preview_selected_sample_count++] = (unsigned)cache_index;
         }
@@ -16145,13 +16504,82 @@ static void show_playlist_window(HWND hwnd, PlayerState *state)
     }
 }
 
+static uint64_t interpolate_seek_display_sample(
+    uint64_t start,
+    uint64_t target,
+    uint64_t completed,
+    uint64_t total)
+{
+    long double ratio;
+    long double value;
+
+    if (total == 0 || completed >= total) {
+        return target;
+    }
+    ratio = (long double)completed / (long double)total;
+    value = start <= target ?
+        (long double)start + ((long double)(target - start) * ratio) :
+        (long double)start - ((long double)(start - target) * ratio);
+    return value > 0.0L ? (uint64_t)(value + 0.5L) : 0u;
+}
+
+static void publish_seek_display_progress(
+    PlayerState *state,
+    uint32_t generation,
+    uint64_t start,
+    uint64_t target,
+    uint64_t completed,
+    uint64_t total)
+{
+    uint64_t sample_pos;
+    HWND hwnd;
+    int changed = 0;
+
+    if (state == NULL) {
+        return;
+    }
+    sample_pos = interpolate_seek_display_sample(
+        start, target, completed, total);
+    lock_state(state);
+    if (state->seek_display_hold_active &&
+        state->seek_display_generation == generation) {
+        state->seek_display_sample_pos = sample_pos;
+        changed = 1;
+    }
+    hwnd = state->hwnd;
+    unlock_state(state);
+    if (!changed || hwnd == NULL) {
+        return;
+    }
+    if (GetCurrentThreadId() == GetWindowThreadProcessId(hwnd, NULL)) {
+        update_time_label(state);
+    } else {
+        PostMessageA(hwnd, PLAYER_WM_SEEK_PROGRESS, 0, 0);
+    }
+}
+
 static int fast_forward_core_ex(PlayerState *state, uint64_t frames_to_skip, uint64_t base_sample, int discard_snapshots)
 {
     uint64_t rendered_total = 0;
+    uint64_t display_start = 0;
+    uint64_t display_target = 0;
+    uint64_t display_origin_frames = 0;
+    uint64_t display_total_frames = frames_to_skip;
+    uint32_t display_generation = 0;
     int16_t *discard_pcm;
     int ok = 1;
 
-    if (state == NULL || frames_to_skip == 0) {
+    if (state == NULL) {
+        return 1;
+    }
+    lock_state(state);
+    display_start = state->seek_display_sample_pos;
+    display_target = state->seek_display_target_pos;
+    display_generation = state->seek_display_generation;
+    unlock_state(state);
+    if (frames_to_skip == 0) {
+        publish_seek_display_progress(
+            state, display_generation, display_start, display_target, 1u, 1u);
         return 1;
     }
 
@@ -16195,7 +16623,22 @@ static int fast_forward_core_ex(PlayerState *state, uint64_t frames_to_skip, uin
                 break;
             }
             frames_to_skip = pending_target - base_sample;
+            lock_state(state);
+            display_start = state->seek_display_sample_pos;
+            display_target = state->seek_display_target_pos;
+            display_generation = state->seek_display_generation;
+            unlock_state(state);
+            display_origin_frames = rendered_total;
+            display_total_frames = frames_to_skip > rendered_total ?
+                frames_to_skip - rendered_total : 0u;
             if (rendered_total >= frames_to_skip) {
+                publish_seek_display_progress(
+                    state,
+                    display_generation,
+                    display_start,
+                    display_target,
+                    display_total_frames,
+                    display_total_frames);
                 break;
             }
         }
@@ -16215,6 +16658,13 @@ static int fast_forward_core_ex(PlayerState *state, uint64_t frames_to_skip, uin
             break;
         }
         rendered_total += rendered;
+        publish_seek_display_progress(
+            state,
+            display_generation,
+            display_start,
+            display_target,
+            rendered_total - display_origin_frames,
+            display_total_frames);
     }
 
     lock_state(state);
@@ -16282,6 +16732,42 @@ static int reopen_core_for_seek(PlayerState *state, uint64_t *out_sample_pos)
     return 1;
 }
 
+static void pump_timbre_scan_paint_messages(void)
+{
+    MSG msg;
+
+    /* Repainting keeps a long scan visibly responsive. Commands, timers and
+       track changes stay queued so they cannot re-enter the provider while
+       the scan core owns its global emulation state. */
+    while (PeekMessageA(&msg, NULL, WM_PAINT, WM_PAINT, PM_REMOVE)) {
+        DispatchMessageA(&msg);
+    }
+}
+
+static void refresh_timbre_scan_listbox(
+    PlayerState *state,
+    unsigned *displayed_sample_count)
+{
+    unsigned sample_count = 0;
+    unsigned group;
+
+    if (state == NULL || displayed_sample_count == NULL) {
+        return;
+    }
+
+    lock_state(state);
+    for (group = 0; group < state->timbre_list_count; ++group) {
+        sample_count += state->timbre_list_key_count[group];
+    }
+    unlock_state(state);
+
+    if (sample_count == *displayed_sample_count) {
+        return;
+    }
+    *displayed_sample_count = sample_count;
+    timbre_refresh_listbox(state);
+}
+
 static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
 {
     Psf2CoreCallbacks callbacks;
@@ -16291,7 +16777,7 @@ static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
     uint64_t scanned_total = 0;
     uint64_t saved_total_samples;
     uint32_t scanned = 0;
-    void *saved_core;
+    unsigned displayed_sample_count = (unsigned)-1;
     int16_t *discard_pcm = NULL;
 
     if (state == NULL || state->provider == NULL || path == NULL || path[0] == '\0') {
@@ -16317,21 +16803,31 @@ static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
 
     psf2log_set_imported_timbre_solo(0, NULL, NULL, NULL, 0);
     psf2log_set_imported_voice_mute_masks(0, 0);
+    lock_state(state);
+    state->timbre_prescanning = 1;
+    state->timbre_scan_core = NULL;
+    unlock_state(state);
+    refresh_timbre_scan_listbox(state, &displayed_sample_count);
+    pump_timbre_scan_paint_messages();
     result = state->provider->open(&scan_core, path, PLAYER_SAMPLE_RATE, &callbacks);
     if (result != PSF2_CORE_BRIDGE_OK || scan_core == NULL) {
+        lock_state(state);
+        state->timbre_prescanning = 0;
+        state->timbre_scan_core = NULL;
+        unlock_state(state);
+        player_log("timbre scan open failed result=%d", (int)result);
         return;
     }
 
-    saved_core = state->core;
-    state->core = scan_core;
     lock_state(state);
-    state->timbre_prescanning = 1;
+    state->timbre_scan_core = scan_core;
     unlock_state(state);
+    refresh_timbre_scan_listbox(state, &displayed_sample_count);
+    pump_timbre_scan_paint_messages();
     player_log("timbre fast scan begin frames=%llu", (unsigned long long)scan_frames);
 
     while (scanned_total < scan_frames) {
         uint32_t batch = TIMBRE_PRESCAN_BATCH_FRAMES;
-        MSG msg;
 
         if (scan_frames - scanned_total < batch) {
             batch = (uint32_t)(scan_frames - scanned_total);
@@ -16339,10 +16835,9 @@ static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
         scanned = 0;
         result = psf2log_scan_imported_timbres(scan_core, batch, &scanned);
         scanned_total += scanned;
-        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageA(&msg);
-        }
+        update_time_label_position(state, scanned_total, 0);
+        refresh_timbre_scan_listbox(state, &displayed_sample_count);
+        pump_timbre_scan_paint_messages();
         if (result != PSF2_CORE_BRIDGE_OK || scanned == 0) {
             break;
         }
@@ -16352,6 +16847,9 @@ static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
        The CPU-only path cannot observe that wait, so retry with normal offline
        rendering only when the fast pass found no playable sample at all. */
     if (state->timbre_list_count == 0 && state->provider->render != NULL) {
+        lock_state(state);
+        state->timbre_scan_core = NULL;
+        unlock_state(state);
         if (state->provider->close != NULL) {
             state->provider->close(scan_core);
         }
@@ -16360,30 +16858,33 @@ static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
         preview_free_samples_locked(state);
         reset_timbre_list_locked(state);
         unlock_state(state);
+        refresh_timbre_scan_listbox(state, &displayed_sample_count);
+        pump_timbre_scan_paint_messages();
         result = state->provider->open(&scan_core, path, PLAYER_SAMPLE_RATE, &callbacks);
         if (result == PSF2_CORE_BRIDGE_OK && scan_core != NULL) {
+            lock_state(state);
+            state->timbre_scan_core = scan_core;
+            unlock_state(state);
             discard_pcm = (int16_t *)calloc(
                 TIMBRE_PRESCAN_BATCH_FRAMES * 2u,
                 sizeof(*discard_pcm));
         }
         if (discard_pcm != NULL) {
             player_log("timbre scan fallback begin frames=%llu", (unsigned long long)scan_frames);
-            state->core = scan_core;
             scanned_total = 0;
+            update_time_label_position(state, 0, 1);
             while (scanned_total < scan_frames) {
                 uint32_t batch = TIMBRE_PRESCAN_BATCH_FRAMES;
                 uint32_t rendered = 0;
-                MSG msg;
 
                 if (scan_frames - scanned_total < batch) {
                     batch = (uint32_t)(scan_frames - scanned_total);
                 }
                 result = state->provider->render(scan_core, discard_pcm, batch, &rendered);
                 scanned_total += rendered;
-                while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-                    TranslateMessage(&msg);
-                    DispatchMessageA(&msg);
-                }
+                update_time_label_position(state, scanned_total, 0);
+                refresh_timbre_scan_listbox(state, &displayed_sample_count);
+                pump_timbre_scan_paint_messages();
                 if (result != PSF2_CORE_BRIDGE_OK || rendered == 0) {
                     break;
                 }
@@ -16395,9 +16896,10 @@ static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
         free(discard_pcm);
     }
 
-    state->core = (Psf2CoreBridge *)saved_core;
     lock_state(state);
+    state->timbre_scan_core = NULL;
     state->timbre_prescanning = 0;
+    state->time_label_cache_valid = 0;
     timbre_list_regroup_locked(state);
     state->timbre_list_locked = 1;
     unlock_state(state);
@@ -16432,6 +16934,7 @@ static void prescan_timbre_list(HWND hwnd, PlayerState *state, const char *path)
     lock_state(state);
     state->live.last_sample_pos = 0;
     unlock_state(state);
+    update_time_label(state);
     if (state->timbre_hwnd != NULL) {
         timbre_refresh_listbox(state);
     }
@@ -16458,6 +16961,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     }
     snprintf(open_path, sizeof(open_path), "%s", path);
     path = open_path;
+    redraw_player_header_controls(state);
     player_log("start playback begin path=%s start_sample=%llu",
         path,
         (unsigned long long)start_sample);
@@ -16499,6 +17003,13 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     ZeroMemory(state->voice_volume_lock_mask, sizeof(state->voice_volume_lock_mask));
     ZeroMemory(state->voice_volume_lock_value, sizeof(state->voice_volume_lock_value));
     if (path_changed) {
+        ZeroMemory(&state->seek_akao_hold, sizeof(state->seek_akao_hold));
+        state->seek_display_hold_active = 0;
+        state->seek_display_release_on_audio_start = 0;
+        state->seek_display_sample_pos = 0;
+        state->seek_display_target_pos = 0;
+        state->seek_display_generation = 0;
+        state->seek_akao_hold_valid = 0;
         state->voice_mute_mask[0] = 0u;
         state->voice_mute_mask[1] = 0u;
         reset_timbre_solo_locked(state);
@@ -16527,6 +17038,8 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     apply_psf_window_mode(hwnd, state, state->psf_version);
     update_settings_menu_check(hwnd, state);
     read_psf_title_tags(path, game, sizeof(game), title, sizeof(title));
+    state->suppress_ps1_music_header =
+        state->psf_version == 0x01u && is_ff1_game_tag(game);
     if (title[0] != '\0') {
         snprintf(window_title, sizeof(window_title), "%s - PSF SPU Player " PSF2_PLAYER_VERSION_DISPLAY, title);
     } else if (game[0] != '\0') {
@@ -16537,6 +17050,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     SetWindowTextA(hwnd, window_title);
     playlist_set_current_path(state, path);
     update_time_label(state);
+    redraw_player_header_controls(state);
     psf2log_set_imported_main_enabled(state->main_enabled);
     psf2log_set_imported_reverb_enabled(state->reverb_enabled);
     psf2log_set_imported_text_log_enabled(state->text_log_enabled);
@@ -16610,6 +17124,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     unlock_state(state);
 
     player_log("start playback provider open begin");
+    redraw_player_header_controls(state);
     result = state->provider->open(&state->core, path, PLAYER_SAMPLE_RATE, &callbacks);
     player_log("start playback provider open result=%d core=%p", (int)result, (void *)state->core);
     if (result != PSF2_CORE_BRIDGE_OK) {
@@ -16803,6 +17318,8 @@ static void process_direct_start_retry(HWND hwnd, PlayerState *state)
 static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
 {
     uint64_t total_samples;
+    uint64_t display_current;
+    uint64_t display_target;
     int playing;
     int paused;
     char path[MAX_PATH];
@@ -16816,11 +17333,39 @@ static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
     playing = state->playing;
     paused = state->paused;
     snprintf(path, sizeof(path), "%s", state->input_path);
-    unlock_state(state);
-
     if (total_samples > 0 && target > total_samples) {
         target = total_samples;
     }
+    if (state->seek_display_hold_active) {
+        display_current = state->seek_display_sample_pos;
+    } else if (state->frame_advance && state->frame_live_valid) {
+        display_current = timeline_sample_at_locked(
+            state, state->frame_live.last_sample_pos);
+    } else if (state->audible_display_valid) {
+        display_current = state->audible_display_snapshot.timeline_sample_pos;
+    } else {
+        display_current = state->timeline_valid ?
+            timeline_sample_at_locked(state, state->live.last_sample_pos) :
+            state->live.last_sample_pos;
+    }
+    display_target = state->timeline_valid ?
+        timeline_sample_at_locked(state, target) : target;
+    state->seek_display_hold_active = 1;
+    state->seek_display_release_on_audio_start = 0;
+    state->seek_display_sample_pos = display_current;
+    state->seek_display_target_pos = display_target;
+    state->seek_display_generation += 1u;
+    state->seek_target_sample = target;
+    if (state->audible_display_valid &&
+        psf1_music_header_state_supported(
+            &state->audible_display_snapshot.akao)) {
+        state->seek_akao_hold = state->audible_display_snapshot.akao;
+        state->seek_akao_hold_valid = 1;
+    } else if (psf1_music_header_state_supported(&state->akao)) {
+        state->seek_akao_hold = state->akao;
+        state->seek_akao_hold_valid = 1;
+    }
+    unlock_state(state);
 
     player_log("seek absolute target=%llu", (unsigned long long)target);
     if (state->core != NULL && playing && !paused) {
@@ -16829,9 +17374,14 @@ static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
         state->seek_request = 1;
         unlock_state(state);
         set_status(state, "Seeking...");
+        update_time_label_position(state, display_current, 1);
         InvalidateRect(hwnd, NULL, TRUE);
         return;
     }
+    update_time_label_position(state, display_current, 1);
+    lock_state(state);
+    state->seek_display_release_on_audio_start = 1;
+    unlock_state(state);
     start_playback_at(hwnd, state, path, target);
 }
 
@@ -16845,7 +17395,8 @@ static void input_seek_time(HWND hwnd, PlayerState *state)
         return;
     }
     lock_state(state);
-    current = state->live.last_sample_pos;
+    current = state->seek_display_hold_active ?
+        state->seek_target_sample : state->live.last_sample_pos;
     unlock_state(state);
     if (!choose_seek_time(hwnd, state, current, &seconds)) {
         return;
@@ -16865,7 +17416,8 @@ static void seek_relative_seconds(HWND hwnd, PlayerState *state, int seconds)
     }
 
     lock_state(state);
-    current = (int64_t)state->live.last_sample_pos;
+    current = (int64_t)(state->seek_display_hold_active ?
+        state->seek_target_sample : state->live.last_sample_pos);
     total_samples = state->total_samples;
     unlock_state(state);
 
@@ -17334,6 +17886,166 @@ static void paint_psf1_track_keyboard(
     }
 }
 
+static int prepare_fullscreen_number_font(HDC hdc, PlayerState *state)
+{
+    SIZE window_extent;
+    SIZE viewport_extent;
+    int height;
+    int cell_width;
+    int font_width;
+    int saved_dc;
+    HFONT font = NULL;
+    ABC metrics[16];
+
+    if (state == NULL || !GetWindowExtEx(hdc, &window_extent) ||
+        !GetViewportExtEx(hdc, &viewport_extent) ||
+        window_extent.cx <= 0 || window_extent.cy <= 0) {
+        return 0;
+    }
+    height = MulDiv(PLAYER_METER_FONT_HEIGHT, viewport_extent.cy, window_extent.cy);
+    cell_width = MulDiv(PLAYER_METER_CHAR_WIDTH, viewport_extent.cx, window_extent.cx);
+    if (height <= 0 || cell_width <= PLAYER_FULLSCREEN_NUMBER_GAP) {
+        return 0;
+    }
+    if (state->meter_number_font != NULL &&
+        state->meter_number_font_height == height &&
+        state->meter_number_cell_width == cell_width) {
+        return 1;
+    }
+    saved_dc = SaveDC(hdc);
+    if (saved_dc == 0) {
+        return 0;
+    }
+    SetMapMode(hdc, MM_TEXT);
+    SetWindowOrgEx(hdc, 0, 0, NULL);
+    SetViewportOrgEx(hdc, 0, 0, NULL);
+    for (font_width = cell_width; font_width > 0; --font_width) {
+        HFONT previous_font;
+        unsigned i;
+        int fits = 1;
+
+        font = CreateFontA(-height, font_width, 0, 0, FW_BOLD,
+            FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            FIXED_PITCH | FF_MODERN, PLAYER_METER_FONT_FACE);
+        if (font == NULL) {
+            break;
+        }
+        previous_font = (HFONT)SelectObject(hdc, font);
+        if (!GetCharABCWidthsA(hdc, '0', '9', metrics) ||
+            !GetCharABCWidthsA(hdc, 'A', 'F', metrics + 10)) {
+            fits = 0;
+        } else {
+            for (i = 0; i < 16u; ++i) {
+                if (metrics[i].abcB + PLAYER_FULLSCREEN_NUMBER_GAP >
+                    (unsigned)cell_width) {
+                    fits = 0;
+                }
+            }
+        }
+        SelectObject(hdc, previous_font);
+        if (fits) {
+            break;
+        }
+        DeleteObject(font);
+        font = NULL;
+    }
+    RestoreDC(hdc, saved_dc);
+    if (font == NULL) {
+        return 0;
+    }
+    if (state->meter_number_font != NULL) {
+        DeleteObject(state->meter_number_font);
+    }
+    state->meter_number_font = font;
+    state->meter_number_font_height = height;
+    state->meter_number_cell_width = cell_width;
+    memcpy(state->meter_number_metrics, metrics, sizeof(metrics));
+    return 1;
+}
+
+static void paint_fullscreen_voice_numbers(
+    HDC hdc,
+    const PlayerState *state,
+    int x,
+    int y,
+    const char *line,
+    const char *env_text,
+    const char *voice_detail)
+{
+    POLYTEXTA numbers[10];
+    POINT origins[10];
+    int advances[10][4];
+    unsigned field;
+    int saved_dc;
+
+    ZeroMemory(numbers, sizeof(numbers));
+    numbers[0].x = x + COL_TEXT_X;
+    numbers[0].lpstr = (LPSTR)line;
+    numbers[0].n = 2;
+    numbers[1].x = x + COL_TEXT_X + 18 * PLAYER_METER_CHAR_WIDTH;
+    numbers[1].lpstr = (LPSTR)line + 18;
+    numbers[1].n = 4;
+    numbers[2].x = x + COL_TEXT_X + 23 * PLAYER_METER_CHAR_WIDTH;
+    numbers[2].lpstr = (LPSTR)line + 23;
+    numbers[2].n = 4;
+    numbers[3].x = x + COL_TEXT_X + 29 * PLAYER_METER_CHAR_WIDTH;
+    numbers[3].lpstr = (LPSTR)line + 29;
+    numbers[3].n = 4;
+    numbers[4].x = x + COL_ENV_TEXT_X;
+    numbers[4].lpstr = (LPSTR)env_text;
+    numbers[4].n = 4;
+    for (field = 5; field < 10u; ++field) {
+        int offset = 11 + (int)(field - 5u) * 3;
+        numbers[field].x = x + COL_FLAGS_X + offset * PLAYER_METER_CHAR_WIDTH;
+        numbers[field].lpstr = (LPSTR)voice_detail + offset;
+        numbers[field].n = 2;
+    }
+    for (field = 0; field < 10u; ++field) {
+        origins[field].x = numbers[field].x;
+        origins[field].y = y;
+    }
+    if (!LPtoDP(hdc, origins, 10)) {
+        return;
+    }
+    saved_dc = SaveDC(hdc);
+    if (saved_dc == 0) {
+        return;
+    }
+    SetMapMode(hdc, MM_TEXT);
+    SetWindowOrgEx(hdc, 0, 0, NULL);
+    SetViewportOrgEx(hdc, 0, 0, NULL);
+    SelectObject(hdc, state->meter_number_font);
+    SetTextCharacterExtra(hdc, 0);
+    for (field = 0; field < 10u; ++field) {
+        unsigned c;
+        int cursor = origins[field].x;
+        int previous_origin = 0;
+
+        /* Keep digit positions fixed inside the existing hit-test columns.
+           Glyph width (notably zero) must not move the following digits. */
+        for (c = 0; c < numbers[field].n; ++c) {
+            unsigned ch = (unsigned char)numbers[field].lpstr[c];
+            const ABC *metric = &state->meter_number_metrics[
+                ch <= '9' ? ch - '0' : ch - 'A' + 10u];
+            int origin = cursor - metric->abcA;
+
+            if (c == 0) {
+                numbers[field].x = origin;
+            } else {
+                advances[field][c - 1u] = origin - previous_origin;
+            }
+            previous_origin = origin;
+            cursor += state->meter_number_cell_width;
+        }
+        advances[field][numbers[field].n - 1u] = 0;
+        numbers[field].y = origins[field].y;
+        numbers[field].pdx = advances[field];
+    }
+    PolyTextOutA(hdc, numbers, 10);
+    RestoreDC(hdc, saved_dc);
+}
+
 static void paint_core_panel(
     HDC hdc,
     PlayerState *player_state,
@@ -17392,8 +18104,9 @@ static void paint_core_panel(
     COLORREF lr_left_color = lr_left_color_from_index(lr_color_index, lr_custom_color);
     COLORREF lr_right_color = lr_right_color_from_index(lr_color_index, lr_custom_color);
     COLORREF current_text_color = active_text_color;
-    TEXTMETRICA text_metrics;
-    int text_char_width = 8;
+    const int text_char_width = PLAYER_METER_CHAR_WIDTH;
+    int text_advances[160];
+    unsigned text_index;
     int show_values = psf1_values_visible_for_state(player_state, psf_version);
     int keyboard_height = psf1_keyboard_height_for_state(player_state, psf_version);
     int keyboard_gap = psf1_keyboard_gap_for_state(player_state, psf_version);
@@ -17404,9 +18117,11 @@ static void paint_core_panel(
     int rows_clip_saved_dc = 0;
     int voice_hit_clip_top = 0;
     HFONT previous_row_font = NULL;
+    int fullscreen_numbers = 0;
 
-    if (GetTextMetricsA(hdc, &text_metrics) && text_metrics.tmAveCharWidth > 0) {
-        text_char_width = text_metrics.tmAveCharWidth;
+    /* Keep drawing and hit testing on the same grid at every display scale. */
+    for (text_index = 0; text_index < 160u; ++text_index) {
+        text_advances[text_index] = text_char_width;
     }
 
     SetDCPenColor(hdc, gauge_border_color);
@@ -17434,13 +18149,14 @@ static void paint_core_panel(
                 core_state->reverb_l,
                 core_state->reverb_r,
                 noise_hz);
-        } else if (psf_version == 0x01u && akao != NULL && akao->detected) {
+        } else if (psf_version == 0x01u &&
+            psf1_music_header_state_supported(akao)) {
             unsigned denominator = akao->beat_denominator != 0u ?
                 akao->beat_denominator :
                 (akao->ticks_per_beat != 0 ? 192u / akao->ticks_per_beat : 0u);
             if (akao->driver_type == PSF1_MUSIC_DRIVER_SONY_SEQ) {
                 snprintf(line, sizeof(line),
-                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%06lX(%7.3f) %u/%u beat:%02u bar:%04u",
+                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%06lX(%7.3f) %2u/%2u beat:%02u bar:%04u",
                     active_count,
                     attack_count,
                     decay_count,
@@ -17457,7 +18173,7 @@ static void paint_core_panel(
                     akao->measure);
             } else {
                 snprintf(line, sizeof(line),
-                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%04lX(%7.3f) %u/%u beat:%02u bar:%04u",
+                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%04lX(%7.3f) %2u/%2u beat:%02u bar:%04u",
                     active_count,
                     attack_count,
                     decay_count,
@@ -17488,9 +18204,10 @@ static void paint_core_panel(
         if (psf_version == 0x01u && player_state != NULL &&
             IsZoomed(player_state->hwnd)) {
             PlayerScaleLayout header_layout;
-            SIZE text_size;
             int saved_dc;
-            int active_header_x = x;
+            int text_length = (int)strlen(line);
+            int active_header_x = x +
+                (CORE_PANEL_WIDTH - text_length * text_char_width) / 2;
 
             get_fullscreen_reference_layout(
                 player_state->hwnd, player_state, &header_layout);
@@ -17506,37 +18223,23 @@ static void paint_core_panel(
                 if (player_state->meter_font != NULL) {
                     SelectObject(hdc, player_state->meter_font);
                 }
-                if (GetTextExtentPoint32A(
-                        hdc, line, (int)strlen(line), &text_size)) {
-                    active_header_x = x +
-                        (CORE_PANEL_WIDTH - text_size.cx) / 2;
-                }
-                TextOutA(hdc, active_header_x, y,
-                    line, (int)strlen(line));
+                ExtTextOutA(hdc, active_header_x, y, 0, NULL,
+                    line, (UINT)text_length, text_advances);
                 RestoreDC(hdc, saved_dc);
             } else {
                 if (saved_dc != 0) {
                     RestoreDC(hdc, saved_dc);
                 }
-                if (GetTextExtentPoint32A(
-                        hdc, line, (int)strlen(line), &text_size)) {
-                    active_header_x = x +
-                        (CORE_PANEL_WIDTH - text_size.cx) / 2;
-                }
-                TextOutA(hdc, active_header_x, y,
-                    line, (int)strlen(line));
+                ExtTextOutA(hdc, active_header_x, y, 0, NULL,
+                    line, (UINT)text_length, text_advances);
             }
         } else {
-            SIZE text_size;
-            int active_header_x = x;
+            int text_length = (int)strlen(line);
+            int active_header_x = x +
+                (CORE_PANEL_WIDTH - text_length * text_char_width) / 2;
 
-            if (GetTextExtentPoint32A(
-                    hdc, line, (int)strlen(line), &text_size)) {
-                active_header_x = x +
-                    (CORE_PANEL_WIDTH - text_size.cx) / 2;
-            }
-            TextOutA(hdc, active_header_x, y,
-                line, (int)strlen(line));
+            ExtTextOutA(hdc, active_header_x, y, 0, NULL,
+                line, (UINT)text_length, text_advances);
         }
         y += active_header_line_height;
 
@@ -17567,6 +18270,9 @@ static void paint_core_panel(
             header_text[5].y = y;
             header_text[5].n = (UINT)strlen(adsr_header);
             header_text[5].lpstr = adsr_header;
+            for (text_index = 0; text_index < 6u; ++text_index) {
+                header_text[text_index].pdx = text_advances;
+            }
             PolyTextOutA(hdc, header_text, 6);
             y += line_height;
 
@@ -17581,6 +18287,9 @@ static void paint_core_panel(
             row_text[3].n = 4u;
             row_text[4].x = x + COL_FLAGS_X;
             row_text[4].n = 25u;
+            for (text_index = 0; text_index < 5u; ++text_index) {
+                row_text[text_index].pdx = text_advances;
+            }
         }
     } else {
         y += active_header_line_height +
@@ -17609,11 +18318,14 @@ static void paint_core_panel(
         }
     }
 
-    if (!gauges_only &&
+    if (!gauges_only && show_values &&
         psf_version == 0x01u &&
         psf1_keyboard_height_for_state(player_state, psf_version) > 0 &&
         player_state->meter_bold_font != NULL) {
         previous_row_font = (HFONT)SelectObject(hdc, player_state->meter_bold_font);
+        if (IsZoomed(player_state->hwnd)) {
+            fullscreen_numbers = prepare_fullscreen_number_font(hdc, player_state);
+        }
     }
 
     for (voice = 0; voice < 24; ++voice) {
@@ -17708,20 +18420,64 @@ static void paint_core_panel(
                 SetTextColor(hdc, row_text_color);
                 current_text_color = row_text_color;
             }
-            if (psf_version == 0x01u && !active) {
-                TextOutA(hdc, x + COL_TEXT_X, y, line, 6);
-                TextOutA(hdc, x + COL_TEXT_X + (18 * text_char_width), y,
-                    line + 18, 9);
-                TextOutA(hdc, x + COL_TEXT_X + (29 * text_char_width), y,
-                    line + 29, 4);
-                TextOutA(hdc, x + COL_ENV_TEXT_X, y, env_text, 4);
-                TextOutA(hdc, x + COL_FLAGS_X, y, voice_detail, 25);
+            if (fullscreen_numbers) {
+                char text_only_line[34];
+                char text_only_detail[26];
+                unsigned field;
+
+                memcpy(text_only_line, line, sizeof(text_only_line));
+                memcpy(text_only_detail, voice_detail, sizeof(text_only_detail));
+                memset(text_only_line, ' ', 2);
+                memset(text_only_line + 18, ' ', 4);
+                memset(text_only_line + 23, ' ', 4);
+                for (field = 0; field < 5u; ++field) {
+                    memset(text_only_detail + 11u + field * 3u, ' ', 2);
+                }
+                if (!active) {
+                    ExtTextOutA(hdc, x + COL_TEXT_X, y,
+                        0, NULL, text_only_line, 6, text_advances);
+                    ExtTextOutA(hdc, x + COL_TEXT_X + 18 * text_char_width, y,
+                        0, NULL, text_only_line + 18, 9, text_advances);
+                    ExtTextOutA(hdc, x + COL_FLAGS_X, y,
+                        0, NULL, text_only_detail, 25, text_advances);
+                    SetTextColor(hdc,
+                        muted ? muted_text_color : inactive_text_color);
+                    ExtTextOutA(hdc, x + COL_TEXT_X + 6 * text_char_width, y,
+                        0, NULL, line + 6, 11, text_advances);
+                    SetTextColor(hdc, row_text_color);
+                } else {
+                    POLYTEXTA decorations[3];
+
+                    decorations[0] = row_text[0];
+                    decorations[0].y = y;
+                    decorations[0].lpstr = text_only_line;
+                    decorations[1] = row_text[1];
+                    decorations[1].y = y;
+                    decorations[1].lpstr = text_only_line + 18;
+                    decorations[2] = row_text[4];
+                    decorations[2].y = y;
+                    decorations[2].lpstr = text_only_detail;
+                    PolyTextOutA(hdc, decorations, 3);
+                }
+                paint_fullscreen_voice_numbers(
+                    hdc, player_state, x, y, line, env_text, voice_detail);
+            } else if (psf_version == 0x01u && !active) {
+                ExtTextOutA(hdc, x + COL_TEXT_X, y, 0, NULL,
+                    line, 6, text_advances);
+                ExtTextOutA(hdc, x + COL_TEXT_X + (18 * text_char_width), y,
+                    0, NULL, line + 18, 9, text_advances);
+                ExtTextOutA(hdc, x + COL_TEXT_X + (29 * text_char_width), y,
+                    0, NULL, line + 29, 4, text_advances);
+                ExtTextOutA(hdc, x + COL_ENV_TEXT_X, y, 0, NULL,
+                    env_text, 4, text_advances);
+                ExtTextOutA(hdc, x + COL_FLAGS_X, y, 0, NULL,
+                    voice_detail, 25, text_advances);
                 SetTextColor(hdc,
                     muted ? muted_text_color : inactive_text_color);
                 current_text_color =
                     muted ? muted_text_color : inactive_text_color;
-                TextOutA(hdc, x + COL_TEXT_X + (6 * text_char_width), y,
-                    line + 6, 11);
+                ExtTextOutA(hdc, x + COL_TEXT_X + (6 * text_char_width), y,
+                    0, NULL, line + 6, 11, text_advances);
             } else {
                 row_text[0].y = y;
                 row_text[0].lpstr = line;
@@ -17784,8 +18540,8 @@ static void paint_core_panel(
                 snprintf(voice_label, sizeof(voice_label), "Vo%02u", voice);
                 SetTextColor(hdc, label_color);
                 current_text_color = label_color;
-                TextOutA(hdc, x + 8, keyboard_y + 2,
-                    voice_label, (int)strlen(voice_label));
+                ExtTextOutA(hdc, x + 8, keyboard_y + 2, 0, NULL,
+                    voice_label, (UINT)strlen(voice_label), text_advances);
             }
         }
         y += row_content_height;
@@ -17879,7 +18635,10 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     }
     akao = use_audible_display ?
         state->audible_display_snapshot.akao : state->akao;
-    if (state->playing && !state->frame_advance && !state->audio_started) {
+    if (state->seek_display_hold_active && state->seek_akao_hold_valid) {
+        akao = state->seek_akao_hold;
+    } else if (state->playing && !state->frame_advance &&
+        !state->audio_started) {
         ZeroMemory(&akao, sizeof(akao));
     }
     stopped_display = use_audible_display ?
@@ -17976,18 +18735,20 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
 
     if (state->meter_font == NULL) {
         state->meter_font = CreateFontA(
-            -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            -PLAYER_METER_FONT_HEIGHT, PLAYER_METER_CHAR_WIDTH,
+            0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, PLAYER_METER_FONT_FACE);
         if (state->meter_font == NULL) {
             state->meter_font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
         }
     }
     if (state->meter_bold_font == NULL) {
         state->meter_bold_font = CreateFontA(
-            -14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            -PLAYER_METER_FONT_HEIGHT, PLAYER_METER_CHAR_WIDTH,
+            0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, PLAYER_METER_FONT_FACE);
         if (state->meter_bold_font == NULL) {
             state->meter_bold_font = state->meter_font;
         }
@@ -18082,6 +18843,9 @@ static void destroy_player_paint_resources(PlayerState *state)
         state->meter_font != (HFONT)GetStockObject(ANSI_FIXED_FONT)) {
         DeleteObject(state->meter_font);
     }
+    if (state->meter_number_font != NULL) {
+        DeleteObject(state->meter_number_font);
+    }
     state->paint_dc = NULL;
     state->paint_bitmap = NULL;
     state->paint_old_bitmap = NULL;
@@ -18094,6 +18858,9 @@ static void destroy_player_paint_resources(PlayerState *state)
     state->psf1_keyboard_width = 0;
     state->meter_font = NULL;
     state->meter_bold_font = NULL;
+    state->meter_number_font = NULL;
+    state->meter_number_font_height = 0;
+    state->meter_number_cell_width = 0;
     state->meter_line_height = 0;
     state->paint_width = 0;
     state->paint_height = 0;
@@ -18170,9 +18937,10 @@ static int get_player_display_line_height(HWND hwnd)
     }
 
     font = CreateFontA(
-        -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        -PLAYER_METER_FONT_HEIGHT, PLAYER_METER_CHAR_WIDTH,
+        0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+        DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, PLAYER_METER_FONT_FACE);
     if (font == NULL) {
         font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
     }
@@ -18272,34 +19040,8 @@ static int voice_row_index_from_y(
 
 static int get_player_display_char_width(HWND hwnd)
 {
-    HDC hdc;
-    HFONT font;
-    HFONT old_font;
-    TEXTMETRICA tm;
-    int char_width = 8;
-
-    hdc = GetDC(hwnd);
-    if (hdc == NULL) {
-        return char_width;
-    }
-
-    font = CreateFontA(
-        -14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
-    if (font == NULL) {
-        font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
-    }
-    old_font = (HFONT)SelectObject(hdc, font);
-    if (GetTextMetricsA(hdc, &tm)) {
-        char_width = tm.tmAveCharWidth;
-    }
-    SelectObject(hdc, old_font);
-    if (font != GetStockObject(ANSI_FIXED_FONT)) {
-        DeleteObject(font);
-    }
-    ReleaseDC(hwnd, hdc);
-    return char_width;
+    (void)hwnd;
+    return PLAYER_METER_CHAR_WIDTH;
 }
 
 static int hit_test_voice_row(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core, unsigned *out_voice)
@@ -18565,7 +19307,8 @@ static void format_core_header_line(
             core_state->reverb_l,
             core_state->reverb_r,
             noise_hz);
-    } else if (psf_version == 0x01u && akao != NULL && akao->detected) {
+    } else if (psf_version == 0x01u &&
+        psf1_music_header_state_supported(akao)) {
         unsigned denominator = akao->beat_denominator != 0u ?
             akao->beat_denominator :
             (akao->ticks_per_beat != 0 ? 192u / akao->ticks_per_beat : 0u);
@@ -18961,7 +19704,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         state->reverb_check = CreateWindowA("BUTTON", "Reverb", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
             618, 4, 70, 20, hwnd, (HMENU)(UINT_PTR)IDC_REVERB_CHECK, NULL, NULL);
         state->time_label = CreateWindowA("STATIC", "00:00.0 / --:--.-",
-            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTERIMAGE,
+            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_OWNERDRAW,
             694, 6, TIME_LABEL_MIN_WIDTH, 16,
             hwnd, (HMENU)(UINT_PTR)IDC_TIME_LABEL, NULL, NULL);
         state->voice_scrollbar = CreateWindowA("SCROLLBAR", "",
@@ -19032,6 +19775,11 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             cancel_direct_start_retry(hwnd, state);
         }
         return 0;
+    case PLAYER_WM_SEEK_PROGRESS:
+        if (state != NULL) {
+            update_time_label(state);
+        }
+        return 0;
     case PLAYER_WM_AUDIO_BUFFER_DONE:
         if (state != NULL && state->playing && state->audio_started &&
             state->wave == (HWAVEOUT)(UINT_PTR)lparam &&
@@ -19077,6 +19825,9 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             return TRUE;
         }
         if (draw_header_percent_label(lparam, state)) {
+            return TRUE;
+        }
+        if (draw_header_time_label(lparam, state)) {
             return TRUE;
         }
         if (draw_owner_button(lparam, state)) {
@@ -19146,9 +19897,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         }
         if (state != NULL && LOWORD(wparam) == IDC_PLAY) {
             if (state->core != NULL && get_paused(state)) {
-                set_paused(state, 0);
-                set_status(state, "Playing direct");
-                InvalidateRect(hwnd, NULL, TRUE);
+                toggle_pause_playback(hwnd, state);
             } else if (state->input_path[0] != '\0') {
                 start_direct_playback(hwnd, state, state->input_path);
             } else {

@@ -1050,6 +1050,28 @@ void ps2_hw_slice(void)
 
 }
 
+void ps2_hw_scan_slice(void)
+{
+	int i = 0;
+
+	timerexp = 0;
+	psx_hw_runcounters();
+
+	if (iCurThread != -1)
+	{
+		mips_execute(836/CLOCK_DIV);
+	}
+	else if (timerexp)
+	{
+		ps2_reschedule();
+
+		if (iCurThread != -1)
+		{
+			mips_execute((836/CLOCK_DIV)-i);
+		}
+	}
+}
+
 static int fcnt = 0;
 
 void psx_hw_frame(void)

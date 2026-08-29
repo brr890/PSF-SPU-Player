@@ -333,6 +333,7 @@ extern uint32_t initial_scratch[0x400/4];
 void psx_hw_slice(void);
 void psx_hw_scan_slice(unsigned int timer_step, unsigned int cpu_step);
 void ps2_hw_slice(void);
+void ps2_hw_scan_slice(void);
 void psx_hw_frame(void);
 void ps2_hw_frame(void);
 
