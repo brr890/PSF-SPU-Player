@@ -593,7 +593,6 @@ static u32 sampcount;
 static u32 decaybegin;
 static u32 decayend;
 static u32 seektime;
-
 #include "../peops/adsr.cc"
 
 // Try this to increase speed.
@@ -730,7 +729,7 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
              start=s_chan[ch].pCurr;                   // set up the current pos
 
              if (start == (u8*)-1)          // special "stop" sign
-             {
+              {
                s_chan[ch].bOn=0;                       // -> turn everything off
                if(psf2log_peops_get_adsr_force((unsigned int)ch))
                 {
@@ -806,13 +805,14 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
              //////////////////////////////////////////// flag handler
 
              if((flags&4) && (!s_chan[ch].bIgnoreLoop))
-              s_chan[ch].pLoop=start-16;               // loop adress
+              {
+               s_chan[ch].pLoop=start-16;              // loop adress
+              }
 
              if(flags&1)                               // 1: stop/loop
               {
                // We play this block out first...
-               //if(!(flags&2))                          // 1+2: do loop... otherwise: stop
-               if(flags!=3 || s_chan[ch].pLoop==nullptr)  // PETE: if we don't check exactly for 3, loop hang ups will happen (DQ4, for example)
+               if((flags&3)!=3 || s_chan[ch].pLoop==nullptr)
                 {                                      // and checking if pLoop is set avoids crashes, yeah
                  start = (u8*)-1;
                 }
@@ -820,6 +820,7 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
                 {
                  start = s_chan[ch].pLoop;
                 }
+               psf2log_ps1_set_endx(ch);
               }
 
              s_chan[ch].pCurr=start;                   // store values for next cycle
@@ -1176,6 +1177,19 @@ void SPUinjectRAMImage(u16 *pIncoming)
 	{
 		spuMem[i] = pIncoming[i];
 	}
+}
+
+void SPUwriteLogDMAData(const u8 *data, u32 halfwords)
+{
+ u32 i;
+
+ if(data==nullptr || spuAddr==0xffffffffu) return;
+ for(i=0;i<halfwords;i++)
+  {
+   spuMem[spuAddr>>1]=(u16)((u16)data[i*2u]|((u16)data[i*2u+1u]<<8));
+   spuAddr+=2;
+   if(spuAddr>0x7ffffu) spuAddr=0;
+  }
 }
 
 static u16 psf2log_ps1_clamp_u16_int(int value)

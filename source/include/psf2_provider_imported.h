@@ -34,6 +34,7 @@ void psf2log_step_imported_frame_advance(uint32_t ticks);
 void psf2log_set_imported_adsr_freeze(int enabled);
 void psf2log_emit_imported_snapshot(Psf2CoreBridge *core);
 void psf2log_rebase_imported_sample_position(Psf2CoreBridge *core, uint64_t sample_pos);
+uint64_t psf2log_get_imported_total_frames(Psf2CoreBridge *core);
 Psf2CoreBridgeResult psf2log_scan_imported_timbres(
     Psf2CoreBridge *core,
     uint32_t sequence_frames,
@@ -51,6 +52,7 @@ int psf2log_get_imported_ps1_akao_state(
     Psf1AkaoPlaybackState *out_state);
 void psf2log_set_imported_reverb_enabled(int enabled);
 void psf2log_set_imported_main_enabled(int enabled);
+void psf2log_set_imported_xa_cdda_enabled(int enabled);
 void psf2log_set_imported_text_log_enabled(int enabled);
 void psf2log_set_imported_voice_mute_masks(uint32_t core0_mask, uint32_t core1_mask);
 void psf2log_set_imported_voice_mute_masks_immediate(uint32_t core0_mask, uint32_t core1_mask);

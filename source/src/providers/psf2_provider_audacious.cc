@@ -1,4 +1,5 @@
 #include "psf2_provider_imported.h"
+#include "ps_stream_decoder.h"
 #include "spu2log_audacious_hooks.h"
 
 #include <limits.h>
@@ -38,8 +39,20 @@
 
 typedef enum AudaciousPsfMode {
     AUDACIOUS_PSF_MODE_PSF1 = 1,
-    AUDACIOUS_PSF_MODE_PSF2 = 2
+    AUDACIOUS_PSF_MODE_PSF2 = 2,
+    AUDACIOUS_PSF_MODE_SPU_LOG = 3,
+    AUDACIOUS_PSF_MODE_STREAM = 4
 } AudaciousPsfMode;
+
+typedef struct AudaciousSpuStreamChunk {
+    struct AudaciousSpuStreamChunk *next;
+    int16_t *pcm;
+    uint64_t start_frame;
+    uint32_t frames;
+    int32_t gain_left;
+    int32_t gain_right;
+    uint8_t hardware_enabled;
+} AudaciousSpuStreamChunk;
 
 typedef struct AudaciousAkaoRange {
     uint32_t start;
@@ -48,6 +61,7 @@ typedef struct AudaciousAkaoRange {
 
 typedef struct AudaciousAkaoMonitor {
     Psf1AkaoPlaybackState state;
+    Psf1AkaoPlaybackState initial_state;
     AudaciousAkaoRange sequence_ranges[AUDACIOUS_AKAO_MAX_SEQUENCES];
     uint16_t tempo_values[AUDACIOUS_AKAO_MAX_TEMPOS];
     uint8_t tempo_formats[AUDACIOUS_AKAO_MAX_TEMPOS];
@@ -69,6 +83,7 @@ typedef struct AudaciousAkaoMonitor {
     uint8_t confidence;
     uint8_t early_format;
     uint8_t started;
+    uint8_t initial_state_conflict;
 } AudaciousAkaoMonitor;
 
 typedef struct AudaciousSonySeqMonitor {
@@ -107,6 +122,22 @@ typedef struct AudaciousPsf2Core {
     int16_t *pcm;
     uint32_t requested_frames;
     uint32_t rendered_frames;
+    uint32_t spu_event_offset;
+    uint32_t spu_current_tick;
+    uint32_t spu_first_tick;
+    uint32_t spu_next_tick;
+    uint32_t spu_end_tick;
+    uint32_t spu_event_index;
+    uint32_t spu_event_count;
+    uint16_t spu_cd_volume_left;
+    uint16_t spu_cd_volume_right;
+    uint16_t spu_control;
+    uint8_t spu_old_format;
+    uint8_t spu_log_finished;
+    PsStreamDecoder *stream_decoder;
+    AudaciousSpuStreamChunk *spu_stream_head;
+    AudaciousSpuStreamChunk *spu_stream_tail;
+    uint64_t spu_stream_tail_frame;
 } AudaciousPsf2Core;
 
 static char g_library_dir[1024];
@@ -117,6 +148,7 @@ static volatile uint32_t g_frame_advance_steps = 0;
 static volatile uint32_t g_frame_advance_adsr_updates = 0;
 static volatile int g_abort_render = 0;
 static volatile int g_fast_timbre_scan = 0;
+static volatile int g_xa_cdda_enabled = 1;
 static uint32_t g_noise_force_on_masks[2];
 static uint32_t g_noise_force_off_masks[2];
 static uint32_t g_pmod_force_on_masks[2];
@@ -525,6 +557,125 @@ static int audacious_akao_in_sequence(
     return 0;
 }
 
+static int audacious_akao_initial_state_from_track(
+    const uint8_t *ram,
+    uint32_t start,
+    uint32_t end,
+    int early_format,
+    Psf1AkaoPlaybackState *out_state)
+{
+    uint32_t limit;
+    uint32_t address;
+    uint32_t tempo_address = 0;
+    uint32_t meter_address = 0;
+    uint32_t measure_address = 0;
+    uint16_t tempo = 0;
+    uint16_t ticks_per_beat = 0;
+    uint16_t beats_per_measure = 0;
+    uint16_t measure = 0;
+
+    if (ram == nullptr || out_state == nullptr || start >= end) {
+        return 0;
+    }
+    limit = start + 128u;
+    if (limit > end) {
+        limit = end;
+    }
+    for (address = start; address < limit; ++address) {
+        if (early_format) {
+            if (tempo_address == 0 && address + 2u < limit &&
+                ram[address] == 0xe8u) {
+                uint16_t value = audacious_psx_ram_u16(address + 1u);
+                if (value != 0u) {
+                    tempo_address = address;
+                    tempo = value;
+                }
+            } else if (meter_address == 0 && address + 2u < limit &&
+                ram[address] == 0xfdu) {
+                uint16_t timebase = ram[address + 1u];
+                uint16_t beats = ram[address + 2u];
+                if (timebase >= 12u && timebase <= 192u &&
+                    192u % timebase == 0u && beats >= 1u && beats <= 16u) {
+                    meter_address = address;
+                    ticks_per_beat = timebase;
+                    beats_per_measure = beats;
+                }
+            } else if (measure_address == 0 && address + 1u < limit &&
+                ram[address] == 0xfeu) {
+                measure_address = address;
+                measure = ram[address + 1u];
+            }
+        } else if (ram[address] == 0xfeu && address + 1u < limit) {
+            uint8_t subcommand = ram[address + 1u];
+            if (tempo_address == 0 && subcommand == 0x00u &&
+                address + 3u < limit) {
+                uint16_t value = audacious_psx_ram_u16(address + 2u);
+                if (value != 0u) {
+                    tempo_address = address;
+                    tempo = value;
+                }
+            } else if (meter_address == 0 && subcommand == 0x15u &&
+                address + 3u < limit) {
+                uint16_t timebase = ram[address + 2u];
+                uint16_t beats = ram[address + 3u];
+                if (timebase >= 12u && timebase <= 192u &&
+                    192u % timebase == 0u && beats >= 1u && beats <= 16u) {
+                    meter_address = address;
+                    ticks_per_beat = timebase;
+                    beats_per_measure = beats;
+                }
+            } else if (measure_address == 0 && subcommand == 0x16u &&
+                address + 2u < limit) {
+                measure_address = address;
+                measure = ram[address + 2u];
+            }
+        }
+    }
+    if (tempo_address == 0 || meter_address == 0 || measure_address == 0) {
+        return 0;
+    }
+    if (tempo_address > meter_address + 64u || meter_address > tempo_address + 64u ||
+        measure_address > meter_address + 64u || meter_address > measure_address + 64u) {
+        return 0;
+    }
+
+    memset(out_state, 0, sizeof(*out_state));
+    out_state->tempo = tempo;
+    out_state->beats_per_measure = beats_per_measure;
+    out_state->ticks_per_beat = ticks_per_beat;
+    out_state->current_beat = 0u;
+    out_state->current_tick = 0u;
+    out_state->measure = measure;
+    out_state->beat_denominator = (uint16_t)(192u / ticks_per_beat);
+    out_state->detected = 1u;
+    out_state->early_format = early_format ? 1u : 0u;
+    out_state->driver_type = early_format ?
+        PSF1_MUSIC_DRIVER_AKAO_EARLY : PSF1_MUSIC_DRIVER_AKAO_LATE;
+    return 1;
+}
+
+static void audacious_akao_merge_initial_state(
+    AudaciousAkaoMonitor *monitor,
+    const Psf1AkaoPlaybackState *candidate)
+{
+    if (monitor == nullptr || candidate == nullptr || !candidate->detected ||
+        monitor->initial_state_conflict) {
+        return;
+    }
+    if (!monitor->initial_state.detected) {
+        monitor->initial_state = *candidate;
+        return;
+    }
+    if (monitor->initial_state.tempo != candidate->tempo ||
+        monitor->initial_state.beats_per_measure != candidate->beats_per_measure ||
+        monitor->initial_state.ticks_per_beat != candidate->ticks_per_beat ||
+        monitor->initial_state.measure != candidate->measure ||
+        monitor->initial_state.driver_type != candidate->driver_type) {
+        memset(&monitor->initial_state, 0, sizeof(monitor->initial_state));
+        monitor->initial_state_conflict = 1u;
+    }
+}
+
 static void audacious_akao_scan_sequences(AudaciousAkaoMonitor *monitor)
 {
     const uint8_t *ram = (const uint8_t *)psx_ram;
@@ -535,6 +686,8 @@ static void audacious_akao_scan_sequences(AudaciousAkaoMonitor *monitor)
     }
     monitor->sequence_count = 0;
     monitor->tempo_count = 0;
+    memset(&monitor->initial_state, 0, sizeof(monitor->initial_state));
+    monitor->initial_state_conflict = 0u;
     memset(monitor->tempo_formats, 0, sizeof(monitor->tempo_formats));
     for (offset = 0; offset + 0x48u < AUDACIOUS_PSX_RAM_BYTES; ++offset) {
         uint32_t size;
@@ -641,8 +794,13 @@ static void audacious_akao_scan_sequences(AudaciousAkaoMonitor *monitor)
             }
         }
         if (late_start != 0) {
+            Psf1AkaoPlaybackState initial_state;
             uint32_t command_limit = late_start + 256u;
             uint32_t command;
+            if (audacious_akao_initial_state_from_track(
+                    ram, late_start, sequence_end, 0, &initial_state)) {
+                audacious_akao_merge_initial_state(monitor, &initial_state);
+            }
             if (command_limit > sequence_end) {
                 command_limit = sequence_end;
             }
@@ -656,8 +814,13 @@ static void audacious_akao_scan_sequences(AudaciousAkaoMonitor *monitor)
             }
         }
         if (early_start != 0) {
+            Psf1AkaoPlaybackState initial_state;
             uint32_t command_limit = early_start + 256u;
             uint32_t command;
+            if (audacious_akao_initial_state_from_track(
+                    ram, early_start, sequence_end, 1, &initial_state)) {
+                audacious_akao_merge_initial_state(monitor, &initial_state);
+            }
             if (command_limit > sequence_end) {
                 command_limit = sequence_end;
             }
@@ -677,6 +840,9 @@ static void audacious_akao_scan_sequences(AudaciousAkaoMonitor *monitor)
         }
     }
     monitor->sequences_scanned = monitor->sequence_count != 0 && monitor->tempo_count != 0;
+    if (monitor->sequences_scanned && monitor->initial_state.detected) {
+        monitor->state = monitor->initial_state;
+    }
 }
 
 static int audacious_akao_counter_fields_valid(uint32_t base)
@@ -785,7 +951,7 @@ static void audacious_akao_reject_counter(
     monitor->tempo_address = 0u;
     monitor->counter_candidate_sample = 0u;
     monitor->confidence = 0u;
-    memset(&monitor->state, 0, sizeof(monitor->state));
+    monitor->state = monitor->initial_state;
     monitor->next_counter_scan_sample = sample_pos + AUDACIOUS_SNAPSHOT_INTERVAL_FRAMES;
 }
 
@@ -878,7 +1044,15 @@ static void audacious_emit_internal_snapshots_masked(
     uint32_t voice_mask);
 
 void setendless(int e);
+void setlength(int32_t stop, int32_t fade);
 int SPUasync(uint32_t cycles, void (*update)(const void *, int));
+int SPUinit(void);
+int SPUopen(void);
+int SPUclose(void);
+void SPUinjectRAMImage(uint16_t *source);
+void SPUwriteLogDMAData(const uint8_t *data, uint32_t halfwords);
+uint16_t SPUreadRegister(uint32_t reg);
+void SPUwriteRegister(uint32_t reg, uint16_t value);
 extern "C" void psf2log_peops_emit_snapshots(
     void *user,
     uint64_t sample_pos,
@@ -1000,6 +1174,11 @@ extern "C" void psf2log_set_imported_main_enabled(int enabled)
 {
     iUseMain = enabled ? 1 : 0;
     psf2log_peops_set_main_enabled(enabled);
+}
+
+extern "C" void psf2log_set_imported_xa_cdda_enabled(int enabled)
+{
+    g_xa_cdda_enabled = enabled ? 1 : 0;
 }
 
 extern "C" void psf2log_set_imported_text_log_enabled(int enabled)
@@ -1410,7 +1589,8 @@ extern "C" uint32_t psf2log_copy_imported_sample(
     if (core == nullptr) {
         return 0;
     }
-    if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
+    if (core->mode == AUDACIOUS_PSF_MODE_PSF1 ||
+        core->mode == AUDACIOUS_PSF_MODE_SPU_LOG) {
         return psf2log_peops_copy_sample(
             start_addr,
             loop_addr,
@@ -1617,12 +1797,15 @@ static void audacious_emit_internal_snapshots_masked(
         return;
     }
 
-    if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
-        audacious_sony_seq_rescan_table(core);
-        if (core->sony_seq.valid) {
-            audacious_sony_seq_update(core);
-        } else {
-            audacious_akao_update(core);
+    if (core->mode == AUDACIOUS_PSF_MODE_PSF1 ||
+        core->mode == AUDACIOUS_PSF_MODE_SPU_LOG) {
+        if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
+            audacious_sony_seq_rescan_table(core);
+            if (core->sony_seq.valid) {
+                audacious_sony_seq_update(core);
+            } else {
+                audacious_akao_update(core);
+            }
         }
         psf2log_peops_emit_snapshots(
             core->callbacks.user,
@@ -1744,6 +1927,477 @@ extern "C" void psf2log_rebase_imported_sample_position(
     spu2log_audacious_set_sample_pos(sample_pos);
 }
 
+#define AUDACIOUS_SPU_LOG_RAM_BYTES 0x80000u
+#define AUDACIOUS_SPU_LOG_REG_BYTES 0x200u
+#define AUDACIOUS_SPU_LOG_EVENT_OFFSET 0x80208u
+#define AUDACIOUS_SPU_LOG_XA_HEADER_BYTES 32u
+#define AUDACIOUS_SPU_LOG_XA_PCM_BYTES 32768u
+
+static uint16_t audacious_read_le16(const uint8_t *data)
+{
+    return (uint16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
+}
+
+static uint32_t audacious_read_le32(const uint8_t *data)
+{
+    return (uint32_t)data[0] |
+        ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2] << 16) |
+        ((uint32_t)data[3] << 24);
+}
+
+static int audacious_spu_log_initial_register_is_trigger(uint32_t offset)
+{
+    switch (offset) {
+    case 0x0188u: /* Key On 1 */
+    case 0x018au: /* Key On 2 */
+    case 0x018cu: /* Key Off 1 */
+    case 0x018eu: /* Key Off 2 */
+    case 0x019cu: /* ENDX 1 */
+    case 0x019eu: /* ENDX 2 */
+    case 0x01a8u: /* Sound RAM data port */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int audacious_spu_log_event_bounds(
+    const uint8_t *data,
+    uint32_t size,
+    uint32_t offset,
+    uint32_t *out_next_offset,
+    uint32_t *out_next_tick)
+{
+    uint64_t tail;
+    uint32_t payload_size;
+    uint8_t opcode;
+
+    if (data == nullptr || offset >= size) {
+        return 0;
+    }
+    opcode = data[offset];
+    tail = (uint64_t)offset + 1u;
+    switch (opcode) {
+    case 0:
+        tail += 6u;
+        break;
+    case 1:
+    case 3:
+        tail += 4u;
+        break;
+    case 2:
+        if (tail + 4u > size) {
+            return 0;
+        }
+        payload_size = audacious_read_le32(data + (uint32_t)tail);
+        tail += 4u + (uint64_t)payload_size * 2u;
+        break;
+    case 4:
+        tail += AUDACIOUS_SPU_LOG_XA_HEADER_BYTES +
+            AUDACIOUS_SPU_LOG_XA_PCM_BYTES;
+        break;
+    case 5:
+        if (tail + 4u > size) {
+            return 0;
+        }
+        payload_size = audacious_read_le32(data + (uint32_t)tail);
+        tail += 4u + payload_size;
+        break;
+    default:
+        return 0;
+    }
+    if (tail > size || tail > UINT32_MAX) {
+        return 0;
+    }
+    if (tail == size) {
+        if (out_next_tick != nullptr) {
+            *out_next_tick = UINT32_MAX;
+        }
+        if (out_next_offset != nullptr) {
+            *out_next_offset = size;
+        }
+        return 1;
+    }
+    if (tail + 4u > size) {
+        return 0;
+    }
+    if (out_next_tick != nullptr) {
+        *out_next_tick = audacious_read_le32(data + (uint32_t)tail);
+    }
+    tail += 4u;
+    if (out_next_offset != nullptr) {
+        *out_next_offset = (uint32_t)tail;
+    }
+    return 1;
+}
+
+static int audacious_spu_log_validate(
+    const uint8_t *data,
+    uint32_t size,
+    int *out_old_format)
+{
+    uint32_t event_count;
+    uint32_t first_tick;
+    uint32_t end_tick;
+
+    if (out_old_format != nullptr) {
+        *out_old_format = 0;
+    }
+    if (data == nullptr || size < AUDACIOUS_SPU_LOG_EVENT_OFFSET) {
+        return 0;
+    }
+    end_tick = audacious_read_le32(data + 0x80200u);
+    first_tick = audacious_read_le32(data + 0x80204u);
+    if (end_tick == 44100u) {
+        uint64_t required;
+
+        event_count = first_tick;
+        required = (uint64_t)AUDACIOUS_SPU_LOG_EVENT_OFFSET +
+            (uint64_t)event_count * 12u;
+        if (required > size) {
+            return 0;
+        }
+        if (out_old_format != nullptr) {
+            *out_old_format = 1;
+        }
+        return 1;
+    }
+    if (end_tick < first_tick) {
+        return 0;
+    }
+    if (AUDACIOUS_SPU_LOG_EVENT_OFFSET < size) {
+        uint32_t next_offset;
+        uint32_t next_tick;
+
+        if (!audacious_spu_log_event_bounds(
+                data, size, AUDACIOUS_SPU_LOG_EVENT_OFFSET,
+                &next_offset, &next_tick) ||
+            next_offset <= AUDACIOUS_SPU_LOG_EVENT_OFFSET ||
+            (next_offset < size && next_tick > end_tick)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void audacious_spu_stream_clear(AudaciousPsf2Core *core)
+{
+    AudaciousSpuStreamChunk *chunk;
+
+    if (core == nullptr) {
+        return;
+    }
+    chunk = core->spu_stream_head;
+    while (chunk != nullptr) {
+        AudaciousSpuStreamChunk *next = chunk->next;
+        free(chunk->pcm);
+        free(chunk);
+        chunk = next;
+    }
+    core->spu_stream_head = nullptr;
+    core->spu_stream_tail = nullptr;
+    core->spu_stream_tail_frame = 0;
+}
+
+static int16_t audacious_spu_pcm_sample(
+    const uint8_t *pcm,
+    uint32_t frame,
+    int stereo,
+    int right)
+{
+    uint32_t offset = stereo ? frame * 4u + (right ? 2u : 0u) : frame * 2u;
+    return (int16_t)audacious_read_le16(pcm + offset);
+}
+
+static void audacious_spu_stream_enqueue(
+    AudaciousPsf2Core *core,
+    const uint8_t *pcm,
+    uint32_t input_frames,
+    uint32_t input_rate,
+    int stereo)
+{
+    AudaciousSpuStreamChunk *chunk;
+    uint64_t output_frames64;
+    uint64_t event_frame;
+    uint32_t output_frames;
+    uint32_t i;
+
+    if (core == nullptr || pcm == nullptr || input_frames == 0 ||
+        input_rate < 4000u || input_rate > 192000u) {
+        return;
+    }
+    output_frames64 = ((uint64_t)input_frames * core->sample_rate +
+        input_rate / 2u) / input_rate;
+    if (output_frames64 == 0 || output_frames64 > UINT32_MAX) {
+        return;
+    }
+    output_frames = (uint32_t)output_frames64;
+    chunk = (AudaciousSpuStreamChunk *)calloc(1, sizeof(*chunk));
+    if (chunk == nullptr) {
+        return;
+    }
+    chunk->pcm = (int16_t *)malloc(
+        (size_t)output_frames * 2u * sizeof(*chunk->pcm));
+    if (chunk->pcm == nullptr) {
+        free(chunk);
+        return;
+    }
+    for (i = 0; i < output_frames; ++i) {
+        uint64_t source_numerator = (uint64_t)i * input_rate;
+        uint32_t source_index = (uint32_t)(source_numerator / core->sample_rate);
+        uint32_t source_next;
+        uint32_t fraction = (uint32_t)(source_numerator % core->sample_rate);
+        int left;
+        int right;
+        int next_left;
+        int next_right;
+
+        if (source_index >= input_frames) {
+            source_index = input_frames - 1u;
+        }
+        source_next = source_index + 1u < input_frames ?
+            source_index + 1u : source_index;
+        left = audacious_spu_pcm_sample(pcm, source_index, stereo, 0);
+        right = audacious_spu_pcm_sample(pcm, source_index, stereo, 1);
+        next_left = audacious_spu_pcm_sample(pcm, source_next, stereo, 0);
+        next_right = audacious_spu_pcm_sample(pcm, source_next, stereo, 1);
+        chunk->pcm[i * 2u] = (int16_t)(left +
+            ((int64_t)(next_left - left) * fraction) / core->sample_rate);
+        chunk->pcm[i * 2u + 1u] = (int16_t)(right +
+            ((int64_t)(next_right - right) * fraction) / core->sample_rate);
+    }
+    event_frame = core->spu_current_tick >= core->spu_first_tick ?
+        (uint64_t)(core->spu_current_tick - core->spu_first_tick) : 0u;
+    chunk->start_frame = event_frame > core->spu_stream_tail_frame ?
+        event_frame : core->spu_stream_tail_frame;
+    chunk->frames = output_frames;
+    chunk->gain_left = (int16_t)core->spu_cd_volume_left;
+    chunk->gain_right = (int16_t)core->spu_cd_volume_right;
+    chunk->hardware_enabled = (uint8_t)((core->spu_control & 0x0001u) != 0u);
+    if (core->spu_stream_tail != nullptr) {
+        core->spu_stream_tail->next = chunk;
+    } else {
+        core->spu_stream_head = chunk;
+    }
+    core->spu_stream_tail = chunk;
+    core->spu_stream_tail_frame = chunk->start_frame + chunk->frames;
+}
+
+static void audacious_spu_track_register(
+    AudaciousPsf2Core *core,
+    uint32_t reg,
+    uint16_t value)
+{
+    uint32_t offset;
+
+    if (core == nullptr) {
+        return;
+    }
+    offset = reg & 0xfffu;
+    if (offset == 0x0db0u) {
+        core->spu_cd_volume_left = value;
+    } else if (offset == 0x0db2u) {
+        core->spu_cd_volume_right = value;
+    } else if (offset == 0x0daau) {
+        core->spu_control = value;
+    }
+}
+
+static void audacious_spu_log_process_event(AudaciousPsf2Core *core)
+{
+    const uint8_t *data;
+    uint32_t offset;
+    uint32_t next_offset;
+    uint32_t next_tick;
+    uint32_t value32;
+    uint16_t value16;
+    uint8_t opcode;
+
+    if (core == nullptr || core->spu_event_offset >= core->input_size) {
+        if (core != nullptr) {
+            core->spu_log_finished = 1;
+        }
+        return;
+    }
+    data = core->input_data;
+    offset = core->spu_event_offset;
+    if (!audacious_spu_log_event_bounds(
+            data, core->input_size, offset, &next_offset, &next_tick)) {
+        core->spu_log_finished = 1;
+        return;
+    }
+    opcode = data[offset];
+    switch (opcode) {
+    case 0:
+        value32 = audacious_read_le32(data + offset + 1u);
+        value16 = audacious_read_le16(data + offset + 5u);
+        audacious_spu_track_register(core, value32, value16);
+        SPUwriteRegister(value32, value16);
+        break;
+    case 1:
+        value32 = audacious_read_le32(data + offset + 1u);
+        (void)SPUreadRegister(value32);
+        break;
+    case 2:
+        value32 = audacious_read_le32(data + offset + 1u);
+        SPUwriteLogDMAData(data + offset + 5u, value32);
+        break;
+    case 3:
+        break;
+    case 4:
+        {
+            const uint8_t *header = data + offset + 1u;
+            const uint8_t *pcm = header + AUDACIOUS_SPU_LOG_XA_HEADER_BYTES;
+            uint32_t frequency = audacious_read_le32(header);
+            uint32_t stereo = audacious_read_le32(header + 8u) != 0u;
+            uint32_t samples = audacious_read_le32(header + 12u);
+            uint32_t maximum = AUDACIOUS_SPU_LOG_XA_PCM_BYTES /
+                (stereo ? 4u : 2u);
+
+            if (samples > maximum) {
+                samples = maximum;
+            }
+            audacious_spu_stream_enqueue(
+                core, pcm, samples, frequency, stereo != 0u);
+        }
+        break;
+    case 5:
+        value32 = audacious_read_le32(data + offset + 1u);
+        audacious_spu_stream_enqueue(
+            core, data + offset + 5u, value32 / 4u,
+            core->sample_rate, 1);
+        break;
+    default:
+        core->spu_log_finished = 1;
+        return;
+    }
+    core->spu_event_offset = next_offset;
+    core->spu_next_tick = next_tick;
+    core->spu_event_index++;
+}
+
+static void audacious_spu_log_advance_tick(AudaciousPsf2Core *core)
+{
+    if (core == nullptr || core->spu_log_finished) {
+        return;
+    }
+    if (core->spu_old_format) {
+        while (core->spu_event_index < core->spu_event_count &&
+            core->spu_event_offset + 12u <= core->input_size &&
+            audacious_read_le32(core->input_data + core->spu_event_offset) ==
+                core->spu_current_tick) {
+            uint32_t reg = audacious_read_le32(
+                core->input_data + core->spu_event_offset + 4u);
+            uint16_t value = audacious_read_le16(
+                core->input_data + core->spu_event_offset + 8u);
+            audacious_spu_track_register(core, reg, value);
+            SPUwriteRegister(reg, value);
+            core->spu_event_offset += 12u;
+            core->spu_event_index++;
+        }
+        if (core->spu_event_index >= core->spu_event_count) {
+            core->spu_log_finished = 1;
+        }
+    } else {
+        while (core->spu_event_offset < core->input_size &&
+            core->spu_current_tick == core->spu_next_tick) {
+            uint32_t previous_offset = core->spu_event_offset;
+            audacious_spu_log_process_event(core);
+            if (core->spu_log_finished ||
+                core->spu_event_offset <= previous_offset) {
+                break;
+            }
+        }
+        if (core->spu_current_tick >= core->spu_end_tick ||
+            core->spu_event_offset >= core->input_size) {
+            core->spu_log_finished = 1;
+        }
+    }
+    core->spu_current_tick++;
+}
+
+static int audacious_clip_stream_sample(int64_t sample)
+{
+    if (sample > INT16_MAX) {
+        return INT16_MAX;
+    }
+    if (sample < INT16_MIN) {
+        return INT16_MIN;
+    }
+    return (int)sample;
+}
+
+static void audacious_spu_mix_stream(
+    AudaciousPsf2Core *core,
+    int16_t *pcm,
+    uint32_t frames)
+{
+    AudaciousSpuStreamChunk *chunk;
+    uint64_t block_start;
+    uint64_t block_end;
+
+    if (core == nullptr || pcm == nullptr || frames == 0) {
+        return;
+    }
+    block_start = core->sample_pos;
+    block_end = block_start + frames;
+    while (core->spu_stream_head != nullptr &&
+        core->spu_stream_head->start_frame +
+            core->spu_stream_head->frames <= block_start) {
+        chunk = core->spu_stream_head;
+        core->spu_stream_head = chunk->next;
+        if (core->spu_stream_tail == chunk) {
+            core->spu_stream_tail = nullptr;
+        }
+        free(chunk->pcm);
+        free(chunk);
+    }
+    for (chunk = core->spu_stream_head;
+         chunk != nullptr && chunk->start_frame < block_end;
+         chunk = chunk->next) {
+        uint64_t chunk_end = chunk->start_frame + chunk->frames;
+        uint64_t overlap_start = chunk->start_frame > block_start ?
+            chunk->start_frame : block_start;
+        uint64_t overlap_end = chunk_end < block_end ? chunk_end : block_end;
+        uint64_t frame;
+
+        if (!g_xa_cdda_enabled || !chunk->hardware_enabled ||
+            overlap_end <= overlap_start) {
+            continue;
+        }
+        for (frame = overlap_start; frame < overlap_end; ++frame) {
+            uint32_t destination = (uint32_t)(frame - block_start);
+            uint32_t source = (uint32_t)(frame - chunk->start_frame);
+            int64_t left = ((int64_t)chunk->pcm[source * 2u] *
+                chunk->gain_left) / 32767;
+            int64_t right = ((int64_t)chunk->pcm[source * 2u + 1u] *
+                chunk->gain_right) / 32767;
+            pcm[destination * 2u] = (int16_t)audacious_clip_stream_sample(
+                (int64_t)pcm[destination * 2u] + left);
+            pcm[destination * 2u + 1u] = (int16_t)audacious_clip_stream_sample(
+                (int64_t)pcm[destination * 2u + 1u] + right);
+        }
+    }
+    while (core->spu_stream_head != nullptr &&
+        core->spu_stream_head->start_frame +
+            core->spu_stream_head->frames <= block_end) {
+        chunk = core->spu_stream_head;
+        core->spu_stream_head = chunk->next;
+        if (core->spu_stream_tail == chunk) {
+            core->spu_stream_tail = nullptr;
+        }
+        free(chunk->pcm);
+        free(chunk);
+    }
+}
+
+static void audacious_discard_audio_update(const void *data, int bytes)
+{
+    (void)data;
+    (void)bytes;
+}
+
 extern "C" Psf2CoreBridgeResult psf2log_scan_imported_timbres(
     Psf2CoreBridge *bridge,
     uint32_t sequence_frames,
@@ -1773,8 +2427,11 @@ extern "C" Psf2CoreBridgeResult psf2log_scan_imported_timbres(
             cpu_step = core->sample_pos < 44100u * 2u ? step : (step + 7u) / 8u;
             psx_hw_scan_slice(step, cpu_step);
             audacious_sony_seq_advance(core, step);
-        } else {
+        } else if (core->mode == AUDACIOUS_PSF_MODE_PSF2) {
             ps2_hw_scan_slice();
+        } else {
+            audacious_spu_log_advance_tick(core);
+            SPUasync(384, audacious_discard_audio_update);
         }
         core->slice_count += step;
         core->sample_pos += step;
@@ -1783,7 +2440,7 @@ extern "C" Psf2CoreBridgeResult psf2log_scan_imported_timbres(
         if (core->slice_count >= 44100u / 60u) {
             if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
                 psx_hw_frame();
-            } else {
+            } else if (core->mode == AUDACIOUS_PSF_MODE_PSF2) {
                 ps2_hw_frame();
             }
             core->slice_count -= 44100u / 60u;
@@ -1832,6 +2489,12 @@ static void audacious_audio_update(const void *data, int bytes)
             }
         }
         memcpy(core->pcm + core->rendered_frames * 2u, data, frames * 2u * sizeof(int16_t));
+        if (core->mode == AUDACIOUS_PSF_MODE_SPU_LOG) {
+            audacious_spu_mix_stream(
+                core,
+                core->pcm + core->rendered_frames * 2u,
+                frames);
+        }
         core->rendered_frames += frames;
         core->sample_pos += frames;
         spu2log_audacious_set_sample_pos(core->sample_pos);
@@ -1847,6 +2510,7 @@ static Psf2CoreBridgeResult audacious_open(
     AudaciousPsf2Core *core;
     uint8_t *data = nullptr;
     uint32_t size = 0;
+    int spu_old_format = 0;
 
     if (out_core == nullptr || path == nullptr || callbacks == nullptr ||
         callbacks->spu2_write16 == nullptr || sample_rate == 0) {
@@ -1867,8 +2531,22 @@ static Psf2CoreBridgeResult audacious_open(
     core->input_data = data;
     core->input_size = size;
     core->sample_rate = sample_rate;
-    core->mode = (size >= 4 && data[0] == 'P' && data[1] == 'S' && data[2] == 'F' && data[3] == 0x01) ?
-        AUDACIOUS_PSF_MODE_PSF1 : AUDACIOUS_PSF_MODE_PSF2;
+    if (size >= 4 && data[0] == 'P' && data[1] == 'S' && data[2] == 'F' &&
+        data[3] == 0x01) {
+        core->mode = AUDACIOUS_PSF_MODE_PSF1;
+    } else if (size >= 4 && data[0] == 'P' && data[1] == 'S' &&
+        data[2] == 'F' && data[3] == 0x02) {
+        core->mode = AUDACIOUS_PSF_MODE_PSF2;
+    } else if (audacious_spu_log_validate(data, size, &spu_old_format)) {
+        core->mode = AUDACIOUS_PSF_MODE_SPU_LOG;
+    } else if ((core->stream_decoder =
+                    ps_stream_decoder_create(data, size, sample_rate)) != nullptr) {
+        core->mode = AUDACIOUS_PSF_MODE_STREAM;
+    } else {
+        free(core);
+        free(data);
+        return PSF2_CORE_BRIDGE_ERROR_OPEN_FAILED;
+    }
     core->next_snapshot_sample = AUDACIOUS_SNAPSHOT_INTERVAL_FRAMES;
     set_library_dir_from_path(path);
     stop_flag = false;
@@ -1903,6 +2581,50 @@ static Psf2CoreBridgeResult audacious_open(
             free(data);
             return PSF2_CORE_BRIDGE_ERROR_OPEN_FAILED;
         }
+    } else if (core->mode == AUDACIOUS_PSF_MODE_SPU_LOG) {
+        uint32_t register_offset;
+
+        setendless(1);
+        if (SPUinit() != 0 || SPUopen() == 0) {
+            fprintf(stderr, "audacious provider: SPU log core init failed\n");
+            spu2log_audacious_set_spu2_write16_callback(nullptr, nullptr);
+            core->input_data = nullptr;
+            core->input_size = 0;
+            free(core);
+            free(data);
+            return PSF2_CORE_BRIDGE_ERROR_OPEN_FAILED;
+        }
+        setlength(-1, 0);
+        SPUinjectRAMImage((uint16_t *)data);
+        for (register_offset = 0; register_offset < AUDACIOUS_SPU_LOG_REG_BYTES;
+             register_offset += 2u) {
+            uint16_t value = audacious_read_le16(
+                data + AUDACIOUS_SPU_LOG_RAM_BYTES + register_offset);
+            uint32_t reg = 0x1f801c00u + register_offset;
+            if (audacious_spu_log_initial_register_is_trigger(register_offset)) {
+                continue;
+            }
+            audacious_spu_track_register(core, reg, value);
+            SPUwriteRegister(reg, value);
+        }
+        core->spu_old_format = (uint8_t)(spu_old_format ? 1 : 0);
+        core->spu_event_offset = AUDACIOUS_SPU_LOG_EVENT_OFFSET;
+        if (spu_old_format) {
+            core->spu_current_tick = 0;
+            core->spu_first_tick = 0;
+            core->spu_event_count = audacious_read_le32(data + 0x80204u);
+            core->spu_end_tick = core->spu_event_count != 0 ?
+                audacious_read_le32(
+                    data + AUDACIOUS_SPU_LOG_EVENT_OFFSET +
+                    (core->spu_event_count - 1u) * 12u) : 0u;
+        } else {
+            core->spu_end_tick = audacious_read_le32(data + 0x80200u);
+            core->spu_first_tick = audacious_read_le32(data + 0x80204u);
+            core->spu_current_tick = core->spu_first_tick;
+            core->spu_next_tick = core->spu_first_tick;
+        }
+    } else if (core->mode == AUDACIOUS_PSF_MODE_STREAM) {
+        core->next_snapshot_sample = UINT64_MAX;
     } else {
         spu2log_audacious_set_spu2_write16_callback(nullptr, nullptr);
         core->input_data = nullptr;
@@ -1965,6 +2687,69 @@ static void audacious_run_cpu_for_output_sample(AudaciousPsf2Core *core)
     }
 }
 
+static void audacious_run_spu_log_for_output_sample(AudaciousPsf2Core *core)
+{
+    int tempo_percent = g_tempo_percent;
+
+    if (core == nullptr) {
+        return;
+    }
+    if (g_frame_advance_mode) {
+        if (g_frame_advance_steps == 0) {
+            return;
+        }
+        tempo_percent = 100;
+    }
+    if (tempo_percent < 10) {
+        if (tempo_percent <= 0) {
+            return;
+        }
+        tempo_percent = 10;
+    }
+    if (tempo_percent > 200) {
+        tempo_percent = 200;
+    }
+    core->tempo_accumulator += (uint32_t)tempo_percent;
+    while (core->tempo_accumulator >= 100u) {
+        audacious_spu_log_advance_tick(core);
+        core->tempo_accumulator -= 100u;
+        if (g_frame_advance_mode && g_frame_advance_steps > 0) {
+            g_frame_advance_steps--;
+        }
+    }
+}
+
+static uint64_t audacious_spu_log_total_frames(const AudaciousPsf2Core *core)
+{
+    uint64_t event_frames;
+
+    if (core == nullptr || core->mode != AUDACIOUS_PSF_MODE_SPU_LOG) {
+        return 0;
+    }
+    event_frames = core->spu_end_tick >= core->spu_first_tick ?
+        (uint64_t)(core->spu_end_tick - core->spu_first_tick) + 1u : 0u;
+    if (core->spu_stream_tail_frame > event_frames) {
+        event_frames = core->spu_stream_tail_frame;
+    }
+    return event_frames;
+}
+
+extern "C" uint64_t psf2log_get_imported_total_frames(Psf2CoreBridge *bridge)
+{
+    AudaciousPsf2Core *core = (AudaciousPsf2Core *)bridge;
+
+    if (core == nullptr) {
+        return 0;
+    }
+    if (core->mode == AUDACIOUS_PSF_MODE_STREAM) {
+        return ps_stream_decoder_total_frames(core->stream_decoder);
+    }
+    if (core->mode == AUDACIOUS_PSF_MODE_SPU_LOG) {
+        return audacious_spu_log_total_frames(core);
+    }
+    return 0;
+}
+
 static Psf2CoreBridgeResult audacious_render(
     Psf2CoreBridge *bridge,
     int16_t *stereo_pcm,
@@ -1974,24 +2759,54 @@ static Psf2CoreBridgeResult audacious_render(
     AudaciousPsf2Core *core = (AudaciousPsf2Core *)bridge;
     uint32_t iterations;
     uint32_t max_iterations;
+    uint32_t render_frames;
     uint64_t render_start_sample;
 
     if (core == nullptr || stereo_pcm == nullptr || frames == 0) {
         return PSF2_CORE_BRIDGE_ERROR_INVALID_ARGUMENT;
     }
+    if (core->mode == AUDACIOUS_PSF_MODE_STREAM) {
+        uint32_t decoded = ps_stream_decoder_render(
+            core->stream_decoder, stereo_pcm, frames);
 
+        if (!g_xa_cdda_enabled && decoded != 0) {
+            memset(stereo_pcm, 0, decoded * 2u * sizeof(*stereo_pcm));
+        }
+        core->sample_pos += decoded;
+        spu2log_audacious_set_sample_pos(core->sample_pos);
+        if (out_frames != nullptr) {
+            *out_frames = decoded;
+        }
+        return PSF2_CORE_BRIDGE_OK;
+    }
+    render_frames = frames;
+    if (core->mode == AUDACIOUS_PSF_MODE_SPU_LOG) {
+        uint64_t total_frames = audacious_spu_log_total_frames(core);
+        uint64_t remaining;
+
+        if (core->sample_pos >= total_frames) {
+            if (out_frames != nullptr) {
+                *out_frames = 0;
+            }
+            return PSF2_CORE_BRIDGE_OK;
+        }
+        remaining = total_frames - core->sample_pos;
+        if (remaining < render_frames) {
+            render_frames = (uint32_t)remaining;
+        }
+    }
     memset(stereo_pcm, 0, frames * 2u * sizeof(int16_t));
     core->pcm = stereo_pcm;
-    core->requested_frames = frames;
+    core->requested_frames = render_frames;
     core->rendered_frames = 0;
     iterations = 0;
-    max_iterations = frames + (core->spu2_write_count == 0 ?
+    max_iterations = render_frames + (core->spu2_write_count == 0 ?
         AUDACIOUS_BOOTSTRAP_EXTRA_SLICES : AUDACIOUS_STEADY_EXTRA_SLICES);
     render_start_sample = core->sample_pos;
     g_rendering_core = core;
 
-    while (!g_abort_render && core->rendered_frames < frames && iterations < max_iterations) {
-        uint32_t bounded_iterations = iterations < frames ? iterations : frames;
+    while (!g_abort_render && core->rendered_frames < render_frames && iterations < max_iterations) {
+        uint32_t bounded_iterations = iterations < render_frames ? iterations : render_frames;
         if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
             audacious_run_cpu_for_output_sample(core);
             spu2log_audacious_debug_set_stage(1);
@@ -2000,7 +2815,7 @@ static Psf2CoreBridgeResult audacious_render(
             audacious_frame_advance_prepare_audio();
             SPUasync(384, audacious_audio_update);
             audacious_frame_advance_finish_audio();
-        } else {
+        } else if (core->mode == AUDACIOUS_PSF_MODE_PSF2) {
             if (audacious_frame_advance_has_step()) {
                 audacious_run_cpu_for_output_sample(core);
             }
@@ -2014,6 +2829,13 @@ static Psf2CoreBridgeResult audacious_render(
             if (!g_frame_advance_mode) {
                 audacious_run_cpu_for_output_sample(core);
             }
+        } else {
+            spu2log_audacious_debug_set_stage(1);
+            spu2log_audacious_set_sample_pos(render_start_sample + bounded_iterations);
+            audacious_run_spu_log_for_output_sample(core);
+            audacious_frame_advance_prepare_audio();
+            SPUasync(384, audacious_audio_update);
+            audacious_frame_advance_finish_audio();
         }
         spu2log_audacious_debug_set_stage(1);
         iterations += 1;
@@ -2034,7 +2856,7 @@ static Psf2CoreBridgeResult audacious_render(
         *out_frames = core->rendered_frames;
     }
 
-    if (core->rendered_frames == 0) {
+    if (core->rendered_frames == 0 && core->mode != AUDACIOUS_PSF_MODE_SPU_LOG) {
         core->rendered_frames = frames;
         core->sample_pos += frames;
         spu2log_audacious_set_sample_pos(core->sample_pos);
@@ -2088,9 +2910,14 @@ static void audacious_close(Psf2CoreBridge *bridge)
     stop_flag = true;
     if (core->mode == AUDACIOUS_PSF_MODE_PSF1) {
         psf_stop();
-    } else {
+    } else if (core->mode == AUDACIOUS_PSF_MODE_PSF2) {
         psf2_stop();
+    } else if (core->mode == AUDACIOUS_PSF_MODE_SPU_LOG) {
+        SPUclose();
     }
+    ps_stream_decoder_destroy(core->stream_decoder);
+    core->stream_decoder = nullptr;
+    audacious_spu_stream_clear(core);
     stop_flag = true;
     spu2log_audacious_set_spu2_write16_callback(nullptr, nullptr);
     free(core->input_data);
@@ -2100,7 +2927,7 @@ static void audacious_close(Psf2CoreBridge *bridge)
 }
 
 static const Psf2CoreProvider audacious_provider = {
-    "audacious-psf-psf2-core",
+    "audacious-psf-psf2-spu-core",
     "BSD + GPL/PeOPS/PeOPS2",
     audacious_open,
     audacious_render,

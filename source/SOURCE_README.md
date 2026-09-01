@@ -1,11 +1,11 @@
 # PSF SPU Player Production Source
 
-This folder contains the source required to build PSF SPU Player Ver 1.58.
+This folder contains the source required to build PSF SPU Player Ver 1.59.
 
 Included:
 
 - Windows player UI and resources
-- PSF/miniPSF/PSF2/miniPSF2 loading and playback integration
+- PSF/miniPSF/PSF2/miniPSF2, SPU, XA/STR, VAG, and ADS/SS2 playback integration
 - SPU/SPU2 state and logging code used by the player
 - Required public headers
 - Required Audacious PSF, Audio Overload, PeOPS, and PeOPS2 source

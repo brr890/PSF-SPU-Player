@@ -48,6 +48,20 @@ the GCC Runtime Library Exception, version 3.1. `libwinpthread` is covered by
 permissive MIT and BSD terms. See the corresponding files under
 `dist/PSF SPU Player/licenses`.
 
+## Archive Extraction Runtime
+
+Binary packages may include a separate `archive` folder containing the
+MinGW32 build of bsdtar and its dynamic libraries. This runtime is used only
+to extract supported archives and is not loaded into the player process.
+
+The runtime includes libarchive, bzip2, Expat, libb2, GNU libiconv, LZ4,
+PCRE2, XZ Utils/liblzma, zlib, Zstandard, and MinGW runtime libraries. These
+components retain their respective BSD, MIT, 0BSD, zlib, GNU LGPL, and GCC
+Runtime Library Exception terms. License texts are under
+`dist/PSF SPU Player/licenses/archive-runtime` and the existing MinGW license
+files. Corresponding source is available from the upstream projects and the
+matching MSYS2 MinGW32 source packages.
+
 ## Binary Releases
 
 A binary release of PSF SPU Player must be accompanied by equivalent access to

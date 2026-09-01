@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(psf_spu_player VERSION 1.57 LANGUAGES C CXX)
+project(psf_spu_player VERSION 1.59 LANGUAGES C CXX)
 
 set(PSF_ARCHIVE_RUNTIME_DIR "" CACHE PATH "Folder containing the optional 32-bit bsdtar archive runtime")
 
@@ -48,6 +48,7 @@ set(AUDACIOUS_PSF_DIR
 
 add_library(psf2_provider_imported STATIC
     src/providers/psf2_provider_audacious.cc
+    src/providers/ps_stream_decoder.cc
     ${AUDACIOUS_PSF_DIR}/corlett.cc
     ${AUDACIOUS_PSF_DIR}/eng_psf.cc
     ${AUDACIOUS_PSF_DIR}/eng_psf2.cc

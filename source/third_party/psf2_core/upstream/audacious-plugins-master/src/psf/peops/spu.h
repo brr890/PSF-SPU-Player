@@ -37,6 +37,7 @@ int SPUopen(void);
 int SPUclose(void);
 int SPUshutdown(void);
 void SPUinjectRAMImage(uint16_t *pIncoming);
+void SPUwriteLogDMAData(const uint8_t *data, uint32_t halfwords);
 void SPUreadDMAMem(uint32_t usPSXMem, int iSize);
 void SPUwriteDMAMem(uint32_t usPSXMem, int iSize);
 uint16_t SPUreadRegister(uint32_t reg);

@@ -58,7 +58,7 @@ static void FModOn(int start,int end,u16 val);
 static void NoiseOn(int start,int end,u16 val);
 static void SetVolumeLR(int right, u8 ch,s16 vol);
 static void SetPitch(int ch,u16 val);
-static int psf2log_ps1_text_log_enabled=1;
+static int psf2log_ps1_text_log_enabled=0;
 
 extern "C" void psf2log_peops_set_text_log_enabled(int enabled)
 {
