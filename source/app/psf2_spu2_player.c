@@ -37,7 +37,7 @@
 #define PLAYER_DIRECT_RETRY_TIMER_ID 4u
 #define PLAYER_DISPLAY_FPS 120u
 #define PLAYER_TIMER_MS 8u
-#define GAUGE_INTERPOLATION_MS 64u
+#define GAUGE_INTERPOLATION_MS 32u
 #define PLAYER_CLICK_DELAY_MS 220u
 #define PLAYER_CLICK_REPEAT_MS 85u
 #define PLAYER_PLAYLIST_SWITCH_TIMER_MS 15u
@@ -92,7 +92,10 @@
 #define PSF1_TUNING_CACHE_SIZE 512u
 #define PSF1_TUNING_MAX_ADPCM_BYTES 16384u
 #define PSF1_TUNING_MAX_LAG 1536u
-#define PSF1_BACKWARD_REDIRECT_MAX_ADPCM_BYTES 512u
+#define PSF1_TUNING_MIN_ANALYSIS_FRAMES 128u
+#define PSF1_TUNING_LONG_PERIOD_MAX_SCORE 0.12
+#define PSF1_TUNING_LONG_PERIOD_MAX_ERROR 0.12
+#define PSF1_SILENT_REDIRECT_MAX_ADPCM_BYTES 512u
 #define PSF1_TUNING_PENDING 0u
 #define PSF1_TUNING_READY 1u
 #define PSF1_TUNING_PROCESSING 2u
@@ -387,6 +390,7 @@ typedef struct PlayerState {
     unsigned audio_queued_buffers;
     unsigned audio_queue_low_water;
     int audio_started;
+    int startup_display_pending;
     uint64_t audio_chunks_queued;
     uint64_t audio_underruns;
     int16_t last_output_l;
@@ -412,6 +416,8 @@ typedef struct PlayerState {
     HBITMAP psf1_keyboard_base_old_bitmap;
     int psf1_keyboard_dark;
     int psf1_keyboard_width;
+    int psf1_keyboard_device_width;
+    int psf1_keyboard_device_height;
     HFONT meter_font;
     HFONT meter_bold_font;
     HFONT meter_number_font;
@@ -1749,6 +1755,27 @@ static void reset_live_display(PlayerState *state)
     ZeroMemory(&state->audible_display_snapshot, sizeof(state->audible_display_snapshot));
     state->audible_display_valid = 0;
     unlock_state(state);
+}
+
+static void initialize_empty_live_state(Spu2LogLiveState *live)
+{
+    uint8_t core;
+    uint8_t voice;
+
+    if (live == NULL) {
+        return;
+    }
+    ZeroMemory(live, sizeof(*live));
+    live->version = SPU2LOG_VERSION;
+    live->sample_rate = PLAYER_SAMPLE_RATE;
+    for (core = 0; core < 2; ++core) {
+        live->cores[core].core = core;
+        for (voice = 0; voice < 24; ++voice) {
+            live->voices[core][voice].core = core;
+            live->voices[core][voice].voice = voice;
+            live->voices[core][voice].adsr_phase = SPU2LOG_ADSR_OFF;
+        }
+    }
 }
 
 static void reset_stopped_display(PlayerState *state)
@@ -11787,7 +11814,11 @@ static void reset_audio_display_tracking(PlayerState *state)
     unlock_state(state);
 }
 
-static void capture_audio_display_snapshot(PlayerState *state, unsigned index, uint64_t sequence)
+static void capture_audio_display_snapshot(
+    PlayerState *state,
+    unsigned index,
+    uint64_t sequence,
+    int suppress_startup_voices)
 {
     AudioDisplaySnapshot *snapshot;
     Psf1AkaoPlaybackState akao;
@@ -11860,6 +11891,19 @@ static void capture_audio_display_snapshot(PlayerState *state, unsigned index, u
     snapshot->sequence = sequence;
     snapshot->stopped_display = state->stopped_display;
     snapshot->startup_track_dimmed = state->ps2_startup_track_dimmed;
+    if (suppress_startup_voices) {
+        initialize_empty_live_state(&snapshot->live);
+        ZeroMemory(snapshot->key_on_events, sizeof(snapshot->key_on_events));
+        ZeroMemory(snapshot->release_events, sizeof(snapshot->release_events));
+        ZeroMemory(snapshot->voice_display_hold_until,
+            sizeof(snapshot->voice_display_hold_until));
+        ZeroMemory(snapshot->voice_display_hold,
+            sizeof(snapshot->voice_display_hold));
+        ZeroMemory(snapshot->psf1_voice_timbre_key,
+            sizeof(snapshot->psf1_voice_timbre_key));
+        snapshot->timeline_sample_pos = 0;
+        snapshot->stopped_display = 1;
+    }
     snapshot->valid = 1;
     unlock_state(state);
 }
@@ -11969,6 +12013,7 @@ static void cleanup_audio_queue(PlayerState *state)
 }
 
 static void copy_scaled_pcm_with_declick(PlayerState *state, int16_t *out_pcm, const int16_t *in_pcm, uint32_t frames);
+static uint32_t first_nonzero_pcm_frame(const int16_t *pcm, uint32_t frames);
 static void reap_audio_queue(PlayerState *state);
 
 static int init_audio_queue(PlayerState *state)
@@ -12063,6 +12108,8 @@ static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t 
 
         for (i = 0; i < PLAYER_AUDIO_BUFFERS; ++i) {
             if (!state->audio_in_use[i]) {
+                int suppress_startup_voices;
+
                 if (state->audio_started) {
                     if (state->audio_queued_buffers < state->audio_queue_low_water) {
                         state->audio_queue_low_water = state->audio_queued_buffers;
@@ -12075,7 +12122,19 @@ static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t 
                     }
                 }
                 copy_scaled_pcm_with_declick(state, state->audio_buffers[i], pcm, frames);
-                capture_audio_display_snapshot(state, i, state->audio_chunks_queued + 1u);
+                lock_state(state);
+                suppress_startup_voices = state->startup_display_pending;
+                if (suppress_startup_voices &&
+                    first_nonzero_pcm_frame(state->audio_buffers[i], frames) < frames) {
+                    state->startup_display_pending = 0;
+                    suppress_startup_voices = 0;
+                }
+                unlock_state(state);
+                capture_audio_display_snapshot(
+                    state,
+                    i,
+                    state->audio_chunks_queued + 1u,
+                    suppress_startup_voices);
                 ZeroMemory(&state->audio_headers[i], sizeof(state->audio_headers[i]));
                 state->audio_headers[i].lpData = (LPSTR)state->audio_buffers[i];
                 state->audio_headers[i].dwBufferLength = frames * 2u * (uint32_t)sizeof(*pcm);
@@ -12979,6 +13038,7 @@ static double psf1_analyze_tuning_region(
     double *out_score)
 {
     uint32_t maximum_lag;
+    double primary_score = 1.0e30;
     double lag;
 
     if (out_score != NULL) {
@@ -12999,7 +13059,7 @@ static double psf1_analyze_tuning_region(
         region_start,
         region_frames,
         maximum_lag,
-        out_score);
+        &primary_score);
     if (lag > 0.0) {
         lag = psf1_refine_fundamental_lag(
             pcm,
@@ -13007,6 +13067,54 @@ static double psf1_analyze_tuning_region(
             region_frames,
             maximum_lag,
             lag);
+    }
+    /* A low note can occupy only about two cycles in a short SPU loop. The
+       normal three-cycle search cannot reach its fundamental and would fall
+       back to the generic 0x1000 tuning. Extend the search only when the
+       longer candidate is highly periodic, so noisy and percussive samples
+       keep the conservative result. */
+    if (region_frames > PSF1_TUNING_MIN_ANALYSIS_FRAMES + maximum_lag) {
+        uint32_t extended_maximum_lag =
+            region_frames - PSF1_TUNING_MIN_ANALYSIS_FRAMES;
+
+        if (extended_maximum_lag > PSF1_TUNING_MAX_LAG) {
+            extended_maximum_lag = PSF1_TUNING_MAX_LAG;
+        }
+        if (extended_maximum_lag > maximum_lag) {
+            double extended_score = 1.0e30;
+            double extended_lag = psf1_estimate_pitch_lag_consensus(
+                pcm,
+                region_start,
+                region_frames,
+                extended_maximum_lag,
+                &extended_score);
+
+            if (extended_lag > (double)maximum_lag + 1.0 &&
+                extended_score < PSF1_TUNING_LONG_PERIOD_MAX_SCORE &&
+                (lag <= 0.0 ||
+                 extended_score + 0.01 < primary_score * 0.5)) {
+                double refined_lag = psf1_refine_fundamental_lag(
+                    pcm,
+                    region_start,
+                    region_frames,
+                    extended_maximum_lag,
+                    extended_lag);
+                uint32_t refined_period = (uint32_t)(refined_lag + 0.5);
+                double refined_error = psf1_period_error(
+                    pcm,
+                    region_start,
+                    region_frames,
+                    refined_period);
+
+                if (refined_error < PSF1_TUNING_LONG_PERIOD_MAX_ERROR) {
+                    lag = refined_lag;
+                    primary_score = extended_score;
+                }
+            }
+        }
+    }
+    if (out_score != NULL) {
+        *out_score = primary_score;
     }
     return lag;
 }
@@ -13065,11 +13173,11 @@ static double psf1_analyze_short_loop(
     return lag;
 }
 
-static int psf1_is_silent_backward_redirect(
+static int psf1_is_silent_loop_redirect(
     Psf2CoreBridge *core,
     uint32_t ssa)
 {
-    uint8_t encoded[PSF1_BACKWARD_REDIRECT_MAX_ADPCM_BYTES];
+    uint8_t encoded[PSF1_SILENT_REDIRECT_MAX_ADPCM_BYTES];
     uint32_t loop_offset = 0;
     uint32_t end_flags = 0;
     uint32_t length;
@@ -13152,14 +13260,15 @@ static void psf1_process_tuning_request(PlayerState *state)
 
     analysis_ssa = ssa;
     analysis_lsa = lsa;
-    /* Some PS1 drivers suppress the attack with a tiny silent end/repeat
-       block. Other drivers briefly expose a stale backward loop pointer at
-       key-on, so only follow it after validating the SSA block itself. */
-    if (lsa != 0u && lsa < ssa) {
-        if (psf1_is_silent_backward_redirect(core, ssa)) {
+    /* Some PS1 drivers start from a tiny silent end/repeat block and redirect
+       to the real waveform at LSA. The target can be before or after SSA.
+       Only follow it after validating the SSA block itself, because other
+       drivers briefly expose a stale backward loop pointer at key-on. */
+    if (lsa != 0u && lsa != ssa) {
+        if (psf1_is_silent_loop_redirect(core, ssa)) {
             analysis_ssa = lsa;
             analysis_lsa = lsa;
-        } else {
+        } else if (lsa < ssa) {
             analysis_lsa = ssa;
         }
     }
@@ -17547,6 +17656,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     }
     state->psf_version = normalize_saved_psf_version(read_psf_version(path));
     state->stream_audio_mode = stream_audio;
+    state->startup_display_pending = start_sample == 0 ? 1 : 0;
     state->ps2_startup_track_dimmed = state->psf_version == 0x02u ? 1 : 0;
     state->startup_silence_trim =
         state->psf_version == 0x02u && !stream_audio && start_sample == 0 ? 1 : 0;
@@ -18183,7 +18293,11 @@ static int psf1_track_white_key_count(void)
     return count;
 }
 
-static void psf1_track_key_rect(int note, int width, RECT *out_rect)
+static void psf1_track_key_rect(
+    int note,
+    int width,
+    int height,
+    RECT *out_rect)
 {
     int white_count = psf1_track_white_key_count();
     int white_index = 0;
@@ -18203,12 +18317,12 @@ static void psf1_track_key_rect(int note, int width, RECT *out_rect)
                 out_rect->left = boundary - black_width / 2;
                 out_rect->right = boundary + (black_width + 1) / 2;
                 out_rect->top = 0;
-                out_rect->bottom = (PSF1_TRACK_KEYBOARD_HEIGHT * 3) / 5;
+                out_rect->bottom = (height * 3) / 5;
             } else {
                 out_rect->left = (width * white_index) / white_count;
                 out_rect->right = (width * (white_index + 1)) / white_count;
                 out_rect->top = 0;
-                out_rect->bottom = PSF1_TRACK_KEYBOARD_HEIGHT;
+                out_rect->bottom = height;
             }
             return;
         }
@@ -18265,6 +18379,9 @@ static int ensure_psf1_track_keyboard(
     HGDIOBJ old_brush;
     HGDIOBJ old_pen;
     RECT rect = {0, 0, width, PSF1_TRACK_KEYBOARD_HEIGHT};
+    POINT device_points[2] = {{0, 0}, {width, PSF1_TRACK_KEYBOARD_HEIGHT}};
+    int device_width;
+    int device_height;
     int white_count = psf1_track_white_key_count();
     int white_index = 0;
     int note;
@@ -18272,12 +18389,33 @@ static int ensure_psf1_track_keyboard(
     if (state == NULL || reference_dc == NULL || width <= 0) {
         return 0;
     }
+    if (!LPtoDP(reference_dc, device_points, 2)) {
+        device_points[0].x = 0;
+        device_points[0].y = 0;
+        device_points[1].x = width;
+        device_points[1].y = PSF1_TRACK_KEYBOARD_HEIGHT;
+    }
+    device_width = device_points[1].x - device_points[0].x;
+    device_height = device_points[1].y - device_points[0].y;
+    if (device_width < 0) {
+        device_width = -device_width;
+    }
+    if (device_height < 0) {
+        device_height = -device_height;
+    }
+    if (device_width <= 0 || device_height <= 0) {
+        return 0;
+    }
+    rect.right = device_width;
+    rect.bottom = device_height;
     if (state->psf1_keyboard_dc != NULL &&
         state->psf1_keyboard_bitmap != NULL &&
         state->psf1_keyboard_base_dc != NULL &&
         state->psf1_keyboard_base_bitmap != NULL &&
         state->psf1_keyboard_dark == dark &&
-        state->psf1_keyboard_width == width) {
+        state->psf1_keyboard_width == width &&
+        state->psf1_keyboard_device_width == device_width &&
+        state->psf1_keyboard_device_height == device_height) {
         return 1;
     }
     if (state->psf1_keyboard_base_dc != NULL) {
@@ -18305,10 +18443,12 @@ static int ensure_psf1_track_keyboard(
         state->psf1_keyboard_bitmap = NULL;
         state->psf1_keyboard_old_bitmap = NULL;
         state->psf1_keyboard_width = 0;
+        state->psf1_keyboard_device_width = 0;
+        state->psf1_keyboard_device_height = 0;
     }
     state->psf1_keyboard_dc = CreateCompatibleDC(reference_dc);
     state->psf1_keyboard_bitmap = CreateCompatibleBitmap(
-        reference_dc, width, PSF1_TRACK_KEYBOARD_HEIGHT);
+        reference_dc, device_width, device_height);
     if (state->psf1_keyboard_dc == NULL || state->psf1_keyboard_bitmap == NULL) {
         if (state->psf1_keyboard_bitmap != NULL) {
             DeleteObject(state->psf1_keyboard_bitmap);
@@ -18332,10 +18472,10 @@ static int ensure_psf1_track_keyboard(
          note <= PSF1_TRACK_KEY_LAST_NOTE;
          ++note) {
         if (!preview_is_black_key(note)) {
-            int left = (width * white_index) / white_count;
-            int right = (width * (white_index + 1)) / white_count;
+            int left = (device_width * white_index) / white_count;
+            int right = (device_width * (white_index + 1)) / white_count;
             Rectangle(state->psf1_keyboard_dc,
-                left, 0, right + 1, PSF1_TRACK_KEYBOARD_HEIGHT);
+                left, 0, right + 1, device_height);
             white_index++;
         }
     }
@@ -18346,7 +18486,7 @@ static int ensure_psf1_track_keyboard(
          ++note) {
         if (preview_is_black_key(note)) {
             RECT key;
-            psf1_track_key_rect(note, width, &key);
+            psf1_track_key_rect(note, device_width, device_height, &key);
             Rectangle(state->psf1_keyboard_dc,
                 key.left, key.top, key.right + 1, key.bottom + 1);
         } else {
@@ -18354,7 +18494,7 @@ static int ensure_psf1_track_keyboard(
         }
     }
     draw_psf1_track_white_key_boundaries(
-        state->psf1_keyboard_dc, width, PSF1_TRACK_KEYBOARD_HEIGHT);
+        state->psf1_keyboard_dc, device_width, device_height);
     SelectObject(state->psf1_keyboard_dc, old_pen);
     SelectObject(state->psf1_keyboard_dc, old_brush);
     DeleteObject(border_pen);
@@ -18362,7 +18502,7 @@ static int ensure_psf1_track_keyboard(
     DeleteObject(white_brush);
     state->psf1_keyboard_base_dc = CreateCompatibleDC(reference_dc);
     state->psf1_keyboard_base_bitmap = CreateCompatibleBitmap(
-        reference_dc, width, PSF1_TRACK_KEYBOARD_HEIGHT);
+        reference_dc, device_width, device_height);
     if (state->psf1_keyboard_base_dc == NULL ||
         state->psf1_keyboard_base_bitmap == NULL) {
         if (state->psf1_keyboard_base_bitmap != NULL) {
@@ -18378,10 +18518,12 @@ static int ensure_psf1_track_keyboard(
     state->psf1_keyboard_base_old_bitmap = (HBITMAP)SelectObject(
         state->psf1_keyboard_base_dc, state->psf1_keyboard_base_bitmap);
     BitBlt(state->psf1_keyboard_base_dc, 0, 0,
-        width, PSF1_TRACK_KEYBOARD_HEIGHT,
+        device_width, device_height,
         state->psf1_keyboard_dc, 0, 0, SRCCOPY);
     state->psf1_keyboard_dark = dark;
     state->psf1_keyboard_width = width;
+    state->psf1_keyboard_device_width = device_width;
+    state->psf1_keyboard_device_height = device_height;
     return 1;
 }
 
@@ -18394,11 +18536,52 @@ static void paint_psf1_track_keyboard(
     int active_note,
     int muted)
 {
+    POINT device_points[2];
+    int device_x;
+    int device_y;
+    int device_width;
+    int device_height;
+    int saved_dc;
+
     if (hdc == NULL || state == NULL || state->psf1_keyboard_dc == NULL ||
         state->psf1_keyboard_base_dc == NULL ||
         width <= 0 || state->psf1_keyboard_width != width) {
         return;
     }
+    device_points[0].x = x;
+    device_points[0].y = y;
+    device_points[1].x = x + width;
+    device_points[1].y = y + PSF1_TRACK_KEYBOARD_HEIGHT;
+    if (!LPtoDP(hdc, device_points, 2)) {
+        return;
+    }
+    device_x = device_points[0].x < device_points[1].x ?
+        device_points[0].x : device_points[1].x;
+    device_y = device_points[0].y < device_points[1].y ?
+        device_points[0].y : device_points[1].y;
+    device_width = device_points[1].x - device_points[0].x;
+    device_height = device_points[1].y - device_points[0].y;
+    if (device_width < 0) {
+        device_width = -device_width;
+    }
+    if (device_height < 0) {
+        device_height = -device_height;
+    }
+    if (device_width != state->psf1_keyboard_device_width) {
+        return;
+    }
+    /* An anisotropic fullscreen scale can round the same logical height to
+       adjacent device-pixel sizes depending on the row's Y position. Use the
+       cached physical keyboard height for every row so none are skipped and
+       every border remains a single device pixel. */
+    device_height = state->psf1_keyboard_device_height;
+    saved_dc = SaveDC(hdc);
+    if (saved_dc == 0) {
+        return;
+    }
+    SetMapMode(hdc, MM_TEXT);
+    SetWindowOrgEx(hdc, 0, 0, NULL);
+    SetViewportOrgEx(hdc, 0, 0, NULL);
     if (active_note >= PSF1_TRACK_KEY_FIRST_NOTE &&
         active_note <= PSF1_TRACK_KEY_LAST_NOTE) {
         RECT key;
@@ -18410,14 +18593,14 @@ static void paint_psf1_track_keyboard(
         HBRUSH active_brush = CreateSolidBrush(
             muted ? RGB(154, 78, 88) : RGB(230, 64, 84));
 
-        psf1_track_key_rect(active_note, width, &key);
+        psf1_track_key_rect(active_note, device_width, device_height, &key);
         active_rect = key;
         if (full_key_highlight) {
-            if (active_rect.right < width) {
+            if (active_rect.right < device_width) {
                 active_rect.right += 1;
             }
             if (preview_is_black_key(active_note) &&
-                active_rect.bottom < PSF1_TRACK_KEYBOARD_HEIGHT) {
+                active_rect.bottom < device_height) {
                 active_rect.bottom += 1;
             }
             if (full_key_highlight) {
@@ -18428,7 +18611,7 @@ static void paint_psf1_track_keyboard(
                 if (key.left <= 0) {
                     active_rect.left += 1;
                 }
-                if (active_rect.right >= width) {
+                if (active_rect.right >= device_width) {
                     active_rect.right -= 1;
                 }
             }
@@ -18455,7 +18638,7 @@ static void paint_psf1_track_keyboard(
                     if (!preview_is_black_key(note)) {
                         continue;
                     }
-                    psf1_track_key_rect(note, width, &black_key);
+                    psf1_track_key_rect(note, device_width, device_height, &black_key);
                     if (black_key.right < active_rect.left ||
                         black_key.left >= active_rect.right) {
                         continue;
@@ -18469,20 +18652,20 @@ static void paint_psf1_track_keyboard(
                 }
             }
         }
-        BitBlt(hdc, x, y, width, PSF1_TRACK_KEYBOARD_HEIGHT,
+        BitBlt(hdc, device_x, device_y, device_width, device_height,
             state->psf1_keyboard_dc, 0, 0, SRCCOPY);
         restore_rect = active_rect;
         if (restore_rect.left < 0) {
             restore_rect.left = 0;
         }
-        if (restore_rect.right > width) {
-            restore_rect.right = width;
+        if (restore_rect.right > device_width) {
+            restore_rect.right = device_width;
         }
         if (restore_rect.top < 0) {
             restore_rect.top = 0;
         }
-        if (restore_rect.bottom > PSF1_TRACK_KEYBOARD_HEIGHT) {
-            restore_rect.bottom = PSF1_TRACK_KEYBOARD_HEIGHT;
+        if (restore_rect.bottom > device_height) {
+            restore_rect.bottom = device_height;
         }
         if (restore_rect.right > restore_rect.left &&
             restore_rect.bottom > restore_rect.top) {
@@ -18495,9 +18678,10 @@ static void paint_psf1_track_keyboard(
         }
         DeleteObject(active_brush);
     } else {
-        BitBlt(hdc, x, y, width, PSF1_TRACK_KEYBOARD_HEIGHT,
+        BitBlt(hdc, device_x, device_y, device_width, device_height,
             state->psf1_keyboard_dc, 0, 0, SRCCOPY);
     }
+    RestoreDC(hdc, saved_dc);
 }
 
 static int prepare_fullscreen_number_font(HDC hdc, PlayerState *state)
@@ -19206,6 +19390,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     uint32_t gauge_vol_r[2][24];
     int psf1_track_notes[24];
     int use_audible_display;
+    int suppress_startup_voice_display;
     int stopped_display;
     int startup_track_dimmed;
     int hide_inactive;
@@ -19254,6 +19439,10 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     }
     akao = use_audible_display ?
         state->audible_display_snapshot.akao : state->akao;
+    suppress_startup_voice_display = !state->frame_advance &&
+        !state->seek_display_hold_active &&
+        (state->startup_display_pending ||
+         (state->playing && !state->audio_started));
     if (state->seek_display_hold_active && state->seek_akao_hold_valid) {
         akao = state->seek_akao_hold;
     } else if (state->playing && !state->frame_advance &&
@@ -19263,6 +19452,10 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     stopped_display = use_audible_display ?
         state->audible_display_snapshot.stopped_display :
         state->stopped_display;
+    if (suppress_startup_voice_display) {
+        initialize_empty_live_state(&live);
+        stopped_display = 1;
+    }
     startup_track_dimmed = psf_version == 0x02u && (use_audible_display ?
         state->audible_display_snapshot.startup_track_dimmed :
         state->ps2_startup_track_dimmed);
@@ -19314,6 +19507,10 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
                 }
             }
         }
+    }
+    if (suppress_startup_voice_display) {
+        ZeroMemory(key_on_events, sizeof(key_on_events));
+        ZeroMemory(release_events, sizeof(release_events));
     }
     effective_voice_mute_masks_locked(state, &live, &voice_mute_mask[0], &voice_mute_mask[1]);
     memcpy(voice_reverb_force_on_mask, state->voice_reverb_force_on_mask, sizeof(voice_reverb_force_on_mask));
@@ -19475,6 +19672,8 @@ static void destroy_player_paint_resources(PlayerState *state)
     state->psf1_keyboard_base_bitmap = NULL;
     state->psf1_keyboard_base_old_bitmap = NULL;
     state->psf1_keyboard_width = 0;
+    state->psf1_keyboard_device_width = 0;
+    state->psf1_keyboard_device_height = 0;
     state->meter_font = NULL;
     state->meter_bold_font = NULL;
     state->meter_number_font = NULL;
