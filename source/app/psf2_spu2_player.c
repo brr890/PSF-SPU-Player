@@ -10886,6 +10886,10 @@ static void update_time_label(PlayerState *state)
         sample_pos = state->seek_display_sample_pos;
     } else if (state->frame_advance && state->frame_live_valid) {
         sample_pos = timeline_sample_at_locked(state, state->frame_live.last_sample_pos);
+    } else if (state->playing && !state->audio_started) {
+        /* Rendering fills the waveOut prebuffer ahead of the audible cursor.
+           Keep the visible clock at zero until playback actually starts. */
+        sample_pos = 0;
     } else if (state->audible_display_valid) {
         sample_pos = state->audible_display_snapshot.timeline_sample_pos;
     } else if (state->playing) {
@@ -12357,6 +12361,7 @@ static void remember_ps2_startup_origin(
 static int advance_ps2_core_to_audible_start(PlayerState *state, uint64_t *out_sample_pos)
 {
     uint64_t trimmed_frames = 0;
+    int solo_filter_active;
 
     if (out_sample_pos != NULL) {
         *out_sample_pos = 0;
@@ -12367,6 +12372,15 @@ static int advance_ps2_core_to_audible_start(PlayerState *state, uint64_t *out_s
     }
 
     lock_state(state);
+    solo_filter_active =
+        ((state->voice_mute_mask[0] & 0x00ffffffu) != 0 ||
+         (state->voice_mute_mask[1] & 0x00ffffffu) != 0 ||
+         (state->timbre_solo_enabled && state->timbre_solo_key_count > 0));
+    if (solo_filter_active) {
+        state->startup_silence_trim = 0;
+        unlock_state(state);
+        return 1;
+    }
     state->startup_silence_trim = 1;
     unlock_state(state);
     for (;;) {
@@ -17587,6 +17601,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     int playback_from_playlist;
     int path_changed;
     int stream_audio;
+    int solo_filter_active;
 
     if (state == NULL || path == NULL || path[0] == '\0') {
         return;
@@ -17654,16 +17669,23 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
         state->ps2_startup_origin_valid = 0;
         state->ps2_startup_origin_sample = 0;
     }
+    solo_filter_active =
+        (state->voice_mute_mask[0] & 0x00ffffffu) != 0 ||
+        (state->voice_mute_mask[1] & 0x00ffffffu) != 0 ||
+        (state->timbre_solo_enabled && state->timbre_solo_key_count > 0);
     state->psf_version = normalize_saved_psf_version(read_psf_version(path));
     state->stream_audio_mode = stream_audio;
-    state->startup_display_pending = start_sample == 0 ? 1 : 0;
+    state->startup_display_pending =
+        start_sample == 0 && !solo_filter_active ? 1 : 0;
     state->ps2_startup_track_dimmed = state->psf_version == 0x02u ? 1 : 0;
     state->startup_silence_trim =
-        state->psf_version == 0x02u && !stream_audio && start_sample == 0 ? 1 : 0;
+        state->psf_version == 0x02u && !stream_audio && start_sample == 0 &&
+        !solo_filter_active ? 1 : 0;
     state->timeline_source_anchor = 0;
     state->timeline_scaled_anchor = 0;
     state->timeline_speed_percent = effective_speed_percent_locked(state);
-    state->timeline_valid = stream_audio || start_sample > 0 ? 1 : 0;
+    state->timeline_valid =
+        stream_audio || start_sample > 0 || solo_filter_active ? 1 : 0;
     state->time_label_cache_valid = 0;
     state->total_samples = tag_length_samples;
     state->fade_samples = tag_fade_samples;
@@ -17757,7 +17779,8 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
         state->timeline_source_anchor = 0;
         state->timeline_scaled_anchor = 0;
         state->timeline_speed_percent = effective_speed_percent_locked(state);
-        state->timeline_valid = stream_audio ? 1 : 0;
+        state->timeline_valid =
+            stream_audio || solo_filter_active ? 1 : 0;
         state->time_label_cache_valid = 0;
     }
     unlock_state(state);
