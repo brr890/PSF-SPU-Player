@@ -10804,6 +10804,8 @@ static void set_psf1_display_mode(
     save_psf1_display_mode(state->psf1_display_mode);
     update_settings_menu_check(hwnd, state);
     state->scroll_y = 0;
+    state->gauge_only_paint_pending = 0;
+    state->paint_frame_initialized = 0;
     apply_psf_window_mode(hwnd, state, state->psf_version);
     update_scrollbar(hwnd, state);
     InvalidateRect(hwnd, NULL, TRUE);
@@ -18394,6 +18396,7 @@ static int ensure_psf1_track_keyboard(
     PlayerState *state,
     HDC reference_dc,
     int dark,
+    int x,
     int width)
 {
     HBRUSH white_brush;
@@ -18402,7 +18405,10 @@ static int ensure_psf1_track_keyboard(
     HGDIOBJ old_brush;
     HGDIOBJ old_pen;
     RECT rect = {0, 0, width, PSF1_TRACK_KEYBOARD_HEIGHT};
-    POINT device_points[2] = {{0, 0}, {width, PSF1_TRACK_KEYBOARD_HEIGHT}};
+    POINT device_points[2] = {
+        {x, 0},
+        {x + width, PSF1_TRACK_KEYBOARD_HEIGHT}
+    };
     int device_width;
     int device_height;
     int white_count = psf1_track_white_key_count();
@@ -18413,9 +18419,9 @@ static int ensure_psf1_track_keyboard(
         return 0;
     }
     if (!LPtoDP(reference_dc, device_points, 2)) {
-        device_points[0].x = 0;
+        device_points[0].x = x;
         device_points[0].y = 0;
-        device_points[1].x = width;
+        device_points[1].x = x + width;
         device_points[1].y = PSF1_TRACK_KEYBOARD_HEIGHT;
     }
     device_width = device_points[1].x - device_points[0].x;
@@ -18977,7 +18983,7 @@ static void paint_core_panel(
                 (akao->ticks_per_beat != 0 ? 192u / akao->ticks_per_beat : 0u);
             if (akao->driver_type == PSF1_MUSIC_DRIVER_SONY_SEQ) {
                 snprintf(line, sizeof(line),
-                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%06lX(%7.3f) %2u/%2u beat:%02u bar:%04u",
+                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%06lX(%7.3f) %2u/%2u beat:%-2u bar:%-4u",
                     active_count,
                     attack_count,
                     decay_count,
@@ -18994,7 +19000,7 @@ static void paint_core_panel(
                     akao->measure);
             } else {
                 snprintf(line, sizeof(line),
-                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%04lX(%7.3f) %2u/%2u beat:%02u bar:%04u",
+                    "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%04lX(%7.3f) %2u/%2u beat:%-2u bar:%-4u",
                     active_count,
                     attack_count,
                     decay_count,
@@ -19623,8 +19629,10 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
              (int)GetBValue(gauge_background_color)) < 384;
         int keyboard_width = psf1_values_visible_for_state(state, psf_version) ?
             CORE_PANEL_WIDTH - 16 : CORE_PANEL_WIDTH - 56;
+        int keyboard_x = psf1_values_visible_for_state(state, psf_version) ?
+            core0_x + 8 : core0_x + 48;
         ensure_psf1_track_keyboard(
-            state, hdc, dark_keyboard, keyboard_width);
+            state, hdc, dark_keyboard, keyboard_x, keyboard_width);
     }
 
     paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, &akao, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, core0_x, y, line_height, active_header_line_height, voice_scroll_y, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
@@ -20156,7 +20164,7 @@ static void format_core_header_line(
 
         if (akao->driver_type == PSF1_MUSIC_DRIVER_SONY_SEQ) {
             snprintf(line, line_size,
-                "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%06lX(%7.3f) %u/%u beat:%02u bar:%04u",
+                "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%06lX(%7.3f) %u/%u beat:%-2u bar:%-4u",
                 active_count,
                 attack_count,
                 decay_count,
@@ -20174,7 +20182,7 @@ static void format_core_header_line(
                 akao->measure);
         } else {
             snprintf(line, line_size,
-                "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%04lX(%7.3f) %u/%u beat:%02u bar:%04u",
+                "active:%02d/24  ADSR:%02d/%02d/%02d/%02d  rv:0x%04X/0x%04X nclk:%5uHz tempo:0x%04lX(%7.3f) %u/%u beat:%-2u bar:%-4u",
                 active_count,
                 attack_count,
                 decay_count,
@@ -20511,8 +20519,8 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         append_darkable_menu_popup(settings_menu, lr_color_menu, "L/R color");
         append_darkable_menu_separator(settings_menu);
         AppendMenuA(settings_menu, MF_OWNERDRAW | MF_CHECKED, IDM_MAIN_ENABLED, "Main");
-        AppendMenuA(settings_menu, MF_OWNERDRAW | MF_CHECKED, IDM_XA_CDDA_ENABLED, "XA/CD-DA");
         AppendMenuA(settings_menu, MF_OWNERDRAW | MF_CHECKED, IDM_REVERB_ENABLED, "Reverb");
+        AppendMenuA(settings_menu, MF_OWNERDRAW | MF_CHECKED, IDM_XA_CDDA_ENABLED, "XA/CD-DA");
         append_darkable_menu_item(performance_menu, IDM_PERF_LOW, "Low spec");
         append_darkable_menu_item(performance_menu, IDM_PERF_MIDDLE, "Middle spec");
         append_darkable_menu_item(performance_menu, IDM_PERF_HIGH, "High spec");
