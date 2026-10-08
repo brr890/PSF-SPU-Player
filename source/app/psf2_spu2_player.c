@@ -221,6 +221,8 @@
 #define PLAYER_PSF1_WIDTH 890
 #define PLAYER_PSF1_HEIGHT 1080
 #define PLAYER_PSF1_KEYBOARD_ONLY_HEIGHT 679
+#define PLAYER_PSF2_KEYBOARD_HEIGHT 1080
+#define PLAYER_PSF2_KEYBOARD_ONLY_HEIGHT 679
 #define PLAYER_FULLSCREEN_CHROME_PERCENT 85
 #define PLAYER_PSF2_FULLSCREEN_CONTENT_PERCENT 98
 #define PLAYER_PSF2_FULLSCREEN_VERTICAL_PERCENT 108
@@ -230,7 +232,7 @@
 #define CORE_PANEL_WIDTH 832
 #define CORE_PANEL_GAP 8
 #define CORE0_X 8
-#define CORE1_X (CORE0_X + CORE_PANEL_WIDTH + CORE_PANEL_GAP)
+#define CORE1_X (CORE0_X + CORE_PANEL_WIDTH + CORE_PANEL_GAP - PLAYER_METER_CHAR_WIDTH)
 #define SPU2_CORE_STRIDE 0x0400u
 #define PS1_SPU_BASE 0x1f801c00u
 #define PS1_SPU_END 0x1f801dffu
@@ -364,6 +366,7 @@ typedef struct AudioDisplaySnapshot {
     uint64_t voice_display_hold_until[2][24];
     Spu2LogVoiceSnapshot voice_display_hold[2][24];
     uint32_t psf1_voice_timbre_key[24];
+    uint32_t psf2_voice_timbre_key[2][24];
     uint64_t timeline_sample_pos;
     uint64_t sequence;
     int stopped_display;
@@ -423,6 +426,7 @@ typedef struct PlayerState {
     HFONT meter_number_font;
     int meter_number_font_height;
     int meter_number_cell_width;
+    int meter_number_font_weight;
     ABC meter_number_metrics[16];
     int meter_line_height;
     int paint_width;
@@ -433,6 +437,8 @@ typedef struct PlayerState {
     int paint_frame_initialized;
     RECT voice_number_hit_rects[2][24];
     uint8_t voice_number_hit_valid[2][24];
+    RECT core_label_hit_rects[2];
+    uint8_t core_label_hit_valid[2];
     HWND open_button;
     HWND play_button;
     HWND pause_button;
@@ -479,6 +485,7 @@ typedef struct PlayerState {
     int debug_edit_controls;
     int playback_only;
     int psf1_display_mode;
+    int psf2_display_mode;
     int timbre_scan_enabled;
     int stream_audio_mode;
     int frame_advance;
@@ -523,6 +530,7 @@ typedef struct PlayerState {
     uint64_t voice_display_hold_until[2][24];
     Spu2LogVoiceSnapshot voice_display_hold[2][24];
     uint32_t psf1_voice_timbre_key[24];
+    uint32_t psf2_voice_timbre_key[2][24];
     Psf1TuningEntry psf1_tuning_cache[PSF1_TUNING_CACHE_SIZE];
     unsigned psf1_tuning_cache_count;
     uint32_t voice_mute_mask[2];
@@ -899,6 +907,35 @@ static void save_psf1_display_mode(int mode)
         mode != PSF1_DISPLAY_VALUES ? 1 : 0);
 }
 
+static int load_psf2_display_mode(void)
+{
+    char path[MAX_PATH];
+
+    get_player_ini_path(path, sizeof(path));
+    return normalize_psf1_display_mode((int)GetPrivateProfileIntA(
+        "Window", "Psf2DisplayMode", PSF1_DISPLAY_VALUES_KEYBOARD, path));
+}
+
+static void save_psf2_display_mode(int mode)
+{
+    char path[MAX_PATH];
+
+    get_player_ini_path(path, sizeof(path));
+    write_profile_int(path, "Window", "Psf2DisplayMode",
+        normalize_psf1_display_mode(mode));
+}
+
+static int display_mode_for_version(
+    const PlayerState *state,
+    uint8_t psf_version)
+{
+    if (state == NULL) {
+        return PSF1_DISPLAY_VALUES_KEYBOARD;
+    }
+    return normalize_psf1_display_mode(psf_version == 0x01u ?
+        state->psf1_display_mode : state->psf2_display_mode);
+}
+
 static const char *psf1_mode_window_key(int display_mode, int field)
 {
     static const char *keys[PSF1_DISPLAY_MODE_COUNT][4] = {
@@ -922,11 +959,55 @@ static int psf1_mode_default_height(int display_mode)
     }
 }
 
-static int load_psf1_mode_window_position(int display_mode, int *x, int *y)
+static const char *psf2_mode_window_key(int display_mode, int field)
+{
+    static const char *keys[PSF1_DISPLAY_MODE_COUNT][4] = {
+        {"Psf2NormalX", "Psf2NormalY", "Psf2NormalWidth", "Psf2NormalHeight"},
+        {"Psf2KeyboardX", "Psf2KeyboardY", "Psf2KeyboardWidth", "Psf2KeyboardHeight"},
+        {"Psf2KeyboardOnlyX", "Psf2KeyboardOnlyY", "Psf2KeyboardOnlyWidth", "Psf2KeyboardOnlyHeight"}
+    };
+
+    return keys[normalize_psf1_display_mode(display_mode)][field];
+}
+
+static int psf2_mode_default_height(int display_mode)
+{
+    switch (normalize_psf1_display_mode(display_mode)) {
+    case PSF1_DISPLAY_VALUES_KEYBOARD:
+        return PLAYER_PSF2_KEYBOARD_HEIGHT;
+    case PSF1_DISPLAY_KEYBOARD_ONLY:
+        return PLAYER_PSF2_KEYBOARD_ONLY_HEIGHT;
+    default:
+        return PLAYER_DEFAULT_HEIGHT;
+    }
+}
+
+static const char *mode_window_key(
+    uint8_t psf_version,
+    int display_mode,
+    int field)
+{
+    return psf_version == 0x01u ?
+        psf1_mode_window_key(display_mode, field) :
+        psf2_mode_window_key(display_mode, field);
+}
+
+static int mode_default_height(uint8_t psf_version, int display_mode)
+{
+    return psf_version == 0x01u ?
+        psf1_mode_default_height(display_mode) :
+        psf2_mode_default_height(display_mode);
+}
+
+static int load_mode_window_position(
+    uint8_t psf_version,
+    int display_mode,
+    int *x,
+    int *y)
 {
     static const int missing = 0x7fffffff;
-    const char *x_key = psf1_mode_window_key(display_mode, 0);
-    const char *y_key = psf1_mode_window_key(display_mode, 1);
+    const char *x_key = mode_window_key(psf_version, display_mode, 0);
+    const char *y_key = mode_window_key(psf_version, display_mode, 1);
     char path[MAX_PATH];
     int loaded_x;
     int loaded_y;
@@ -945,17 +1026,19 @@ static int load_psf1_mode_window_position(int display_mode, int *x, int *y)
     return 1;
 }
 
-static int load_psf1_mode_window_size(
+static int load_mode_window_size(
+    uint8_t psf_version,
     int display_mode,
     int *width,
     int *height)
 {
     static const int missing = 0x7fffffff;
-    const char *width_key = psf1_mode_window_key(display_mode, 2);
-    const char *height_key = psf1_mode_window_key(display_mode, 3);
+    const char *width_key = mode_window_key(psf_version, display_mode, 2);
+    const char *height_key = mode_window_key(psf_version, display_mode, 3);
     char path[MAX_PATH];
     int loaded_width;
     int loaded_height;
+    int expected_width;
     int minimum_height;
 
     if (width == NULL || height == NULL) {
@@ -966,9 +1049,11 @@ static int load_psf1_mode_window_size(
         "Window", width_key, missing, path);
     loaded_height = (int)GetPrivateProfileIntA(
         "Window", height_key, missing, path);
-    minimum_height = psf1_mode_default_height(display_mode);
+    expected_width = psf_version == 0x01u ?
+        PLAYER_PSF1_WIDTH : PLAYER_DEFAULT_WIDTH;
+    minimum_height = mode_default_height(psf_version, display_mode);
     if (loaded_width == missing || loaded_height == missing ||
-        loaded_width != PLAYER_PSF1_WIDTH || loaded_height < minimum_height) {
+        loaded_width != expected_width || loaded_height < minimum_height) {
         return 0;
     }
     *width = loaded_width;
@@ -1011,12 +1096,15 @@ static int window_is_or_restores_maximized(HWND hwnd)
         (placement.flags & WPF_RESTORETOMAXIMIZED) != 0;
 }
 
-static void save_psf1_mode_window_bounds(HWND hwnd, int display_mode)
+static void save_mode_window_bounds(
+    HWND hwnd,
+    uint8_t psf_version,
+    int display_mode)
 {
-    const char *x_key = psf1_mode_window_key(display_mode, 0);
-    const char *y_key = psf1_mode_window_key(display_mode, 1);
-    const char *width_key = psf1_mode_window_key(display_mode, 2);
-    const char *height_key = psf1_mode_window_key(display_mode, 3);
+    const char *x_key = mode_window_key(psf_version, display_mode, 0);
+    const char *y_key = mode_window_key(psf_version, display_mode, 1);
+    const char *width_key = mode_window_key(psf_version, display_mode, 2);
+    const char *height_key = mode_window_key(psf_version, display_mode, 3);
     char path[MAX_PATH];
     RECT rect;
 
@@ -1053,8 +1141,8 @@ static void load_window_bounds(
     *x = CW_USEDEFAULT;
     *y = CW_USEDEFAULT;
     *width = default_width;
-    *height = last_psf_version == 0x01u && state != NULL ?
-        psf1_mode_default_height(state->psf1_display_mode) : PLAYER_DEFAULT_HEIGHT;
+    *height = state != NULL ? mode_default_height(last_psf_version,
+        display_mode_for_version(state, last_psf_version)) : PLAYER_DEFAULT_HEIGHT;
 
     get_player_ini_path(path, sizeof(path));
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
@@ -1063,10 +1151,12 @@ static void load_window_bounds(
 
     *x = GetPrivateProfileIntA("Window", "X", *x, path);
     *y = GetPrivateProfileIntA("Window", "Y", *y, path);
-    if (last_psf_version == 0x01u && state != NULL) {
-        load_psf1_mode_window_position(state->psf1_display_mode, x, y);
-        load_psf1_mode_window_size(
-            state->psf1_display_mode, width, height);
+    if (state != NULL) {
+        int display_mode = display_mode_for_version(state, last_psf_version);
+
+        load_mode_window_position(last_psf_version, display_mode, x, y);
+        load_mode_window_size(
+            last_psf_version, display_mode, width, height);
     }
 }
 
@@ -1098,9 +1188,15 @@ static void save_window_bounds(HWND hwnd, const PlayerState *state)
     write_profile_int(path, "Window", "Y", rect.top);
     write_profile_int(path, "Window", "Width", rect.right - rect.left);
     write_profile_int(path, "Window", "Height", rect.bottom - rect.top);
-    if (state != NULL && state->psf_version == 0x01u) {
-        save_psf1_mode_window_bounds(hwnd, state->psf1_display_mode);
-        save_psf1_display_mode(state->psf1_display_mode);
+    if (state != NULL) {
+        int display_mode = display_mode_for_version(state, state->psf_version);
+
+        save_mode_window_bounds(hwnd, state->psf_version, display_mode);
+        if (state->psf_version == 0x01u) {
+            save_psf1_display_mode(display_mode);
+        } else {
+            save_psf2_display_mode(display_mode);
+        }
     }
 }
 
@@ -3152,23 +3248,24 @@ static void update_settings_menu_check(HWND hwnd, const PlayerState *state)
     EnableMenuItem(menu, IDM_TIMBRE_SCAN,
         MF_BYCOMMAND | (state->stream_audio_mode ? MF_GRAYED : MF_ENABLED));
     CheckMenuItem(keyboard_menu, IDM_KEYBOARD_VALUES,
-        MF_BYCOMMAND | (normalize_psf1_display_mode(state->psf1_display_mode) ==
+        MF_BYCOMMAND | (display_mode_for_version(state, state->psf_version) ==
             PSF1_DISPLAY_VALUES ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(keyboard_menu, IDM_KEYBOARD_VALUES_AND_KEYS,
-        MF_BYCOMMAND | (normalize_psf1_display_mode(state->psf1_display_mode) ==
+        MF_BYCOMMAND | (display_mode_for_version(state, state->psf_version) ==
             PSF1_DISPLAY_VALUES_KEYBOARD ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(keyboard_menu, IDM_KEYBOARD_KEYS_ONLY,
-        MF_BYCOMMAND | (normalize_psf1_display_mode(state->psf1_display_mode) ==
+        MF_BYCOMMAND | (display_mode_for_version(state, state->psf_version) ==
             PSF1_DISPLAY_KEYBOARD_ONLY ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(keyboard_menu, IDM_KEYBOARD_VALUES,
-        MF_BYCOMMAND | (state->psf_version == 0x01u ? MF_ENABLED : MF_GRAYED));
+        MF_BYCOMMAND | ((state->psf_version == 0x01u || state->psf_version == 0x02u) ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(keyboard_menu, IDM_KEYBOARD_VALUES_AND_KEYS,
-        MF_BYCOMMAND | (state->psf_version == 0x01u ? MF_ENABLED : MF_GRAYED));
+        MF_BYCOMMAND | ((state->psf_version == 0x01u || state->psf_version == 0x02u) ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(keyboard_menu, IDM_KEYBOARD_KEYS_ONLY,
-        MF_BYCOMMAND | (state->psf_version == 0x01u ? MF_ENABLED : MF_GRAYED));
+        MF_BYCOMMAND | ((state->psf_version == 0x01u || state->psf_version == 0x02u) ? MF_ENABLED : MF_GRAYED));
     if (state->keyboard_parent_menu != NULL) {
         MENUITEMINFOA item;
-        int should_attach = state->psf_version == 0x01u;
+        int should_attach =
+            state->psf_version == 0x01u || state->psf_version == 0x02u;
 
         ZeroMemory(&item, sizeof(item));
         item.cbSize = sizeof(item);
@@ -3481,8 +3578,9 @@ static void psf1_queue_tuning_locked(PlayerState *state, const Spu2LogVoiceSnaps
     uint32_t lsa;
     int existing;
 
-    if (state == NULL || voice == NULL || state->psf_version != 0x01u ||
-        voice->voice >= 24u || voice->envx == 0 ||
+    if (state == NULL || voice == NULL ||
+        (state->psf_version != 0x01u && state->psf_version != 0x02u) ||
+        voice->core >= 2u || voice->voice >= 24u || voice->envx == 0 ||
         (voice->flags & SPU2LOG_VOICE_NOISE) != 0) {
         return;
     }
@@ -3495,7 +3593,11 @@ static void psf1_queue_tuning_locked(PlayerState *state, const Spu2LogVoiceSnaps
     if (lsa == 0u) {
         lsa = ssa;
     }
-    state->psf1_voice_timbre_key[voice->voice] = key;
+    if (state->psf_version == 0x01u) {
+        state->psf1_voice_timbre_key[voice->voice] = key;
+    } else {
+        state->psf2_voice_timbre_key[voice->core][voice->voice] = key;
+    }
     existing = psf1_find_tuning_locked(state, key);
     if (existing >= 0) {
         int previous_backward;
@@ -5840,6 +5942,22 @@ static void toggle_voice_pitch_lock(HWND hwnd, PlayerState *state, unsigned core
             psf2log_set_imported_voice_pitch_lock(core, voice, 1, pitch);
         }
     }
+    InvalidateRect(hwnd, NULL, TRUE);
+}
+
+static void toggle_core_mute(HWND hwnd, PlayerState *state, unsigned core)
+{
+    const uint32_t all_mask = 0x00ffffffu;
+
+    if (state == NULL || core >= 2u) {
+        return;
+    }
+
+    lock_state(state);
+    state->voice_mute_mask[core] =
+        (state->voice_mute_mask[core] & all_mask) == all_mask ? 0u : all_mask;
+    unlock_state(state);
+    apply_voice_mute_masks(state);
     InvalidateRect(hwnd, NULL, TRUE);
 }
 
@@ -9673,33 +9791,35 @@ static uint8_t read_psf_version(const char *path)
 
 static int psf1_keyboard_height_for_state(const PlayerState *state, uint8_t psf_version)
 {
-    return psf_version == 0x01u && state != NULL &&
-        normalize_psf1_display_mode(state->psf1_display_mode) != PSF1_DISPLAY_VALUES ?
+    return state != NULL &&
+        display_mode_for_version(state, psf_version) != PSF1_DISPLAY_VALUES ?
         PSF1_TRACK_KEYBOARD_HEIGHT : 0;
 }
 
 static int psf1_values_visible_for_state(const PlayerState *state, uint8_t psf_version)
 {
-    return psf_version != 0x01u || state == NULL ||
-        normalize_psf1_display_mode(state->psf1_display_mode) !=
+    return state == NULL ||
+        display_mode_for_version(state, psf_version) !=
             PSF1_DISPLAY_KEYBOARD_ONLY;
 }
 
 static int psf1_keyboard_gap_for_state(const PlayerState *state, uint8_t psf_version)
 {
-    return psf_version == 0x01u && state != NULL &&
-        normalize_psf1_display_mode(state->psf1_display_mode) ==
+    return state != NULL &&
+        display_mode_for_version(state, psf_version) ==
             PSF1_DISPLAY_KEYBOARD_ONLY ? PSF1_TRACK_KEYBOARD_GAP : 0;
 }
 
 static int player_height_for_mode(const PlayerState *state, uint8_t psf_version)
 {
-    return psf_version == 0x01u && state != NULL ?
-        psf1_mode_default_height(state->psf1_display_mode) :
-        PLAYER_DEFAULT_HEIGHT;
+    return state != NULL ? mode_default_height(psf_version,
+        display_mode_for_version(state, psf_version)) : PLAYER_DEFAULT_HEIGHT;
 }
 
-static int psf1_values_keyboard_window_height(HWND hwnd, const PlayerState *state)
+static int values_keyboard_window_height(
+    HWND hwnd,
+    const PlayerState *state,
+    uint8_t psf_version)
 {
     RECT window_rect;
     RECT client_rect;
@@ -9708,9 +9828,9 @@ static int psf1_values_keyboard_window_height(HWND hwnd, const PlayerState *stat
     int nonclient_height;
 
     if (hwnd == NULL || state == NULL ||
-        normalize_psf1_display_mode(state->psf1_display_mode) !=
+        display_mode_for_version(state, psf_version) !=
             PSF1_DISPLAY_VALUES_KEYBOARD) {
-        return PLAYER_PSF1_HEIGHT;
+        return mode_default_height(psf_version, PSF1_DISPLAY_VALUES_KEYBOARD);
     }
 
     line_height = state->meter_line_height > 0 ?
@@ -9719,7 +9839,7 @@ static int psf1_values_keyboard_window_height(HWND hwnd, const PlayerState *stat
         (24 * (line_height + PSF1_TRACK_KEYBOARD_HEIGHT)) + 4;
     if (!GetWindowRect(hwnd, &window_rect) ||
         !GetClientRect(hwnd, &client_rect)) {
-        return PLAYER_PSF1_HEIGHT;
+        return mode_default_height(psf_version, PSF1_DISPLAY_VALUES_KEYBOARD);
     }
     nonclient_height = (window_rect.bottom - window_rect.top) -
         (client_rect.bottom - client_rect.top);
@@ -9999,8 +10119,7 @@ static void get_player_content_scale_layout(
         hwnd, state);
     active_header_height =
         (line_height * active_header_scale + 500) / 1000;
-    if (state->psf_version == 0x01u &&
-        normalize_psf1_display_mode(state->psf1_display_mode) ==
+    if (display_mode_for_version(state, state->psf_version) ==
         PSF1_DISPLAY_VALUES_KEYBOARD) {
         int rows_height = 2 + line_height +
             16 * (line_height + PSF1_TRACK_KEYBOARD_HEIGHT);
@@ -10722,23 +10841,20 @@ static void apply_psf_window_mode(HWND hwnd, const PlayerState *state, uint8_t p
         return;
     }
 
-    if (psf_version == 0x01u && state != NULL) {
-        int display_mode = normalize_psf1_display_mode(
-            state->psf1_display_mode);
+    if (state != NULL) {
+        int display_mode = display_mode_for_version(state, psf_version);
 
-        load_psf1_mode_window_size(
-            state->psf1_display_mode, &width, &height);
-        if (load_psf1_mode_window_position(
-                state->psf1_display_mode, &x, &y)) {
+        load_mode_window_size(
+            psf_version, display_mode, &width, &height);
+        if (load_mode_window_position(
+                psf_version, display_mode, &x, &y)) {
             flags &= ~SWP_NOMOVE;
         }
         if (display_mode == PSF1_DISPLAY_VALUES_KEYBOARD) {
-            height = psf1_values_keyboard_window_height(hwnd, state);
+            height = values_keyboard_window_height(hwnd, state, psf_version);
         } else if (display_mode == PSF1_DISPLAY_VALUES) {
             height = player_values_window_height(hwnd, state);
         }
-    } else {
-        height = player_values_window_height(hwnd, state);
     }
     if (g_main_restore_position_valid &&
         (IsZoomed(hwnd) || g_main_restore_position_active)) {
@@ -10785,23 +10901,31 @@ static void toggle_player_maximized(HWND hwnd)
     ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
 }
 
-static void set_psf1_display_mode(
+static void set_track_display_mode(
     HWND hwnd,
     PlayerState *state,
     int display_mode)
 {
+    int *current_mode;
+
     display_mode = normalize_psf1_display_mode(display_mode);
-    if (state == NULL || state->psf_version != 0x01u) {
+    if (state == NULL ||
+        (state->psf_version != 0x01u && state->psf_version != 0x02u)) {
         return;
     }
-    if (display_mode == normalize_psf1_display_mode(
-            state->psf1_display_mode)) {
+    current_mode = state->psf_version == 0x01u ?
+        &state->psf1_display_mode : &state->psf2_display_mode;
+    if (display_mode == normalize_psf1_display_mode(*current_mode)) {
         update_settings_menu_check(hwnd, state);
         return;
     }
-    save_psf1_mode_window_bounds(hwnd, state->psf1_display_mode);
-    state->psf1_display_mode = display_mode;
-    save_psf1_display_mode(state->psf1_display_mode);
+    save_mode_window_bounds(hwnd, state->psf_version, *current_mode);
+    *current_mode = display_mode;
+    if (state->psf_version == 0x01u) {
+        save_psf1_display_mode(display_mode);
+    } else {
+        save_psf2_display_mode(display_mode);
+    }
     update_settings_menu_check(hwnd, state);
     state->scroll_y = 0;
     state->gauge_only_paint_pending = 0;
@@ -10811,7 +10935,7 @@ static void set_psf1_display_mode(
     InvalidateRect(hwnd, NULL, TRUE);
 }
 
-static void cycle_psf1_display_mode(HWND hwnd, PlayerState *state)
+static void cycle_track_display_mode(HWND hwnd, PlayerState *state)
 {
     int display_mode;
 
@@ -10819,9 +10943,9 @@ static void cycle_psf1_display_mode(HWND hwnd, PlayerState *state)
         return;
     }
     display_mode =
-        (normalize_psf1_display_mode(state->psf1_display_mode) + 1) %
+        (display_mode_for_version(state, state->psf_version) + 1) %
         PSF1_DISPLAY_MODE_COUNT;
-    set_psf1_display_mode(hwnd, state, display_mode);
+    set_track_display_mode(hwnd, state, display_mode);
 }
 
 static void update_time_label_position(
@@ -11323,18 +11447,21 @@ static int calculate_content_height(HDC hdc, const PlayerState *state)
     GetTextMetricsA(hdc, &tm);
     line_height = tm.tmHeight + 4;
     core0_count = visible_voice_count(&state->live, 0, state->hide_inactive);
-    if (state->psf_version == 0x01u) {
+    core1_count = state->psf_version == 0x01u ? 0 :
+        visible_voice_count(&state->live, 1, state->hide_inactive);
+    if (psf1_keyboard_height_for_state(state, state->psf_version) > 0) {
         int values_height = psf1_values_visible_for_state(
             state, state->psf_version) ? line_height : 0;
+        int visible_count = core0_count > core1_count ? core0_count : core1_count;
+
         return CONTROLS_HEIGHT + 6 +
             (line_height * (values_height > 0 ? 2 : 1)) +
             (values_height > 0 ? 0 : psf1_keyboard_gap_for_state(
                 state, state->psf_version)) +
             ((values_height + psf1_keyboard_height_for_state(
                 state, state->psf_version) + psf1_keyboard_gap_for_state(
-                state, state->psf_version)) * core0_count);
+                state, state->psf_version)) * visible_count);
     }
-    core1_count = visible_voice_count(&state->live, 1, state->hide_inactive);
 
     return CONTROLS_HEIGHT + 6 + (line_height * 2) +
         (line_height * (core0_count > core1_count ? core0_count : core1_count));
@@ -11343,8 +11470,7 @@ static int calculate_content_height(HDC hdc, const PlayerState *state)
 static int player_voice_scroll_enabled(HWND hwnd, const PlayerState *state)
 {
     return hwnd != NULL && state != NULL && IsZoomed(hwnd) &&
-        state->psf_version == 0x01u &&
-        normalize_psf1_display_mode(state->psf1_display_mode) ==
+        display_mode_for_version(state, state->psf_version) ==
             PSF1_DISPLAY_VALUES_KEYBOARD;
 }
 
@@ -11363,6 +11489,8 @@ static int player_voice_scroll_metrics(
     int row_step;
     int rows_bottom;
     int visible_rows;
+    int viewport_height;
+    int max_scroll;
 
     if (!player_voice_scroll_enabled(hwnd, state) ||
         !GetClientRect(hwnd, &client_rect)) {
@@ -11381,17 +11509,32 @@ static int player_voice_scroll_metrics(
     visible_rows = 16;
     rows_top = 2 + CONTROLS_HEIGHT + active_header_height + line_height;
     rows_bottom = rows_top + 24 * row_step;
+    viewport_height = visible_rows * row_step;
+    if (state->psf_version == 0x02u) {
+        /* Match the scroll range to the actual viewport, including its 4px margin. */
+        int logical_bottom = (int)(((int64_t)(client_rect.bottom - 4 -
+            layout.dest_y) * layout.base_height) / layout.dest_height);
+
+        viewport_height = logical_bottom - rows_top;
+        if (viewport_height < 1) {
+            viewport_height = 1;
+        }
+    }
+    max_scroll = rows_bottom - rows_top - viewport_height;
+    if (max_scroll < 0) {
+        max_scroll = 0;
+    }
     if (total_height != NULL) {
         *total_height = rows_bottom - rows_top;
     }
     if (page_height != NULL) {
-        *page_height = visible_rows * row_step;
+        *page_height = viewport_height;
     }
     if (device_top != NULL) {
         *device_top = layout.dest_y + (int)(((int64_t)rows_top *
             layout.dest_height) / layout.base_height);
     }
-    return (24 - visible_rows) * row_step;
+    return max_scroll;
 }
 
 static int player_voice_scroll_max(HWND hwnd, const PlayerState *state)
@@ -11892,6 +12035,9 @@ static void capture_audio_display_snapshot(
     memcpy(snapshot->psf1_voice_timbre_key,
         state->psf1_voice_timbre_key,
         sizeof(snapshot->psf1_voice_timbre_key));
+    memcpy(snapshot->psf2_voice_timbre_key,
+        state->psf2_voice_timbre_key,
+        sizeof(snapshot->psf2_voice_timbre_key));
     snapshot->timeline_sample_pos = timeline_sample_at_locked(
         state, snapshot->live.last_sample_pos);
     snapshot->sequence = sequence;
@@ -11907,8 +12053,11 @@ static void capture_audio_display_snapshot(
             sizeof(snapshot->voice_display_hold));
         ZeroMemory(snapshot->psf1_voice_timbre_key,
             sizeof(snapshot->psf1_voice_timbre_key));
+        ZeroMemory(snapshot->psf2_voice_timbre_key,
+            sizeof(snapshot->psf2_voice_timbre_key));
         snapshot->timeline_sample_pos = 0;
         snapshot->stopped_display = 1;
+        snapshot->startup_track_dimmed = state->psf_version == 0x02u;
     }
     snapshot->valid = 1;
     unlock_state(state);
@@ -13229,6 +13378,7 @@ static int psf1_is_silent_loop_redirect(
 static void psf1_process_tuning_request(PlayerState *state)
 {
     Psf2CoreBridge *core;
+    uint8_t psf_version = 0;
     uint8_t *encoded = NULL;
     int16_t *pcm = NULL;
     uint32_t ssa = 0;
@@ -13252,7 +13402,8 @@ static void psf1_process_tuning_request(PlayerState *state)
         return;
     }
     lock_state(state);
-    if (state->psf_version == 0x01u && state->core != NULL) {
+    if ((state->psf_version == 0x01u || state->psf_version == 0x02u) &&
+        state->core != NULL) {
         for (i = 0; i < state->psf1_tuning_cache_count; ++i) {
             if (state->psf1_tuning_cache[i].status == PSF1_TUNING_PENDING ||
                 state->psf1_tuning_cache[i].status == PSF1_TUNING_REFRESH_PENDING) {
@@ -13269,6 +13420,7 @@ static void psf1_process_tuning_request(PlayerState *state)
         }
     }
     core = state->core;
+    psf_version = state->psf_version;
     unlock_state(state);
     if (index >= PSF1_TUNING_CACHE_SIZE || core == NULL) {
         return;
@@ -13280,7 +13432,7 @@ static void psf1_process_tuning_request(PlayerState *state)
        to the real waveform at LSA. The target can be before or after SSA.
        Only follow it after validating the SSA block itself, because other
        drivers briefly expose a stale backward loop pointer at key-on. */
-    if (lsa != 0u && lsa != ssa) {
+    if (psf_version == 0x01u && lsa != 0u && lsa != ssa) {
         if (psf1_is_silent_loop_redirect(core, ssa)) {
             analysis_ssa = lsa;
             analysis_lsa = lsa;
@@ -13353,7 +13505,8 @@ static void psf1_process_tuning_request(PlayerState *state)
             c4_pitch = (uint16_t)estimated;
         }
         player_log(
-            "PS1 tuning ssa=%05lX source=%05lX frames=%lu loop_frame=%lu c4=%04X",
+            "%s tuning ssa=%05lX source=%05lX frames=%lu loop_frame=%lu c4=%04X",
+            psf_version == 0x01u ? "PS1" : "PS2",
             (unsigned long)ssa,
             (unsigned long)analysis_ssa,
             (unsigned long)pcm_frames,
@@ -17623,8 +17776,9 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     read_psf_timing_samples(
         path, &tag_length_samples, &tag_fade_samples);
 
-    if (state != NULL && state->psf_version == 0x01u) {
-        save_psf1_mode_window_bounds(hwnd, state->psf1_display_mode);
+    if (state != NULL) {
+        save_mode_window_bounds(hwnd, state->psf_version,
+            display_mode_for_version(state, state->psf_version));
     }
     stop_playback_for_track_switch(state);
     player_log("start playback after stop");
@@ -17666,6 +17820,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
         preview_free_samples_locked(state);
         reset_timbre_list_locked(state);
         ZeroMemory(state->psf1_voice_timbre_key, sizeof(state->psf1_voice_timbre_key));
+        ZeroMemory(state->psf2_voice_timbre_key, sizeof(state->psf2_voice_timbre_key));
         ZeroMemory(state->psf1_tuning_cache, sizeof(state->psf1_tuning_cache));
         state->psf1_tuning_cache_count = 0;
         state->ps2_startup_origin_valid = 0;
@@ -18570,6 +18725,7 @@ static void paint_psf1_track_keyboard(
     int device_y;
     int device_width;
     int device_height;
+    int source_width;
     int saved_dc;
 
     if (hdc == NULL || state == NULL || state->psf1_keyboard_dc == NULL ||
@@ -18596,13 +18752,14 @@ static void paint_psf1_track_keyboard(
     if (device_height < 0) {
         device_height = -device_height;
     }
-    if (device_width != state->psf1_keyboard_device_width) {
+    source_width = state->psf1_keyboard_device_width;
+    if (device_width <= 0 || source_width <= 0) {
         return;
     }
-    /* An anisotropic fullscreen scale can round the same logical height to
-       adjacent device-pixel sizes depending on the row's Y position. Use the
-       cached physical keyboard height for every row so none are skipped and
-       every border remains a single device pixel. */
+    /* An anisotropic fullscreen scale can round the same logical size to
+       adjacent device-pixel sizes depending on the row and core position.
+       Keep one cached source size, stretch its width when necessary, and use
+       its physical height for every row so neither core is skipped. */
     device_height = state->psf1_keyboard_device_height;
     saved_dc = SaveDC(hdc);
     if (saved_dc == 0) {
@@ -18611,6 +18768,7 @@ static void paint_psf1_track_keyboard(
     SetMapMode(hdc, MM_TEXT);
     SetWindowOrgEx(hdc, 0, 0, NULL);
     SetViewportOrgEx(hdc, 0, 0, NULL);
+    SetStretchBltMode(hdc, COLORONCOLOR);
     if (active_note >= PSF1_TRACK_KEY_FIRST_NOTE &&
         active_note <= PSF1_TRACK_KEY_LAST_NOTE) {
         RECT key;
@@ -18622,10 +18780,10 @@ static void paint_psf1_track_keyboard(
         HBRUSH active_brush = CreateSolidBrush(
             muted ? RGB(154, 78, 88) : RGB(230, 64, 84));
 
-        psf1_track_key_rect(active_note, device_width, device_height, &key);
+        psf1_track_key_rect(active_note, source_width, device_height, &key);
         active_rect = key;
         if (full_key_highlight) {
-            if (active_rect.right < device_width) {
+            if (active_rect.right < source_width) {
                 active_rect.right += 1;
             }
             if (preview_is_black_key(active_note) &&
@@ -18640,7 +18798,7 @@ static void paint_psf1_track_keyboard(
                 if (key.left <= 0) {
                     active_rect.left += 1;
                 }
-                if (active_rect.right >= device_width) {
+                if (active_rect.right >= source_width) {
                     active_rect.right -= 1;
                 }
             }
@@ -18667,7 +18825,7 @@ static void paint_psf1_track_keyboard(
                     if (!preview_is_black_key(note)) {
                         continue;
                     }
-                    psf1_track_key_rect(note, device_width, device_height, &black_key);
+                    psf1_track_key_rect(note, source_width, device_height, &black_key);
                     if (black_key.right < active_rect.left ||
                         black_key.left >= active_rect.right) {
                         continue;
@@ -18681,14 +18839,20 @@ static void paint_psf1_track_keyboard(
                 }
             }
         }
-        BitBlt(hdc, device_x, device_y, device_width, device_height,
-            state->psf1_keyboard_dc, 0, 0, SRCCOPY);
+        if (device_width == source_width) {
+            BitBlt(hdc, device_x, device_y, device_width, device_height,
+                state->psf1_keyboard_dc, 0, 0, SRCCOPY);
+        } else {
+            StretchBlt(hdc, device_x, device_y, device_width, device_height,
+                state->psf1_keyboard_dc, 0, 0,
+                source_width, device_height, SRCCOPY);
+        }
         restore_rect = active_rect;
         if (restore_rect.left < 0) {
             restore_rect.left = 0;
         }
-        if (restore_rect.right > device_width) {
-            restore_rect.right = device_width;
+        if (restore_rect.right > source_width) {
+            restore_rect.right = source_width;
         }
         if (restore_rect.top < 0) {
             restore_rect.top = 0;
@@ -18707,13 +18871,19 @@ static void paint_psf1_track_keyboard(
         }
         DeleteObject(active_brush);
     } else {
-        BitBlt(hdc, device_x, device_y, device_width, device_height,
-            state->psf1_keyboard_dc, 0, 0, SRCCOPY);
+        if (device_width == source_width) {
+            BitBlt(hdc, device_x, device_y, device_width, device_height,
+                state->psf1_keyboard_dc, 0, 0, SRCCOPY);
+        } else {
+            StretchBlt(hdc, device_x, device_y, device_width, device_height,
+                state->psf1_keyboard_dc, 0, 0,
+                source_width, device_height, SRCCOPY);
+        }
     }
     RestoreDC(hdc, saved_dc);
 }
 
-static int prepare_fullscreen_number_font(HDC hdc, PlayerState *state)
+static int prepare_fullscreen_number_font(HDC hdc, PlayerState *state, int weight)
 {
     SIZE window_extent;
     SIZE viewport_extent;
@@ -18736,7 +18906,8 @@ static int prepare_fullscreen_number_font(HDC hdc, PlayerState *state)
     }
     if (state->meter_number_font != NULL &&
         state->meter_number_font_height == height &&
-        state->meter_number_cell_width == cell_width) {
+        state->meter_number_cell_width == cell_width &&
+        state->meter_number_font_weight == weight) {
         return 1;
     }
     saved_dc = SaveDC(hdc);
@@ -18751,7 +18922,7 @@ static int prepare_fullscreen_number_font(HDC hdc, PlayerState *state)
         unsigned i;
         int fits = 1;
 
-        font = CreateFontA(-height, font_width, 0, 0, FW_BOLD,
+        font = CreateFontA(-height, font_width, 0, 0, weight,
             FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
             FIXED_PITCH | FF_MODERN, PLAYER_METER_FONT_FACE);
@@ -18787,8 +18958,56 @@ static int prepare_fullscreen_number_font(HDC hdc, PlayerState *state)
     state->meter_number_font = font;
     state->meter_number_font_height = height;
     state->meter_number_cell_width = cell_width;
+    state->meter_number_font_weight = weight;
     memcpy(state->meter_number_metrics, metrics, sizeof(metrics));
     return 1;
+}
+
+static void paint_fullscreen_voice_text(
+    HDC hdc,
+    const PlayerState *state,
+    const POLYTEXTA *text,
+    unsigned count)
+{
+    POLYTEXTA device_text[4];
+    POINT origins[4];
+    int advances[34];
+    unsigned i;
+    int saved_dc;
+
+    if (count == 0 || count > 4u) {
+        return;
+    }
+    for (i = 0; i < count; ++i) {
+        if (text[i].n > 34u) {
+            return;
+        }
+        device_text[i] = text[i];
+        origins[i].x = text[i].x;
+        origins[i].y = text[i].y;
+    }
+    if (!LPtoDP(hdc, origins, count)) {
+        return;
+    }
+    saved_dc = SaveDC(hdc);
+    if (saved_dc == 0) {
+        return;
+    }
+    SetMapMode(hdc, MM_TEXT);
+    SetWindowOrgEx(hdc, 0, 0, NULL);
+    SetViewportOrgEx(hdc, 0, 0, NULL);
+    SelectObject(hdc, state->meter_number_font);
+    SetTextCharacterExtra(hdc, 0);
+    for (i = 0; i < 34u; ++i) {
+        advances[i] = state->meter_number_cell_width;
+    }
+    for (i = 0; i < count; ++i) {
+        device_text[i].x = origins[i].x;
+        device_text[i].y = origins[i].y;
+        device_text[i].pdx = advances;
+    }
+    PolyTextOutA(hdc, device_text, count);
+    RestoreDC(hdc, saved_dc);
 }
 
 static void paint_fullscreen_voice_numbers(
@@ -18889,7 +19108,7 @@ static void paint_core_panel(
     const uint32_t gauge_env[2][24],
     const uint32_t gauge_vol_l[2][24],
     const uint32_t gauge_vol_r[2][24],
-    const int psf1_track_notes[24],
+    const int track_notes[2][24],
     const Psf1AkaoPlaybackState *akao,
     unsigned core,
     int hide_inactive,
@@ -19064,9 +19283,32 @@ static void paint_core_panel(
             int text_length = (int)strlen(line);
             int active_header_x = x +
                 (CORE_PANEL_WIDTH - text_length * text_char_width) / 2;
+            int core_label_muted = 0;
 
-            ExtTextOutA(hdc, active_header_x, y, 0, NULL,
-                line, (UINT)text_length, text_advances);
+            if (show_core_label && player_state != NULL) {
+                RECT *label_rect = &player_state->core_label_hit_rects[core];
+
+                label_rect->left = active_header_x;
+                label_rect->right = active_header_x + 6 * text_char_width;
+                label_rect->top = y;
+                label_rect->bottom = y + line_height;
+                player_state->core_label_hit_valid[core] = 1u;
+                lock_state(player_state);
+                core_label_muted =
+                    (player_state->voice_mute_mask[core] & 0x00ffffffu) == 0x00ffffffu;
+                unlock_state(player_state);
+            }
+            if (core_label_muted) {
+                SetTextColor(hdc, muted_text_color);
+                ExtTextOutA(hdc, active_header_x, y, 0, NULL,
+                    line, 6u, text_advances);
+                SetTextColor(hdc, active_text_color);
+                ExtTextOutA(hdc, active_header_x + 6 * text_char_width, y, 0, NULL,
+                    line + 6, (UINT)(text_length - 6), text_advances);
+            } else {
+                ExtTextOutA(hdc, active_header_x, y, 0, NULL,
+                    line, (UINT)text_length, text_advances);
+            }
         }
         y += active_header_line_height;
 
@@ -19146,12 +19388,13 @@ static void paint_core_panel(
     }
 
     if (!gauges_only && show_values &&
-        psf_version == 0x01u &&
-        psf1_keyboard_height_for_state(player_state, psf_version) > 0 &&
+        player_state != NULL &&
+        (psf_version == 0x02u ||
+            psf1_keyboard_height_for_state(player_state, psf_version) > 0) &&
         player_state->meter_bold_font != NULL) {
         previous_row_font = (HFONT)SelectObject(hdc, player_state->meter_bold_font);
         if (IsZoomed(player_state->hwnd)) {
-            fullscreen_numbers = prepare_fullscreen_number_font(hdc, player_state);
+            fullscreen_numbers = prepare_fullscreen_number_font(hdc, player_state, FW_BOLD);
         }
     }
 
@@ -19250,6 +19493,7 @@ static void paint_core_panel(
             if (fullscreen_numbers) {
                 char text_only_line[34];
                 char text_only_detail[26];
+                POLYTEXTA decorations[3];
                 unsigned field;
 
                 memcpy(text_only_line, line, sizeof(text_only_line));
@@ -19260,31 +19504,31 @@ static void paint_core_panel(
                 for (field = 0; field < 5u; ++field) {
                     memset(text_only_detail + 11u + field * 3u, ' ', 2);
                 }
+                decorations[0] = row_text[0];
+                decorations[0].y = y;
+                decorations[0].lpstr = text_only_line;
+                decorations[1] = row_text[1];
+                decorations[1].y = y;
+                decorations[1].lpstr = text_only_line + 18;
+                decorations[2] = row_text[4];
+                decorations[2].y = y;
+                decorations[2].lpstr = text_only_detail;
                 if (!active) {
-                    ExtTextOutA(hdc, x + COL_TEXT_X, y,
-                        0, NULL, text_only_line, 6, text_advances);
-                    ExtTextOutA(hdc, x + COL_TEXT_X + 18 * text_char_width, y,
-                        0, NULL, text_only_line + 18, 9, text_advances);
-                    ExtTextOutA(hdc, x + COL_FLAGS_X, y,
-                        0, NULL, text_only_detail, 25, text_advances);
+                    POLYTEXTA phase = decorations[0];
+
+                    decorations[0].n = 6;
+                    paint_fullscreen_voice_text(
+                        hdc, player_state, decorations, 3);
                     SetTextColor(hdc,
                         muted ? muted_text_color : inactive_text_color);
-                    ExtTextOutA(hdc, x + COL_TEXT_X + 6 * text_char_width, y,
-                        0, NULL, line + 6, 11, text_advances);
+                    phase.x = x + COL_TEXT_X + 6 * text_char_width;
+                    phase.lpstr = line + 6;
+                    phase.n = 11;
+                    paint_fullscreen_voice_text(hdc, player_state, &phase, 1);
                     SetTextColor(hdc, row_text_color);
                 } else {
-                    POLYTEXTA decorations[3];
-
-                    decorations[0] = row_text[0];
-                    decorations[0].y = y;
-                    decorations[0].lpstr = text_only_line;
-                    decorations[1] = row_text[1];
-                    decorations[1].y = y;
-                    decorations[1].lpstr = text_only_line + 18;
-                    decorations[2] = row_text[4];
-                    decorations[2].y = y;
-                    decorations[2].lpstr = text_only_detail;
-                    PolyTextOutA(hdc, decorations, 3);
+                    paint_fullscreen_voice_text(
+                        hdc, player_state, decorations, 3);
                 }
                 paint_fullscreen_voice_numbers(
                     hdc, player_state, x, y, line, env_text, voice_detail);
@@ -19344,11 +19588,10 @@ static void paint_core_panel(
                 force_fullscreen_black_border);
         }
 
-        if (psf_version == 0x01u &&
-            psf1_keyboard_height_for_state(player_state, psf_version) > 0 &&
+        if (psf1_keyboard_height_for_state(player_state, psf_version) > 0 &&
             !gauges_only) {
-            int active_note = v->envx >= 1 && psf1_track_notes != NULL ?
-                psf1_track_notes[voice] : -1;
+            int active_note = v->envx >= 1 && track_notes != NULL ?
+                track_notes[core][voice] : -1;
             int keyboard_x = show_values ? x + 8 : x + 48;
             int keyboard_width = show_values ?
                 CORE_PANEL_WIDTH - 16 : CORE_PANEL_WIDTH - 56;
@@ -19417,7 +19660,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     uint32_t gauge_env[2][24];
     uint32_t gauge_vol_l[2][24];
     uint32_t gauge_vol_r[2][24];
-    int psf1_track_notes[24];
+    int track_notes[2][24];
     int use_audible_display;
     int suppress_startup_voice_display;
     int stopped_display;
@@ -19448,10 +19691,13 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     if (!gauges_only) {
         ZeroMemory(state->voice_number_hit_valid,
             sizeof(state->voice_number_hit_valid));
+        ZeroMemory(state->core_label_hit_valid,
+            sizeof(state->core_label_hit_valid));
     }
 
     for (note_voice = 0; note_voice < 24u; ++note_voice) {
-        psf1_track_notes[note_voice] = -1;
+        track_notes[0][note_voice] = -1;
+        track_notes[1][note_voice] = -1;
     }
 
     lock_state(state);
@@ -19485,9 +19731,12 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
         initialize_empty_live_state(&live);
         stopped_display = 1;
     }
-    startup_track_dimmed = psf_version == 0x02u && (use_audible_display ?
-        state->audible_display_snapshot.startup_track_dimmed :
-        state->ps2_startup_track_dimmed);
+    startup_track_dimmed = psf_version == 0x02u &&
+        (suppress_startup_voice_display ||
+            (state->playing && stopped_display && !state->frame_advance) ||
+            (use_audible_display ?
+            state->audible_display_snapshot.startup_track_dimmed :
+            state->ps2_startup_track_dimmed));
     if (!stopped_display) {
         unsigned hold_core;
         unsigned hold_voice;
@@ -19561,18 +19810,30 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     muted_text_color = player_muted_text_color(state);
     gauge_background_color = player_background_color(state);
     gauge_border_color = active_text_color;
-    if (psf_version == 0x01u &&
-        psf1_keyboard_height_for_state(state, psf_version) > 0) {
-        const uint32_t *voice_keys = use_audible_display ?
-            state->audible_display_snapshot.psf1_voice_timbre_key :
-            state->psf1_voice_timbre_key;
+    if (psf1_keyboard_height_for_state(state, psf_version) > 0) {
+        unsigned note_core;
 
-        for (note_voice = 0; note_voice < 24u; ++note_voice) {
-            const Spu2LogVoiceSnapshot *voice = &live.voices[0][note_voice];
-            if (voice->envx >= 1 &&
-                (voice->flags & SPU2LOG_VOICE_NOISE) == 0) {
-                psf1_track_notes[note_voice] = psf1_note_for_voice_locked(
-                    state, voice_keys[note_voice], voice->pitch);
+        for (note_core = 0; note_core < display_core_count; ++note_core) {
+            const uint32_t *voice_keys;
+
+            if (psf_version == 0x01u) {
+                voice_keys = use_audible_display ?
+                    state->audible_display_snapshot.psf1_voice_timbre_key :
+                    state->psf1_voice_timbre_key;
+            } else {
+                voice_keys = use_audible_display ?
+                    state->audible_display_snapshot.psf2_voice_timbre_key[note_core] :
+                    state->psf2_voice_timbre_key[note_core];
+            }
+            for (note_voice = 0; note_voice < 24u; ++note_voice) {
+                const Spu2LogVoiceSnapshot *voice =
+                    &live.voices[note_core][note_voice];
+                if (voice->envx >= 1 &&
+                    (voice->flags & SPU2LOG_VOICE_NOISE) == 0) {
+                    track_notes[note_core][note_voice] =
+                        psf1_note_for_voice_locked(
+                            state, voice_keys[note_voice], voice->pitch);
+                }
             }
         }
     }
@@ -19613,16 +19874,15 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     y += CONTROLS_HEIGHT;
     voice_scroll_y = player_voice_scroll_enabled(hwnd, state) ?
         state->scroll_y : 0;
-    voice_rows_target_bottom = voice_scroll_y > 0 ||
-        player_voice_scroll_enabled(hwnd, state) ? 0 :
+    voice_rows_target_bottom = psf_version != 0x02u &&
+        (voice_scroll_y > 0 || player_voice_scroll_enabled(hwnd, state)) ? 0 :
         maximized_voice_rows_target_bottom(hwnd, state);
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, active_text_color);
     core0_x = player_core_panel_x(hwnd, state, psf_version, 0u);
 
-    if (psf_version == 0x01u &&
-        psf1_keyboard_height_for_state(state, psf_version) > 0) {
+    if (psf1_keyboard_height_for_state(state, psf_version) > 0) {
         int dark_keyboard =
             ((int)GetRValue(gauge_background_color) +
              (int)GetGValue(gauge_background_color) +
@@ -19635,9 +19895,9 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
             state, hdc, dark_keyboard, keyboard_x, keyboard_width);
     }
 
-    paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, &akao, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, core0_x, y, line_height, active_header_line_height, voice_scroll_y, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
+    paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, track_notes, &akao, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, core0_x, y, line_height, active_header_line_height, voice_scroll_y, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
     if (psf_version != 0x01u) {
-        paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, psf1_track_notes, NULL, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, active_header_line_height, 0, 1, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
+        paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, track_notes, NULL, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, active_header_line_height, voice_scroll_y, 1, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
     }
 
     SelectObject(hdc, old_pen);
@@ -19651,6 +19911,7 @@ static void destroy_player_paint_resources(PlayerState *state)
     if (state == NULL) {
         return;
     }
+
     if (state->paint_dc != NULL && state->paint_old_bitmap != NULL) {
         SelectObject(state->paint_dc, state->paint_old_bitmap);
     }
@@ -19710,6 +19971,7 @@ static void destroy_player_paint_resources(PlayerState *state)
     state->meter_number_font = NULL;
     state->meter_number_font_height = 0;
     state->meter_number_cell_width = 0;
+    state->meter_number_font_weight = 0;
     state->meter_line_height = 0;
     state->paint_width = 0;
     state->paint_height = 0;
@@ -19891,6 +20153,28 @@ static int get_player_display_char_width(HWND hwnd)
 {
     (void)hwnd;
     return PLAYER_METER_CHAR_WIDTH;
+}
+
+static int hit_test_core_label(
+    const PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core)
+{
+    unsigned core;
+
+    if (state == NULL || out_core == NULL ||
+        state->psf_version != 0x02u || state->playback_only) {
+        return 0;
+    }
+    for (core = 0; core < 2u; ++core) {
+        const RECT *label_rect = &state->core_label_hit_rects[core];
+
+        if (state->core_label_hit_valid[core] != 0u &&
+            mouse_x >= label_rect->left && mouse_x < label_rect->right &&
+            mouse_y >= label_rect->top && mouse_y < label_rect->bottom) {
+            *out_core = core;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int hit_test_voice_row(HWND hwnd, PlayerState *state, int mouse_x, int mouse_y, unsigned *out_core, unsigned *out_voice)
@@ -20873,17 +21157,17 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             return 0;
         }
         if (state != NULL && LOWORD(wparam) == IDM_KEYBOARD_VALUES) {
-            set_psf1_display_mode(hwnd, state, PSF1_DISPLAY_VALUES);
+            set_track_display_mode(hwnd, state, PSF1_DISPLAY_VALUES);
             return 0;
         }
         if (state != NULL && LOWORD(wparam) ==
                 IDM_KEYBOARD_VALUES_AND_KEYS) {
-            set_psf1_display_mode(
+            set_track_display_mode(
                 hwnd, state, PSF1_DISPLAY_VALUES_KEYBOARD);
             return 0;
         }
         if (state != NULL && LOWORD(wparam) == IDM_KEYBOARD_KEYS_ONLY) {
-            set_psf1_display_mode(hwnd, state, PSF1_DISPLAY_KEYBOARD_ONLY);
+            set_track_display_mode(hwnd, state, PSF1_DISPLAY_KEYBOARD_ONLY);
             return 0;
         }
         if (state != NULL && LOWORD(wparam) == IDM_FONT_SELECT) {
@@ -20993,7 +21277,7 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         }
         if (state != NULL && wparam == 'K') {
             if ((lparam & (1l << 30)) == 0) {
-                cycle_psf1_display_mode(hwnd, state);
+                cycle_track_display_mode(hwnd, state);
             }
             return 0;
         }
@@ -21030,6 +21314,10 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             unsigned voice;
             unsigned column;
             unsigned side;
+            if (hit_test_core_label(state, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam), &core)) {
+                toggle_core_mute(hwnd, state, core);
+                return 0;
+            }
             if (hit_test_voice_env_column(hwnd, state, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam), &core, &voice)) {
                 if (!debug_edit_controls_active(state)) {
                     return 0;
@@ -21126,6 +21414,10 @@ static LRESULT CALLBACK player_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
             unsigned voice;
             unsigned column;
             unsigned side;
+            if (hit_test_core_label(state, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam), &core)) {
+                toggle_core_mute(hwnd, state, core);
+                return 0;
+            }
             if (hit_test_voice_text_column(hwnd, state, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam), &core, &voice, &column)) {
                 if (!debug_edit_controls_active(state)) {
                     return 0;
@@ -21652,6 +21944,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     state.frame_advance = 0;
     state.playback_only = 0;
     state.psf1_display_mode = load_psf1_display_mode();
+    state.psf2_display_mode = load_psf2_display_mode();
     state.theme_mode = THEME_SYSTEM;
     state.playlist_topmost = load_playlist_topmost();
     state.playlist_append_mode = load_playlist_append_mode();
