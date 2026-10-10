@@ -96,6 +96,7 @@
 //*************************************************************************//
 
 #include "stdafx.h"
+#include <atomic>
 
 #define _IN_SPU
 
@@ -157,6 +158,15 @@ static unsigned int psf2log_peops2_timbre_keyed_start[MAXCHAN];
 static unsigned int psf2log_peops2_timbre_keyed_flags[MAXCHAN];
 static unsigned char psf2log_peops2_timbre_allowed_latched[MAXCHAN];
 static int psf2log_peops2_timbre_gain_init;
+static std::atomic<int> psf2log_peops2_reverb_enabled{1};
+static int psf2log_peops2_reverb_was_enabled=1;
+static int psf2log_peops2_reverb_draining;
+static unsigned int psf2log_peops2_reverb_quiet_samples;
+
+extern "C" void psf2log_peops2_set_reverb_enabled(int enabled)
+{
+ psf2log_peops2_reverb_enabled=enabled?1:0;
+}
 
 static int psf2log_peops2_effective_noise(int ch);
 static int psf2log_peops2_effective_pmod_target(int ch);
@@ -1203,6 +1213,7 @@ ENDX:   ;
     SSumL[0]+=MixREVERBLeft(0,1);
     SSumR[0]+=MixREVERBRight(0);
     SSumR[0]+=MixREVERBRight(1);
+    psf2log_peops2_finish_reverb_drain();
 
     d=SSumL[0];SSumL[0]=0;
     d2=SSumR[0];SSumR[0]=0;
@@ -1278,6 +1289,7 @@ EXPORT_GCC void CALLBACK SPU2async(void (*update)(const void *, int))
    if(iSpuAsyncWait<=64) return;
    iSpuAsyncWait=0;
   }
+ psf2log_peops2_prepare_reverb_drain();
  MAINThread(update);                                      // -> linux high-compat mode
 }
 

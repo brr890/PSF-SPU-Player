@@ -53,6 +53,26 @@ int *          sRVBPlay[2];
 int *          sRVBEnd[2];
 int *          sRVBStart[2];
 
+static void psf2log_peops2_clear_reverb_history(void)
+{
+ const unsigned int samples=sizeof(spuMem)/sizeof(spuMem[0]);
+ unsigned int core;
+
+ for(core=0;core<2;core++)
+  {
+   const int start=rvb[core].StartAddr;
+   const int end=rvb[core].EndAddr;
+
+   // Preserve voice sample RAM and reverb configuration outside this region.
+   if(start>0 && end>=start && (unsigned int)end<samples)
+    memset(spuMem+start,0,(end-start+1u)*sizeof(spuMem[0]));
+   if(sRVBStart[core]!=nullptr)
+    memset(sRVBStart[core],0,NSSIZE*2*sizeof(sRVBStart[core][0]));
+   rvb[core].iLastRVBLeft=rvb[core].iLastRVBRight=rvb[core].iRVBLeft=rvb[core].iRVBRight=0;
+   rvb[core].iCnt=0;
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////
 // START REVERB
 ////////////////////////////////////////////////////////////////////////
@@ -92,12 +112,61 @@ static inline void InitREVERB(void)
 // STORE REVERB
 ////////////////////////////////////////////////////////////////////////
 
+static void psf2log_peops2_prepare_reverb_drain(void)
+{
+ const int enabled=psf2log_peops2_reverb_enabled.load();
+
+ if(enabled)
+  {
+   psf2log_peops2_reverb_draining=0;
+   psf2log_peops2_reverb_quiet_samples=0;
+  }
+ else if(psf2log_peops2_reverb_was_enabled)
+  {
+   psf2log_peops2_reverb_draining=1;
+   psf2log_peops2_reverb_quiet_samples=0;
+  }
+ psf2log_peops2_reverb_was_enabled=enabled;
+ iUseReverb=enabled || psf2log_peops2_reverb_draining ? 1 : 0;
+}
+
+static void psf2log_peops2_finish_reverb_drain(void)
+{
+ const unsigned int samples=sizeof(spuMem)/sizeof(spuMem[0]);
+ unsigned int core;
+ unsigned int quiet_limit=2048u;
+
+ if(!psf2log_peops2_reverb_draining || psf2log_peops2_reverb_enabled.load()) return;
+ for(core=0;core<2;core++)
+  {
+   if(rvb[core].iRVBLeft>1 || rvb[core].iRVBLeft<-1 || rvb[core].iRVBRight>1 || rvb[core].iRVBRight<-1 ||
+      rvb[core].iLastRVBLeft>1 || rvb[core].iLastRVBLeft<-1 || rvb[core].iLastRVBRight>1 || rvb[core].iLastRVBRight<-1)
+    {
+     psf2log_peops2_reverb_quiet_samples=0;
+     return;
+    }
+   if(rvb[core].StartAddr>0 && rvb[core].EndAddr>=rvb[core].StartAddr &&
+      (unsigned int)rvb[core].EndAddr<samples)
+    {
+     const unsigned int cycle=(rvb[core].EndAddr-rvb[core].StartAddr+1u)*2u+16u;
+     if(cycle>quiet_limit) quiet_limit=cycle;
+    }
+  }
+ if(++psf2log_peops2_reverb_quiet_samples>=quiet_limit)
+  {
+   psf2log_peops2_clear_reverb_history();
+   psf2log_peops2_reverb_draining=0;
+   psf2log_peops2_reverb_quiet_samples=0;
+   iUseReverb=0;
+  }
+}
+
 static void StoreREVERB(int ch,int ns)
 {
  int core=ch/24;
  unsigned int bit=1u<<(ch%24);
 
- if(iUseReverb==0) return;
+ if(iUseReverb==0 || !psf2log_peops2_reverb_enabled.load()) return;
  if((psf2log_peops2_reverb_force_off_masks[core]&bit)!=0) return;
  else
  if(iUseReverb==1) // -------------------------------- // Neil's reverb

@@ -1085,6 +1085,7 @@ extern "C" uint32_t psf2log_peops_copy_sample(
     uint32_t *out_loop_offset,
     uint32_t *out_end_flags);
 extern "C" void psf2log_peops2_set_mute_masks(uint32_t core0_mask, uint32_t core1_mask);
+extern "C" void psf2log_peops2_set_reverb_enabled(int enabled);
 extern "C" void psf2log_peops2_set_mute_masks_immediate(uint32_t core0_mask, uint32_t core1_mask);
 extern "C" void psf2log_peops2_set_timbre_solo(int enabled, const uint32_t *starts, const uint32_t *loops, const uint32_t *flags, uint32_t count);
 extern "C" void psf2log_peops2_set_reverb_override_masks(uint32_t core0_on, uint32_t core1_on, uint32_t core0_off, uint32_t core1_off);
@@ -1166,7 +1167,7 @@ static void audacious_frame_advance_finish_audio(void)
 
 extern "C" void psf2log_set_imported_reverb_enabled(int enabled)
 {
-    iUseReverb = enabled ? 1 : 0;
+    psf2log_peops2_set_reverb_enabled(enabled);
     psf2log_peops_set_reverb_enabled(enabled);
 }
 

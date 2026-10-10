@@ -5689,6 +5689,8 @@ static void sync_timbre_solo_from_listbox(HWND hwnd, PlayerState *state)
     } else {
         snprintf(message, sizeof(message), "Timbre solo off");
     }
+    state->display_render_source = 0;
+    state->gauge_only_paint_pending = 0;
     unlock_state(state);
 
     set_status(state, message);
@@ -19125,6 +19127,7 @@ static void paint_core_panel(
     uint8_t psf_version,
     int stopped_display,
     int force_track_dimmed,
+    uint32_t solo_display_mask,
     COLORREF active_text_color,
     COLORREF inactive_text_color,
     COLORREF muted_text_color,
@@ -19400,6 +19403,7 @@ static void paint_core_panel(
 
     for (voice = 0; voice < 24; ++voice) {
         const Spu2LogVoiceSnapshot *v = &live->voices[core][voice];
+        Spu2LogVoiceSnapshot inactive_voice;
         char modes[8];
         char rates[15];
         char voice_detail[26];
@@ -19407,14 +19411,25 @@ static void paint_core_panel(
         const char *phase_label;
         size_t phase_length;
         int row_y = y;
-        int ps2_env_off = psf_version != 0x01u && v->envx == 0;
+        int ps2_env_off = psf_version == 0x02u &&
+            (v->envx == 0 || v->adsr_phase == SPU2LOG_ADSR_OFF);
         int active = ps2_env_off ? 0 :
             (psf_version == 0x01u ? is_voice_really_sounding(v) : is_voice_active(v));
         int muted = (voice_mute_mask[core] & (1u << voice)) != 0;
+        int solo_selected = !ps2_env_off && !muted &&
+            (solo_display_mask & (1u << voice)) != 0;
         uint32_t flags;
         int key_on_pulse;
         int release_pulse;
         COLORREF row_text_color;
+
+        if (ps2_env_off) {
+            ZeroMemory(&inactive_voice, sizeof(inactive_voice));
+            inactive_voice.core = (uint8_t)core;
+            inactive_voice.voice = (uint8_t)voice;
+            inactive_voice.adsr_phase = SPU2LOG_ADSR_OFF;
+            v = &inactive_voice;
+        }
 
         if (hide_inactive && !active) {
             continue;
@@ -19482,9 +19497,9 @@ static void paint_core_panel(
             voice_detail[10] = ' ';
             memcpy(voice_detail + 11, rates, 14u);
             voice_detail[25] = '\0';
-            row_text_color = force_track_dimmed ? inactive_text_color :
+            row_text_color = force_track_dimmed && !solo_selected ? inactive_text_color :
                 (muted ? muted_text_color :
-                    (psf_version == 0x01u || active || stopped_display ?
+                    (psf_version == 0x01u || active || stopped_display || solo_selected ?
                         active_text_color : inactive_text_color));
             if (row_text_color != current_text_color) {
                 SetTextColor(hdc, row_text_color);
@@ -19513,7 +19528,7 @@ static void paint_core_panel(
                 decorations[2] = row_text[4];
                 decorations[2].y = y;
                 decorations[2].lpstr = text_only_detail;
-                if (!active) {
+                if (!active && !solo_selected) {
                     POLYTEXTA phase = decorations[0];
 
                     decorations[0].n = 6;
@@ -19577,11 +19592,12 @@ static void paint_core_panel(
                 inactive_text_color : gauge_border_color;
 
             SetDCPenColor(hdc, row_border_color);
-            draw_bar(hdc, x + COL_ENV_BAR_X, row_y + 1, 175, line_height - 5, gauge_env[core][voice], 0x7fffu,
+            draw_bar(hdc, x + COL_ENV_BAR_X, row_y + 1, 175, line_height - 5,
+                ps2_env_off ? 0u : gauge_env[core][voice], 0x7fffu,
                 row_env_color, gauge_background_color,
                 force_fullscreen_black_border);
-            vol_bar_l = gauge_vol_l[core][voice];
-            vol_bar_r = gauge_vol_r[core][voice];
+            vol_bar_l = ps2_env_off ? 0u : gauge_vol_l[core][voice];
+            vol_bar_r = ps2_env_off ? 0u : gauge_vol_r[core][voice];
             draw_stereo_bar(hdc, x + COL_VOL_BAR_X, row_y + 1, 100, line_height - 5,
                 vol_bar_l, vol_bar_r, 0x3fffu, row_lr_left_color, row_lr_right_color,
                 gauge_background_color,
@@ -19651,6 +19667,7 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
     uint8_t key_on_events[2][24];
     uint8_t release_events[2][24];
     uint32_t voice_mute_mask[2];
+    uint32_t solo_display_mask[2] = {0u, 0u};
     uint32_t voice_reverb_force_on_mask[2];
     uint32_t voice_reverb_force_off_mask[2];
     uint32_t voice_noise_force_on_mask[2];
@@ -19791,6 +19808,42 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
         ZeroMemory(release_events, sizeof(release_events));
     }
     effective_voice_mute_masks_locked(state, &live, &voice_mute_mask[0], &voice_mute_mask[1]);
+    if (psf_version == 0x02u) {
+        unsigned solo_core;
+        int sample_solo = state->timbre_solo_enabled && state->timbre_solo_key_count > 0;
+
+        for (solo_core = 0; solo_core < 2u; ++solo_core) {
+            if (sample_solo) {
+                unsigned solo_voice;
+                const uint32_t *sample_keys = use_audible_display ?
+                    state->audible_display_snapshot.psf2_voice_timbre_key[solo_core] :
+                    state->psf2_voice_timbre_key[solo_core];
+
+                for (solo_voice = 0; solo_voice < 24u; ++solo_voice) {
+                    const Spu2LogVoiceSnapshot *snapshot = &live.voices[solo_core][solo_voice];
+                    uint32_t key = voice_timbre_key(snapshot);
+                    uint32_t bit = 1u << solo_voice;
+
+                    /* Env-zero display reset clears SSA, not the last played sample. */
+                    if (key == 0 && !suppress_startup_voice_display) {
+                        key = sample_keys[solo_voice];
+                    }
+                    if (timbre_solo_has_key_locked(state, key)) {
+                        voice_mute_mask[solo_core] &= ~bit;
+                    } else {
+                        voice_mute_mask[solo_core] |= bit;
+                    }
+                }
+            }
+            uint32_t selected = ~voice_mute_mask[solo_core] & 0x00ffffffu;
+            int voice_solo = state->voice_mute_mask[solo_core ^ 1u] == 0x00ffffffu &&
+                selected != 0 && (selected & (selected - 1u)) == 0;
+
+            if (sample_solo || voice_solo) {
+                solo_display_mask[solo_core] = selected;
+            }
+        }
+    }
     memcpy(voice_reverb_force_on_mask, state->voice_reverb_force_on_mask, sizeof(voice_reverb_force_on_mask));
     memcpy(voice_reverb_force_off_mask, state->voice_reverb_force_off_mask, sizeof(voice_reverb_force_off_mask));
     memcpy(voice_noise_force_on_mask, state->voice_noise_force_on_mask, sizeof(voice_noise_force_on_mask));
@@ -19895,9 +19948,9 @@ static void paint_player(HWND hwnd, HDC hdc, PlayerState *state, int gauges_only
             state, hdc, dark_keyboard, keyboard_x, keyboard_width);
     }
 
-    paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, track_notes, &akao, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, core0_x, y, line_height, active_header_line_height, voice_scroll_y, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
+    paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, track_notes, &akao, 0, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, core0_x, y, line_height, active_header_line_height, voice_scroll_y, psf_version != 0x01u, psf_version, stopped_display, startup_track_dimmed, solo_display_mask[0], active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
     if (psf_version != 0x01u) {
-        paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, track_notes, NULL, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, active_header_line_height, voice_scroll_y, 1, psf_version, stopped_display, startup_track_dimmed, active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
+        paint_core_panel(hdc, state, &live, key_on_events, release_events, voice_mute_mask, voice_reverb_force_on_mask, voice_reverb_force_off_mask, voice_noise_force_on_mask, voice_noise_force_off_mask, voice_pmod_force_on_mask, voice_pmod_force_off_mask, gauge_env, gauge_vol_l, gauge_vol_r, track_notes, NULL, 1, hide_inactive, env_color_index, lr_color_index, env_custom_color, lr_custom_color, CORE1_X, y, line_height, active_header_line_height, voice_scroll_y, 1, psf_version, stopped_display, startup_track_dimmed, solo_display_mask[1], active_text_color, inactive_text_color, muted_text_color, gauge_background_color, gauge_border_color, voice_rows_target_bottom, gauges_only);
     }
 
     SelectObject(hdc, old_pen);

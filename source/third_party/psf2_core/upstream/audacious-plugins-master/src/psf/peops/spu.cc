@@ -84,6 +84,7 @@
 #include "../peops/registers.h"
 #include "../peops/spu.h"
 #include "spu2log.h"
+#include <atomic>
 
 // Enable experimental silence skipping
 // Currently it is too aggressive, destroying the rhythm of some songs
@@ -178,7 +179,10 @@ static unsigned int psf2log_ps1_pitch_lock_values[MAXCHAN];
 static unsigned int psf2log_ps1_volume_lock_masks[2];
 static unsigned int psf2log_ps1_volume_lock_values[2][MAXCHAN];
 static int psf2log_ps1_main_enabled=1;
-static int psf2log_ps1_reverb_enabled=1;
+static std::atomic<int> psf2log_ps1_reverb_enabled{1};
+static int psf2log_ps1_reverb_was_enabled=1;
+static int psf2log_ps1_reverb_draining;
+static unsigned int psf2log_ps1_reverb_quiet_samples;
 static int psf2log_ps1_mute_gain[MAXCHAN];
 static int psf2log_ps1_mute_gain_init;
 static unsigned int psf2log_ps1_timbre_solo_enabled;
@@ -696,6 +700,7 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
 
  while(temp)
  {
+   psf2log_ps1_prepare_reverb_drain();
    s32 revLeft=0, revRight=0;
    s32 sl=0, sr=0;
    int ch,fa;
@@ -943,8 +948,9 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
 
   ///////////////////////////////////////////////////////
   // mix all channels (including reverb) into one buffer
-  if(psf2log_ps1_reverb_enabled)
+  if(psf2log_ps1_reverb_enabled || psf2log_ps1_reverb_draining)
    MixREVERBLeftRight(&sl,&sr,revLeft,revRight);
+  psf2log_ps1_finish_reverb_drain();
 //  printf("sampcount %d decaybegin %d decayend %d\n", sampcount, decaybegin, decayend);
   if(sampcount>=decaybegin)
   {

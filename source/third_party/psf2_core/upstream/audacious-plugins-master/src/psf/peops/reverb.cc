@@ -86,11 +86,68 @@ static inline void s_buffer1(int iOff,int iVal)                // set_buffer (+1
  *(p+iOff)=(s16)BFLIP16((s16)iVal);
 }
 
+static s32 downbuf[2][8];
+static s32 upbuf[2][8];
+static int dbpos=0,ubpos=0;
+
+static void psf2log_ps1_clear_reverb_history(void)
+{
+ const unsigned int samples=sizeof(spuMem)/sizeof(spuMem[0]);
+
+ // Only the audio thread may clear the shared SPU reverb work area.
+ if(rvb.StartAddr>0 && (unsigned int)rvb.StartAddr<samples)
+  memset(spuMem+rvb.StartAddr,0,(samples-rvb.StartAddr)*sizeof(spuMem[0]));
+ memset(downbuf,0,sizeof(downbuf));
+ memset(upbuf,0,sizeof(upbuf));
+ dbpos=ubpos=0;
+ rvb.iLastRVBLeft=rvb.iLastRVBRight=rvb.iRVBLeft=rvb.iRVBRight=0;
+}
+
+static void psf2log_ps1_prepare_reverb_drain(void)
+{
+ const int enabled=psf2log_ps1_reverb_enabled.load();
+
+ if(enabled)
+  {
+   psf2log_ps1_reverb_draining=0;
+   psf2log_ps1_reverb_quiet_samples=0;
+  }
+ else if(psf2log_ps1_reverb_was_enabled)
+  {
+   psf2log_ps1_reverb_draining=1;
+   psf2log_ps1_reverb_quiet_samples=0;
+  }
+ psf2log_ps1_reverb_was_enabled=enabled;
+}
+
+static void psf2log_ps1_finish_reverb_drain(void)
+{
+ const unsigned int samples=sizeof(spuMem)/sizeof(spuMem[0]);
+ unsigned int quiet_limit=2048u;
+
+ if(!psf2log_ps1_reverb_draining || psf2log_ps1_reverb_enabled.load()) return;
+ if(rvb.iRVBLeft>1 || rvb.iRVBLeft<-1 || rvb.iRVBRight>1 || rvb.iRVBRight<-1 ||
+    rvb.iLastRVBLeft>1 || rvb.iLastRVBLeft<-1 || rvb.iLastRVBRight>1 || rvb.iLastRVBRight<-1)
+  {
+   psf2log_ps1_reverb_quiet_samples=0;
+   return;
+  }
+ // Wait a full work-area cycle so a delayed echo cannot be mistaken for silence.
+ if(rvb.StartAddr>0 && (unsigned int)rvb.StartAddr<samples)
+  {
+   const unsigned int cycle=(samples-rvb.StartAddr)*2u+16u;
+   if(cycle>quiet_limit) quiet_limit=cycle;
+  }
+ if(++psf2log_ps1_reverb_quiet_samples>=quiet_limit)
+  {
+   psf2log_ps1_clear_reverb_history();
+   psf2log_ps1_reverb_draining=0;
+   psf2log_ps1_reverb_quiet_samples=0;
+  }
+}
+
 static inline void MixREVERBLeftRight(s32 *oleft, s32 *oright, s32 inleft, s32 inright)
 {
-   static s32 downbuf[2][8];
-   static s32 upbuf[2][8];
-   static int dbpos=0,ubpos=0;
    static s32 downcoeffs[8]={ /* Symmetry is sexy. */
 				1283,5344,10895,15243,
 				15243,10895,5344,1283

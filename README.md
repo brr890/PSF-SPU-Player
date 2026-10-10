@@ -1,6 +1,6 @@
 # PSF SPU Player Production Source
 
-This folder contains the source required to build PSF SPU Player Ver 1.63.
+This folder contains the source required to build PSF SPU Player Ver 1.64.
 
 Included:
 
