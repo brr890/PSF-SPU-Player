@@ -3713,6 +3713,9 @@ static void reset_timbre_solo_locked(PlayerState *state)
     state->timbre_solo_adsr1 = 0;
     state->timbre_solo_adsr2 = 0;
     state->timbre_solo_flag_class = 0;
+    state->display_render_source = 0;
+    state->gauge_only_paint_pending = 0;
+    state->paint_frame_initialized = 0;
     ZeroMemory(state->timbre_solo_keys, sizeof(state->timbre_solo_keys));
     ZeroMemory(state->timbre_solo_ssa, sizeof(state->timbre_solo_ssa));
     ZeroMemory(state->timbre_solo_lsa, sizeof(state->timbre_solo_lsa));
