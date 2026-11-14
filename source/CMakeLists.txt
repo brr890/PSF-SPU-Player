@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(psf_spu_player VERSION 1.64 LANGUAGES C CXX)
+project(psf_spu_player VERSION 1.65 LANGUAGES C CXX)
 
 set(PSF_ARCHIVE_RUNTIME_DIR "" CACHE PATH "Folder containing the optional 32-bit bsdtar archive runtime")
 
@@ -72,6 +72,14 @@ target_link_libraries(psf2_provider_imported
 target_compile_definitions(psf2_provider_imported PRIVATE
     PSF2LOG_IMPORTED_PROVIDER_LICENSE="GPL-2.0-or-later"
 )
+
+include(TestBigEndian)
+test_big_endian(PSF2LOG_TARGET_BIG_ENDIAN)
+if(PSF2LOG_TARGET_BIG_ENDIAN)
+    target_compile_definitions(psf2_provider_imported PRIVATE LSB_FIRST=0)
+else()
+    target_compile_definitions(psf2_provider_imported PRIVATE LSB_FIRST=1)
+endif()
 
 if(MINGW)
     get_filename_component(PSF2LOG_ZLIB_LIBRARY_DIR "${ZLIB_LIBRARY_RELEASE}" DIRECTORY)

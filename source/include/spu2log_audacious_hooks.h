@@ -21,6 +21,9 @@ void spu2log_audacious_set_sample_pos(uint64_t sample_pos);
 void spu2log_audacious_advance_sample_pos(uint32_t frames);
 uint64_t spu2log_audacious_get_sample_pos(void);
 uint64_t spu2log_audacious_get_spu2_write16_count(void);
+void spu2log_audacious_note_song_output(int32_t left, int32_t right);
+int spu2log_audacious_get_song_start(uint64_t *sample_pos);
+void spu2log_audacious_rebase_song_start(uint64_t old_sample_pos, uint64_t new_sample_pos);
 
 void spu2log_audacious_spu2_write16(uint32_t address, uint16_t value);
 

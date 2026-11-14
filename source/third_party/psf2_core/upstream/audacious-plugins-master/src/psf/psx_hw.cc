@@ -145,6 +145,7 @@ typedef struct
 	uint32_t stackloc;	// stack location in IOP RAM
 	uint32_t stacksize;	// stack size
 	uint32_t refCon;		// user value passed in at CreateThread time
+	uint32_t priority;
 
 	uint32_t waitparm;	// what we're waiting on if in one the TS_WAIT* states
 	int resume_advance;	// advance past an HLE call when this thread is restored
@@ -380,6 +381,12 @@ static void ps2_reschedule(void)
 {
 	int i, starti, iNextThread;
 
+	// Do not preempt a running thread while it programs DMA with interrupts suspended.
+	if (intr_susp && iCurThread >= 0 && threads[iCurThread].iState == TS_RUNNING)
+	{
+		return;
+	}
+
 	iNextThread = -1;
 
 	// see if any thread other than the current one is ready to run
@@ -397,10 +404,10 @@ static void ps2_reschedule(void)
 	{
 		if (i != iCurThread)
 		{
-			if (threads[i].iState == TS_READY)
+			if (threads[i].iState == TS_READY &&
+				(iNextThread == -1 || threads[i].priority < threads[iNextThread].priority))
 			{
 			  	iNextThread = i;
-				break;
 			}
 		}
 
@@ -409,16 +416,16 @@ static void ps2_reschedule(void)
 
 	// if we started above thread 0 and didn't pick one,
 	// go around and try from zero
-	if ((starti > 0) && (iNextThread == -1))
+	if (starti > 0)
 	{
 		for (i = 0; i < iNumThreads; i++)
 		{
 			if (i != iCurThread)
 			{
-				if (threads[i].iState == TS_READY)
+				if (threads[i].iState == TS_READY &&
+					(iNextThread == -1 || threads[i].priority < threads[iNextThread].priority))
 				{
 				  	iNextThread = i;
-					break;
 				}
 			}
 		}
@@ -426,6 +433,11 @@ static void ps2_reschedule(void)
 
 	if (iNextThread != -1)
 	{
+		if (iCurThread >= 0 && threads[iCurThread].iState == TS_RUNNING &&
+			threads[iCurThread].priority < threads[iNextThread].priority)
+		{
+			return;
+		}
 		#if DEBUG_THREADING
 		for (i = 0; i < iNumThreads; i++)
 		{
@@ -659,31 +671,25 @@ static void psx_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 	}
 }
 
-static uint32_t ps2_dma_word_count(uint32_t bcr, unsigned int core)
+static uint32_t ps2_dma_word_count(uint32_t bcr)
 {
 	const uint32_t block_words = (bcr >> 16) * (bcr & 0xffff);
-	const uint32_t spu_address = spuAddr2[core] & 0xfffff;
-	const uint32_t ring_offset = spu_address & 0x1fff;
 
-	/* Neill Corlett's streaming driver feeds 16 KiB left/right blocks into
-	   fixed low SPU2 ring buffers.  The legacy x4 conversion doubles those
-	   blocks and overlaps the other channel; regular PSF2 sample loaders rely
-	   on the legacy conversion and must retain it. */
-	if (block_words == 0x1000 && spu_address < 0x24000 &&
-	    (ring_offset == 0x20 || ring_offset == 0x60))
-		return block_words * 2;
-
-	return block_words * 4;
+	// BCR counts 32-bit words; the SPU2 DMA interface counts 16-bit samples.
+	return block_words * 2;
 }
 
 static void ps2_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 {
-	if (chcr == 0x01000201)	// cpu to SPU2
+	if (!(chcr & 0x01000000))
+		return;
+
+	if (chcr & 1)	// cpu to SPU2
 	{
 		#if DEBUG_HLE_IOP
 		printf("DMA4: RAM %08x to SPU2\n", madr);
 		#endif
-		bcr = ps2_dma_word_count(bcr, 0);
+		bcr = ps2_dma_word_count(bcr);
 		SPU2writeDMA4Mem(madr&0x1fffff, bcr);
 	}
 	else
@@ -691,7 +697,7 @@ static void ps2_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 		#if DEBUG_HLE_IOP
 		printf("DMA4: SPU2 to RAM %08x\n", madr);
 		#endif
-		bcr = ps2_dma_word_count(bcr, 0);
+		bcr = ps2_dma_word_count(bcr);
 		SPU2readDMA4Mem(madr&0x1fffff, bcr);
 	}
 
@@ -701,12 +707,15 @@ static void ps2_dma4(uint32_t madr, uint32_t bcr, uint32_t chcr)
 
 static void ps2_dma7(uint32_t madr, uint32_t bcr, uint32_t chcr)
 {
-	if ((chcr == 0x01000201) || (chcr == 0x00100010) || (chcr == 0x000f0010) || (chcr == 0x00010010))	// cpu to SPU2
+	if (!(chcr & 0x01000000))
+		return;
+
+	if (chcr & 1)	// cpu to SPU2
 	{
 		#if DEBUG_HLE_IOP
 		printf("DMA7: RAM %08x to SPU2\n", madr);
 		#endif
-		bcr = ps2_dma_word_count(bcr, 1);
+		bcr = ps2_dma_word_count(bcr);
 		SPU2writeDMA7Mem(madr&0x1fffff, bcr);
 	}
 	else
@@ -714,8 +723,8 @@ static void ps2_dma7(uint32_t madr, uint32_t bcr, uint32_t chcr)
 		#if DEBUG_HLE_IOP
 		printf("DMA7: SPU2 to RAM %08x\n", madr);
 		#endif
-		bcr = ps2_dma_word_count(bcr, 1);
-//		SPU2readDMA7Mem(madr&0x1fffff, bcr);
+		bcr = ps2_dma_word_count(bcr);
+		SPU2readDMA7Mem(madr&0x1fffff, bcr);
 	}
 
 	dma7_delay = PS2_SPU_DMA_COMPLETION_SAMPLES;
@@ -919,14 +928,14 @@ static void psx_hw_write(offs_t offset, uint32_t data, uint32_t mem_mask)
 		dma7_madr = data;
 		return;
 	}
-	else if (offset == 0xbf801504)
+	else if (offset == 0xbf801508)
 	{
 		dma7_chcr = data;
 		ps2_dma7(dma7_madr, dma7_bcr, dma7_chcr);
 		return;
 	}
 
-	if (offset == 0xbf801508 || offset == 0xbf80150a)
+	if (offset == 0xbf801504 || offset == 0xbf801506)
 	{
 		dma7_bcr &= mem_mask;
 		dma7_bcr |= data;
@@ -1009,7 +1018,8 @@ void ps2_hw_slice(void)
 
 	if (iCurThread != -1)
 	{
-		mips_execute(836/CLOCK_DIV);
+		// Underclocking lets startup timers overtake pending sample-bank uploads.
+		mips_execute(PS2_IOP_TICKS_PER_OUTPUT_SAMPLE);
 		ran_cpu = 1;
 	}
 	else	// no thread, don't run CPU, just update counters
@@ -1020,8 +1030,8 @@ void ps2_hw_slice(void)
 
 			if (iCurThread != -1)
 			{
-				mips_execute((836/CLOCK_DIV)-i);
-				i = (836/CLOCK_DIV);
+				mips_execute(PS2_IOP_TICKS_PER_OUTPUT_SAMPLE-i);
+				i = PS2_IOP_TICKS_PER_OUTPUT_SAMPLE;
 				ran_cpu = 1;
 			}
 		}
@@ -1059,7 +1069,7 @@ void ps2_hw_scan_slice(void)
 
 	if (iCurThread != -1)
 	{
-		mips_execute(836/CLOCK_DIV);
+		mips_execute(PS2_IOP_TICKS_PER_OUTPUT_SAMPLE);
 	}
 	else if (timerexp)
 	{
@@ -1067,7 +1077,7 @@ void ps2_hw_scan_slice(void)
 
 		if (iCurThread != -1)
 		{
-			mips_execute((836/CLOCK_DIV)-i);
+			mips_execute(PS2_IOP_TICKS_PER_OUTPUT_SAMPLE-i);
 		}
 	}
 }
@@ -1435,12 +1445,17 @@ static uint32_t calc_spec(uint32_t a1)
 void psx_hw_init(void)
 {
 	timerexp = 0;
+	intr_susp = 0;
+	irq_mutex = 0;
 	memset(psx_scratch, 0, sizeof(psx_scratch));
 
 	memset(filestat, 0, sizeof(filestat));
 	memset(filedata, 0, sizeof(filedata));
 
 	dma4_cb = dma7_cb = 0;
+	irq9_cb = 0;
+	dma4_fval = dma4_flag = dma7_fval = dma7_flag = 0;
+	irq9_fval = irq9_flag = 0;
 
 	sys_time = 0;
 
@@ -1459,6 +1474,7 @@ void psx_hw_init(void)
 
 	// set the initial thread to "RUNNING"
 	threads[0].iState = TS_RUNNING;
+	threads[0].priority = 64u;
 	iCurThread = 0;
 
 	memset(iop_timers, 0, sizeof(iop_timers));
@@ -1478,12 +1494,16 @@ void psx_hw_init(void)
 	irq_mask = 0;
 	softcall_target = 0;
 	gpu_stat = 0;
-	dma4_madr = dma4_bcr = dma4_chcr = 0;
+	dma_timer = 0;
+	fcnt = 0;
+	dma4_madr = dma4_bcr = dma4_chcr = dma4_delay = 0;
+	dma7_madr = dma7_bcr = dma7_chcr = dma7_delay = 0;
 	heap_addr = 0;
 	entry_int = 0;
 
 	WAI = 0;
 
+	memset(root_cnts, 0, sizeof(root_cnts));
 	root_cnts[0].mode = RC_EN;
 	root_cnts[1].mode = RC_EN;
 	root_cnts[2].mode = RC_EN;
@@ -2459,6 +2479,7 @@ int psx_iop_call(uint32_t pc, uint32_t callnum)
 				threads[iNumThreads].routine = LE32(psx_ram[a0+2]);
 				threads[iNumThreads].stacksize = LE32(psx_ram[a0+3]);
 				threads[iNumThreads].refCon = LE32(psx_ram[a0+4]);
+				threads[iNumThreads].priority = LE32(psx_ram[a0+4]);
 
 				mipsinfo.i = iNumThreads;
 				iNumThreads++;
@@ -3230,12 +3251,14 @@ int psx_iop_call(uint32_t pc, uint32_t callnum)
 				#if DEBUG_HLE_IOP
 				printf("IOP: CpuDisableIntr(%d)\n", a0);
 				#endif
+				intr_susp = 1;
 				break;
 
 			case 9: // CpuEnableIntr
 				#if DEBUG_HLE_IOP
 				printf("IOP: CpuEnableIntr(%d)\n", a0);
 				#endif
+				intr_susp = 0;
 				break;
 
 			case 17:	// CpuSuspendIntr
@@ -3243,6 +3266,11 @@ int psx_iop_call(uint32_t pc, uint32_t callnum)
 				printf("IOP: CpuSuspendIntr\n");
 				#endif
 
+				// Preserve the prior state for nested interrupt suspend/resume pairs.
+				if (a0 != 0)
+				{
+					psx_ram[(a0 & 0x1fffff) / 4] = LE32(intr_susp ? 0u : 1u);
+				}
 				// if already suspended, return an error code
 				if (intr_susp)
 				{
@@ -3260,7 +3288,7 @@ int psx_iop_call(uint32_t pc, uint32_t callnum)
 				#if DEBUG_HLE_IOP
 				printf("IOP: CpuResumeIntr\n");
 				#endif
-				intr_susp = 0;
+				intr_susp = a0 ? 0 : 1;
 				mipsinfo.i = 0;
 				mips_set_info(CPUINFO_INT_REGISTER + MIPS_R2, &mipsinfo);
 				break;
@@ -3717,4 +3745,4 @@ int psx_iop_call(uint32_t pc, uint32_t callnum)
 
 	return ps2_iop_call_should_advance(calling_thread);
 }
-/* Modified by brr890 for PSF SPU Player through 2026-07-21. */
+/* Modified by brr890 for PSF SPU Player through 2026-11-14. */

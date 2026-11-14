@@ -1921,6 +1921,7 @@ extern "C" void psf2log_rebase_imported_sample_position(
     if (core == nullptr) {
         return;
     }
+    spu2log_audacious_rebase_song_start(core->sample_pos, sample_pos);
     core->sample_pos = sample_pos;
     core->next_snapshot_sample =
         ((sample_pos / AUDACIOUS_SNAPSHOT_INTERVAL_FRAMES) + 1u) *

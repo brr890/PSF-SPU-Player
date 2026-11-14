@@ -84,6 +84,7 @@
 #include "../peops/registers.h"
 #include "../peops/spu.h"
 #include "spu2log.h"
+#include "spu2log_audacious_hooks.h"
 #include <atomic>
 
 // Enable experimental silence skipping
@@ -179,6 +180,7 @@ static unsigned int psf2log_ps1_pitch_lock_values[MAXCHAN];
 static unsigned int psf2log_ps1_volume_lock_masks[2];
 static unsigned int psf2log_ps1_volume_lock_values[2][MAXCHAN];
 static int psf2log_ps1_main_enabled=1;
+static int psf2log_ps1_song_started;
 static std::atomic<int> psf2log_ps1_reverb_enabled{1};
 static int psf2log_ps1_reverb_was_enabled=1;
 static int psf2log_ps1_reverb_draining;
@@ -703,6 +705,8 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
    psf2log_ps1_prepare_reverb_drain();
    s32 revLeft=0, revRight=0;
    s32 sl=0, sr=0;
+   s32 song_l=0, song_r=0;
+   const int detect_song_start=!psf2log_ps1_song_started;
    int ch,fa;
 
    temp--;
@@ -920,6 +924,7 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
 	   int timbre_gain=psf2log_ps1_next_timbre_gain(ch);
 	   tmpl=(s_chan[ch].sval*s_chan[ch].iLeftVolume)>>14;
 	   tmpr=(s_chan[ch].sval*s_chan[ch].iRightVolume)>>14;
+	   if(detect_song_start) {song_l+=tmpl;song_r+=tmpr;}
 	   tmpl=(tmpl*mute_gain)>>12;
 	   tmpr=(tmpr*mute_gain)>>12;
 	   tmpl=(tmpl*timbre_gain)>>12;
@@ -948,6 +953,18 @@ int SPUasync(u32 cycles, void (*update)(const void *, int))
 
   ///////////////////////////////////////////////////////
   // mix all channels (including reverb) into one buffer
+  if(detect_song_start)
+   {
+    CLIP(song_l);
+    CLIP(song_r);
+    song_l=(((song_l*iMainVolumeLeft)>>14)*volmul)>>8;
+    song_r=(((song_r*iMainVolumeRight)>>14)*volmul)>>8;
+    if(song_l || song_r)
+     {
+      spu2log_audacious_note_song_output(song_l,song_r);
+      psf2log_ps1_song_started=1;
+     }
+   }
   if(psf2log_ps1_reverb_enabled || psf2log_ps1_reverb_draining)
    MixREVERBLeftRight(&sl,&sr,revLeft,revRight);
   psf2log_ps1_finish_reverb_drain();
@@ -1064,6 +1081,7 @@ int SPUinit(void)
  psf2log_ps1_endx_mask=0;
  InitADSR();
  sampcount=ttemp=0;
+ psf2log_ps1_song_started=0;
  seektime=0;
  #ifdef TIMEO
  begintime=gettime64();
@@ -1347,4 +1365,4 @@ extern "C" void psf2log_peops_emit_snapshots(
   if(voice_snapshot!=nullptr) voice_snapshot(user,sample_pos,&voice);
  }
 }
-/* Modified by brr890 for PSF SPU Player through 2026-07-21. */
+/* Modified by brr890 for PSF SPU Player through 2026-11-14. */

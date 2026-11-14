@@ -45,7 +45,8 @@
 #define PLAYER_START_RETRY_TIMEOUT_MS 5000u
 #define PLAYER_RENDER_FRAMES 735u
 #define PLAYER_FRAME_ADVANCE_TICK_FRAMES 192u
-#define PLAYER_SEEK_RENDER_FRAMES 65536u
+/* Keep seek batches aligned with the playback core's complete PCM blocks. */
+#define PLAYER_SEEK_RENDER_FRAMES (PLAYER_RENDER_FRAMES * 32u)
 #define PLAYER_SAMPLE_RATE 44100u
 #define PLAYER_WM_WORKER_UPDATE (WM_APP + 1u)
 #define PLAYER_WM_PLAYLIST_PLAY (WM_APP + 2u)
@@ -454,8 +455,6 @@ typedef struct PlayerState {
     int paused;
     int seek_discarding;
     int startup_silence_trim;
-    int ps2_startup_origin_valid;
-    uint64_t ps2_startup_origin_sample;
     int timbre_prescanning;
     Psf2CoreBridge *timbre_scan_core;
     int timbre_list_locked;
@@ -465,6 +464,9 @@ typedef struct PlayerState {
     int seek_display_release_on_audio_start;
     uint64_t seek_display_sample_pos;
     uint64_t seek_display_target_pos;
+    uint64_t seek_source_start_pos;
+    uint64_t seek_source_sample_pos;
+    uint64_t seek_source_target_pos;
     uint32_t seek_display_generation;
     Psf1AkaoPlaybackState seek_akao_hold;
     int seek_akao_hold_valid;
@@ -1891,6 +1893,9 @@ static void reset_stopped_display(PlayerState *state)
     state->seek_display_release_on_audio_start = 0;
     state->seek_display_sample_pos = 0;
     state->seek_display_target_pos = 0;
+    state->seek_source_start_pos = 0;
+    state->seek_source_sample_pos = 0;
+    state->seek_source_target_pos = 0;
     state->seek_display_generation = 0;
     state->seek_akao_hold_valid = 0;
     state->live.version = SPU2LOG_VERSION;
@@ -5710,18 +5715,16 @@ static void refresh_timbre_listbox_after_drag(PlayerState *state)
     }
 }
 
-static void toggle_timbre_scan_mode(HWND hwnd, PlayerState *state)
+static void set_timbre_scan_mode(HWND hwnd, PlayerState *state, int enabled)
 {
-    int enabled;
-
     if (state == NULL) {
         return;
     }
-    if (state->stream_audio_mode) {
+    if (enabled && state->stream_audio_mode) {
         return;
     }
     lock_state(state);
-    enabled = state->timbre_scan_enabled ? 0 : 1;
+    enabled = enabled ? 1 : 0;
     state->timbre_scan_enabled = enabled;
     reset_timbre_solo_locked(state);
     preview_free_samples_locked(state);
@@ -5739,6 +5742,13 @@ static void toggle_timbre_scan_mode(HWND hwnd, PlayerState *state)
     timbre_refresh_listbox(state);
     set_status(state, enabled ? "Samples Scan on" : "Samples Scan off");
     InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void toggle_timbre_scan_mode(HWND hwnd, PlayerState *state)
+{
+    if (state != NULL) {
+        set_timbre_scan_mode(hwnd, state, !state->timbre_scan_enabled);
+    }
 }
 
 static void toggle_voice_solo(HWND hwnd, PlayerState *state, unsigned core, unsigned voice)
@@ -5772,6 +5782,9 @@ static void toggle_voice_solo(HWND hwnd, PlayerState *state, unsigned core, unsi
     } else {
         state->voice_mute_mask[core] = solo_mask;
     }
+    state->display_render_source = 0;
+    state->gauge_only_paint_pending = 0;
+    state->paint_frame_initialized = 0;
     unlock_state(state);
     apply_voice_mute_masks(state);
     InvalidateRect(hwnd, NULL, TRUE);
@@ -12251,7 +12264,11 @@ static void reap_audio_queue(PlayerState *state)
     }
 }
 
-static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t frames)
+static int queue_waveout_chunk_ex(
+    PlayerState *state,
+    const int16_t *pcm,
+    uint32_t frames,
+    int startup_padding)
 {
     MMRESULT result;
     unsigned i;
@@ -12284,8 +12301,9 @@ static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t 
                 copy_scaled_pcm_with_declick(state, state->audio_buffers[i], pcm, frames);
                 lock_state(state);
                 suppress_startup_voices = state->startup_display_pending;
-                if (suppress_startup_voices &&
-                    first_nonzero_pcm_frame(state->audio_buffers[i], frames) < frames) {
+                if (suppress_startup_voices && !startup_padding &&
+                    (state->timeline_valid ||
+                     first_nonzero_pcm_frame(state->audio_buffers[i], frames) < frames)) {
                     state->startup_display_pending = 0;
                     suppress_startup_voices = 0;
                 }
@@ -12370,6 +12388,11 @@ static int16_t clamp_i32_to_i16(int value)
     return (int16_t)value;
 }
 
+static int queue_waveout_chunk(PlayerState *state, const int16_t *pcm, uint32_t frames)
+{
+    return queue_waveout_chunk_ex(state, pcm, frames, 0);
+}
+
 static uint32_t first_nonzero_pcm_frame(const int16_t *pcm, uint32_t frames)
 {
     uint32_t frame;
@@ -12385,32 +12408,22 @@ static uint32_t first_nonzero_pcm_frame(const int16_t *pcm, uint32_t frames)
     return frames;
 }
 
-static int song_voice_activity_present(PlayerState *state)
+static uint32_t first_song_frame(
+    const int16_t *pcm,
+    uint32_t frames,
+    uint64_t block_end_sample)
 {
-    unsigned core;
-    unsigned voice;
-    unsigned core_count;
-    int active = 0;
+    uint64_t origin;
+    uint64_t block_start;
 
-    if (state == NULL) {
-        return 0;
+    if (!spu2log_audacious_get_song_start(&origin) || block_end_sample < frames) {
+        return first_nonzero_pcm_frame(pcm, frames);
     }
-
-    lock_state(state);
-    core_count = state->psf_version == 0x01u ? 1u : 2u;
-    for (core = 0; core < core_count && !active; ++core) {
-        for (voice = 0; voice < 24u; ++voice) {
-            const Spu2LogVoiceSnapshot *snapshot =
-                &state->live.voices[core][voice];
-
-            if (snapshot->active || snapshot->envx != 0) {
-                active = 1;
-                break;
-            }
-        }
+    block_start = block_end_sample - frames;
+    if (origin >= block_end_sample) {
+        return frames;
     }
-    unlock_state(state);
-    return active;
+    return origin <= block_start ? 0u : (uint32_t)(origin - block_start);
 }
 
 static void start_timeline_at_first_audible_frame(
@@ -12434,18 +12447,12 @@ static void start_timeline_at_first_audible_frame(
         return;
     }
 
-    first_audible = first_nonzero_pcm_frame(pcm, frames);
-    /* Voice and timbre solo are applied in the mixer. The SPU/SPU2 voice
-       state still describes the original song, so do not make elapsed time
-       wait for the selected voice to produce non-zero output. */
-    if (first_audible >= frames && song_voice_activity_present(state)) {
-        first_audible = 0;
-    }
+    block_end_sample = spu2log_audacious_get_sample_pos();
+    first_audible = first_song_frame(pcm, frames, block_end_sample);
     if (first_audible >= frames) {
         return;
     }
 
-    block_end_sample = spu2log_audacious_get_sample_pos();
     block_start_sample = block_end_sample >= frames ?
         block_end_sample - frames : 0;
 
@@ -12466,58 +12473,9 @@ static void start_timeline_at_first_audible_frame(
     unlock_state(state);
 }
 
-static uint32_t first_ps2_song_frame(
-    PlayerState *state,
-    const int16_t *pcm,
-    uint32_t frames,
-    uint64_t block_end_sample)
-{
-    uint64_t origin_sample = 0;
-    uint64_t block_start_sample;
-    int use_origin = 0;
-
-    if (state != NULL) {
-        lock_state(state);
-        use_origin = state->ps2_startup_origin_valid;
-        origin_sample = state->ps2_startup_origin_sample;
-        unlock_state(state);
-    }
-    if (!use_origin || block_end_sample < frames) {
-        return first_nonzero_pcm_frame(pcm, frames);
-    }
-
-    block_start_sample = block_end_sample - frames;
-    if (origin_sample >= block_end_sample) {
-        return frames;
-    }
-    if (origin_sample <= block_start_sample) {
-        return 0;
-    }
-    return (uint32_t)(origin_sample - block_start_sample);
-}
-
-static void remember_ps2_startup_origin(
-    PlayerState *state,
-    uint64_t block_end_sample,
-    uint32_t rendered,
-    uint32_t first_song_frame)
-{
-    if (state == NULL || first_song_frame >= rendered || block_end_sample < rendered) {
-        return;
-    }
-    lock_state(state);
-    if (!state->ps2_startup_origin_valid) {
-        state->ps2_startup_origin_sample =
-            block_end_sample - rendered + first_song_frame;
-        state->ps2_startup_origin_valid = 1;
-    }
-    unlock_state(state);
-}
-
 static int advance_ps2_core_to_audible_start(PlayerState *state, uint64_t *out_sample_pos)
 {
     uint64_t trimmed_frames = 0;
-    int solo_filter_active;
 
     if (out_sample_pos != NULL) {
         *out_sample_pos = 0;
@@ -12528,15 +12486,6 @@ static int advance_ps2_core_to_audible_start(PlayerState *state, uint64_t *out_s
     }
 
     lock_state(state);
-    solo_filter_active =
-        ((state->voice_mute_mask[0] & 0x00ffffffu) != 0 ||
-         (state->voice_mute_mask[1] & 0x00ffffffu) != 0 ||
-         (state->timbre_solo_enabled && state->timbre_solo_key_count > 0));
-    if (solo_filter_active) {
-        state->startup_silence_trim = 0;
-        unlock_state(state);
-        return 1;
-    }
     state->startup_silence_trim = 1;
     unlock_state(state);
     for (;;) {
@@ -12558,8 +12507,7 @@ static int advance_ps2_core_to_audible_start(PlayerState *state, uint64_t *out_s
             break;
         }
         block_end_sample = spu2log_audacious_get_sample_pos();
-        first_nonzero = first_ps2_song_frame(
-            state,
+        first_nonzero = first_song_frame(
             state->pcm,
             rendered,
             block_end_sample);
@@ -12569,11 +12517,6 @@ static int advance_ps2_core_to_audible_start(PlayerState *state, uint64_t *out_s
         }
 
         trimmed_frames += first_nonzero;
-        remember_ps2_startup_origin(
-            state,
-            block_end_sample,
-            rendered,
-            first_nonzero);
         lock_state(state);
         state->startup_silence_trim = 0;
         unlock_state(state);
@@ -14615,7 +14558,9 @@ static DWORD WINAPI playback_thread_proc(void *user)
                         }
                     }
 
-                    seek_result = fast_forward_core(state, target_sample - current_sample, current_sample);
+                    seek_result = fast_forward_core(state,
+                        target_sample > current_sample ? target_sample - current_sample : 0,
+                        current_sample);
                     if (seek_result == 2) {
                         lock_state(state);
                         target_sample = state->seek_target_sample;
@@ -14635,9 +14580,11 @@ static DWORD WINAPI playback_thread_proc(void *user)
                     }
                 }
                 lock_state(state);
-                state->seek_display_sample_pos =
-                    state->seek_display_target_pos;
-                state->seek_display_release_on_audio_start = 1;
+                if (!state->seek_request) {
+                    state->seek_display_sample_pos = state->seek_display_target_pos;
+                    state->seek_source_sample_pos = state->seek_source_target_pos;
+                    state->seek_display_release_on_audio_start = 1;
+                }
                 unlock_state(state);
                 if (state->hwnd != NULL) {
                     PostMessageA(state->hwnd, PLAYER_WM_SEEK_PROGRESS, 0, 0);
@@ -14696,8 +14643,7 @@ static DWORD WINAPI playback_thread_proc(void *user)
 
         if (state->startup_silence_trim) {
             uint64_t block_end_sample = spu2log_audacious_get_sample_pos();
-            uint32_t first_nonzero = first_ps2_song_frame(
-                state,
+            uint32_t first_nonzero = first_song_frame(
                 state->pcm,
                 rendered,
                 block_end_sample);
@@ -14706,11 +14652,6 @@ static DWORD WINAPI playback_thread_proc(void *user)
                 startup_trimmed_frames += rendered;
                 continue;
             }
-            remember_ps2_startup_origin(
-                state,
-                block_end_sample,
-                rendered,
-                first_nonzero);
             state->startup_silence_trim = 0;
             psf2log_rebase_imported_sample_position(
                 state->core,
@@ -14749,10 +14690,11 @@ static DWORD WINAPI playback_thread_proc(void *user)
                 for (silence_buffer = 0;
                      silence_buffer < PLAYER_STARTUP_SILENCE_BUFFERS;
                      ++silence_buffer) {
-                    if (!queue_waveout_chunk(
+                    if (!queue_waveout_chunk_ex(
                             state,
                             startup_silence,
-                            PLAYER_RENDER_FRAMES)) {
+                        PLAYER_RENDER_FRAMES,
+                        1)) {
                         startup_queue_failed = 1;
                         break;
                     }
@@ -16827,6 +16769,9 @@ static LRESULT CALLBACK timbre_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         break;
     case WM_CLOSE:
         save_timbre_window_bounds(hwnd);
+        if (state != NULL && state->timbre_scan_enabled) {
+            set_timbre_scan_mode(state->hwnd != NULL ? state->hwnd : hwnd, state, 0);
+        }
         ShowWindow(hwnd, SW_HIDE);
         return 0;
     case WM_DESTROY:
@@ -17348,6 +17293,9 @@ static void publish_seek_display_progress(
     if (state->seek_display_hold_active &&
         state->seek_display_generation == generation) {
         state->seek_display_sample_pos = sample_pos;
+        state->seek_source_sample_pos = interpolate_seek_display_sample(
+            state->seek_source_start_pos, state->seek_source_target_pos,
+            completed, total);
         changed = 1;
     }
     hwnd = state->hwnd;
@@ -17761,7 +17709,6 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
     int playback_from_playlist;
     int path_changed;
     int stream_audio;
-    int solo_filter_active;
 
     if (state == NULL || path == NULL || path[0] == '\0') {
         return;
@@ -17817,6 +17764,9 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
         state->seek_display_release_on_audio_start = 0;
         state->seek_display_sample_pos = 0;
         state->seek_display_target_pos = 0;
+        state->seek_source_start_pos = 0;
+        state->seek_source_sample_pos = 0;
+        state->seek_source_target_pos = 0;
         state->seek_display_generation = 0;
         state->seek_akao_hold_valid = 0;
         state->voice_mute_mask[0] = 0u;
@@ -17828,26 +17778,19 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
         ZeroMemory(state->psf2_voice_timbre_key, sizeof(state->psf2_voice_timbre_key));
         ZeroMemory(state->psf1_tuning_cache, sizeof(state->psf1_tuning_cache));
         state->psf1_tuning_cache_count = 0;
-        state->ps2_startup_origin_valid = 0;
-        state->ps2_startup_origin_sample = 0;
     }
-    solo_filter_active =
-        (state->voice_mute_mask[0] & 0x00ffffffu) != 0 ||
-        (state->voice_mute_mask[1] & 0x00ffffffu) != 0 ||
-        (state->timbre_solo_enabled && state->timbre_solo_key_count > 0);
     state->psf_version = normalize_saved_psf_version(read_psf_version(path));
     state->stream_audio_mode = stream_audio;
     state->startup_display_pending =
-        start_sample == 0 && !solo_filter_active ? 1 : 0;
+        start_sample == 0 ? 1 : 0;
     state->ps2_startup_track_dimmed = state->psf_version == 0x02u ? 1 : 0;
     state->startup_silence_trim =
-        state->psf_version == 0x02u && !stream_audio && start_sample == 0 &&
-        !solo_filter_active ? 1 : 0;
+        state->psf_version == 0x02u && !stream_audio && start_sample == 0 ? 1 : 0;
     state->timeline_source_anchor = 0;
     state->timeline_scaled_anchor = 0;
     state->timeline_speed_percent = effective_speed_percent_locked(state);
     state->timeline_valid =
-        stream_audio || start_sample > 0 || solo_filter_active ? 1 : 0;
+        stream_audio || start_sample > 0 ? 1 : 0;
     state->time_label_cache_valid = 0;
     state->total_samples = tag_length_samples;
     state->fade_samples = tag_fade_samples;
@@ -17942,7 +17885,7 @@ static void start_playback_at(HWND hwnd, PlayerState *state, const char *path, u
         state->timeline_scaled_anchor = 0;
         state->timeline_speed_percent = effective_speed_percent_locked(state);
         state->timeline_valid =
-            stream_audio || solo_filter_active ? 1 : 0;
+            stream_audio ? 1 : 0;
         state->time_label_cache_valid = 0;
     }
     unlock_state(state);
@@ -18151,13 +18094,24 @@ static void process_direct_start_retry(HWND hwnd, PlayerState *state)
     }
 }
 
+static uint64_t current_seek_sample_locked(const PlayerState *state);
+
+static uint64_t seek_limit_sample_locked(const PlayerState *state)
+{
+    if (state->stream_audio_mode || is_spu_log_path(state->input_path) ||
+        state->tag_fade_enabled) {
+        return state->total_samples;
+    }
+    return 0;
+}
+
 static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
 {
     uint64_t total_samples;
     uint64_t display_current;
     uint64_t display_target;
-    int playing;
-    int paused;
+    uint64_t source_current;
+    int queue_seek;
     char path[MAX_PATH];
 
     if (state == NULL || state->input_path[0] == '\0') {
@@ -18165,13 +18119,14 @@ static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
     }
 
     lock_state(state);
-    total_samples = state->total_samples;
-    playing = state->playing;
-    paused = state->paused;
+    total_samples = seek_limit_sample_locked(state);
+    queue_seek = state->playing && !state->paused &&
+        (state->thread != NULL || state->core != NULL);
     snprintf(path, sizeof(path), "%s", state->input_path);
     if (total_samples > 0 && target > total_samples) {
         target = total_samples;
     }
+    source_current = current_seek_sample_locked(state);
     if (state->seek_display_hold_active) {
         display_current = state->seek_display_sample_pos;
     } else if (state->frame_advance && state->frame_live_valid) {
@@ -18190,8 +18145,14 @@ static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
     state->seek_display_release_on_audio_start = 0;
     state->seek_display_sample_pos = display_current;
     state->seek_display_target_pos = display_target;
+    state->seek_source_start_pos = source_current;
+    state->seek_source_sample_pos = source_current;
+    state->seek_source_target_pos = target;
     state->seek_display_generation += 1u;
     state->seek_target_sample = target;
+    if (queue_seek) {
+        state->seek_request = 1;
+    }
     if (state->audible_display_valid &&
         psf1_music_header_state_supported(
             &state->audible_display_snapshot.akao)) {
@@ -18204,11 +18165,7 @@ static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
     unlock_state(state);
 
     player_log("seek absolute target=%llu", (unsigned long long)target);
-    if (state->core != NULL && playing && !paused) {
-        lock_state(state);
-        state->seek_target_sample = target;
-        state->seek_request = 1;
-        unlock_state(state);
+    if (queue_seek) {
         set_status(state, "Seeking...");
         update_time_label_position(state, display_current, 1);
         InvalidateRect(hwnd, NULL, TRUE);
@@ -18221,6 +18178,26 @@ static void seek_absolute_sample(HWND hwnd, PlayerState *state, uint64_t target)
     start_playback_at(hwnd, state, path, target);
 }
 
+static uint64_t current_seek_sample_locked(const PlayerState *state)
+{
+    if (state->seek_display_hold_active &&
+        (state->seek_request || state->seek_discarding || !state->audio_started)) {
+        return state->seek_source_sample_pos;
+    }
+    if (state->frame_advance && state->frame_live_valid) {
+        return state->frame_live.last_sample_pos;
+    }
+    /* The renderer runs ahead of the output queue; seek from the audible
+       position, not its prebuffer or a previous seek destination. */
+    if (state->audible_display_valid) {
+        return state->audible_display_snapshot.live.last_sample_pos;
+    }
+    if (state->playing && !state->audio_started) {
+        return 0;
+    }
+    return state->live.last_sample_pos;
+}
+
 static void input_seek_time(HWND hwnd, PlayerState *state)
 {
     uint64_t current;
@@ -18231,8 +18208,7 @@ static void input_seek_time(HWND hwnd, PlayerState *state)
         return;
     }
     lock_state(state);
-    current = state->seek_display_hold_active ?
-        state->seek_target_sample : state->live.last_sample_pos;
+    current = current_seek_sample_locked(state);
     unlock_state(state);
     if (!choose_seek_time(hwnd, state, current, &seconds)) {
         return;
@@ -18252,9 +18228,8 @@ static void seek_relative_seconds(HWND hwnd, PlayerState *state, int seconds)
     }
 
     lock_state(state);
-    current = (int64_t)(state->seek_display_hold_active ?
-        state->seek_target_sample : state->live.last_sample_pos);
-    total_samples = state->total_samples;
+    current = (int64_t)current_seek_sample_locked(state);
+    total_samples = seek_limit_sample_locked(state);
     unlock_state(state);
 
     target = current + ((int64_t)seconds * (int64_t)PLAYER_SAMPLE_RATE);
@@ -19504,7 +19479,7 @@ static void paint_core_panel(
                 (muted ? muted_text_color :
                     (psf_version == 0x01u || active || stopped_display || solo_selected ?
                         active_text_color : inactive_text_color));
-            if (row_text_color != current_text_color) {
+            if (psf_version == 0x02u || row_text_color != current_text_color) {
                 SetTextColor(hdc, row_text_color);
                 current_text_color = row_text_color;
             }
@@ -19548,6 +19523,7 @@ static void paint_core_panel(
                     paint_fullscreen_voice_text(
                         hdc, player_state, decorations, 3);
                 }
+                SetTextColor(hdc, row_text_color);
                 paint_fullscreen_voice_numbers(
                     hdc, player_state, x, y, line, env_text, voice_detail);
             } else if (psf_version == 0x01u && !active) {

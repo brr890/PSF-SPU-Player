@@ -3,6 +3,8 @@
 static Spu2LogAudaciousSpu2Write16Callback g_spu2_write16_callback;
 static void *g_spu2_write16_user;
 static uint64_t g_sample_pos;
+static uint64_t g_song_start_sample;
+static int g_song_start_valid;
 static uint64_t g_spu2_write16_count;
 static uint64_t g_debug_slice_count;
 static uint64_t g_debug_cpu_slice_count;
@@ -51,6 +53,37 @@ uint64_t spu2log_audacious_get_spu2_write16_count(void)
     return g_spu2_write16_count;
 }
 
+void spu2log_audacious_note_song_output(int32_t left, int32_t right)
+{
+    if (!g_song_start_valid && (left != 0 || right != 0)) {
+        g_song_start_sample = g_sample_pos;
+        g_song_start_valid = 1;
+    }
+}
+
+int spu2log_audacious_get_song_start(uint64_t *sample_pos)
+{
+    if (g_song_start_valid && sample_pos != 0) {
+        *sample_pos = g_song_start_sample;
+    }
+    return g_song_start_valid;
+}
+
+void spu2log_audacious_rebase_song_start(uint64_t old_sample_pos, uint64_t new_sample_pos)
+{
+    if (!g_song_start_valid) {
+        return;
+    }
+    if (new_sample_pos < old_sample_pos) {
+        uint64_t delta = old_sample_pos - new_sample_pos;
+        g_song_start_sample = g_song_start_sample > delta ? g_song_start_sample - delta : 0;
+    } else {
+        uint64_t delta = new_sample_pos - old_sample_pos;
+        g_song_start_sample = UINT64_MAX - g_song_start_sample < delta ?
+            UINT64_MAX : g_song_start_sample + delta;
+    }
+}
+
 void spu2log_audacious_spu2_write16(uint32_t address, uint16_t value)
 {
     g_spu2_write16_count += 1;
@@ -61,6 +94,8 @@ void spu2log_audacious_spu2_write16(uint32_t address, uint16_t value)
 
 void spu2log_audacious_debug_reset(void)
 {
+    g_song_start_sample = 0;
+    g_song_start_valid = 0;
     g_debug_slice_count = 0;
     g_debug_cpu_slice_count = 0;
     g_debug_hw_write_count = 0;

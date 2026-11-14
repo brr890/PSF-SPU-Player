@@ -1,6 +1,9 @@
-# PSF SPU Player Production Source
+# PSF SPU Player Ver 1.65
 
-This folder contains the source required to build PSF SPU Player Ver 1.64.
+This repository contains the source required to build PSF SPU Player Ver 1.65.
+The Windows player and Japanese/English usage instructions are available in the
+release ZIP. Production source is in `source/` and third-party licenses are in
+`licenses/`.
 
 Included:
 
@@ -25,13 +28,13 @@ Not included:
 Install CMake, MSYS2 MinGW32, Ninja, GCC, zlib, and libarchive. Then run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
+powershell -ExecutionPolicy Bypass -File .\source\build.ps1
 ```
 
 Output:
 
 ```text
-build\mingw32-release\psf_spu_player.exe
+source\build\mingw32-release\psf_spu_player.exe
 ```
 
 The resulting 32-bit executable runs on Windows 10 32-bit and through WOW64 on
@@ -41,3 +44,10 @@ When the MinGW32 libarchive runtime is installed, the build also creates an
 LHA, and LZH archives without requiring a separate 7-Zip installation.
 
 See `LICENSE`, `THIRD_PARTY_NOTICES.md`, and `licenses/` for license terms.
+
+## Seeking
+
+再生が進んだ後の戻りシークは、内部の再生状態を再構築するため、処理に時間がかかる場合があります。
+
+Seeking backward after extended playback may take some time because the internal
+playback state must be rebuilt.

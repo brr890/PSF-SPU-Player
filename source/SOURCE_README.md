@@ -1,6 +1,6 @@
 # PSF SPU Player Production Source
 
-This folder contains the source required to build PSF SPU Player Ver 1.64.
+This folder contains the source required to build PSF SPU Player Ver 1.65.
 
 Included:
 
@@ -40,4 +40,4 @@ When the MinGW32 libarchive runtime is installed, the build also creates an
 `archive` folder beside the executable. Keep it there to open ZIP, 7Z, RAR,
 LHA, and LZH archives without requiring a separate 7-Zip installation.
 
-See `LICENSE`, `THIRD_PARTY_NOTICES.md`, and `licenses/` for license terms.
+See `LICENSE`, `THIRD_PARTY_NOTICES.md`, and `../licenses/` for license terms.

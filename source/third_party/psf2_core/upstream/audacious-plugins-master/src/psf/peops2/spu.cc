@@ -104,6 +104,7 @@
 #include "../peops2/regs.h"
 #include "../peops2/dma.h"
 #include "../peops2/spu.h"
+#include "spu2log_audacious_hooks.h"
 
 ////////////////////////////////////////////////////////////////////////
 // globals
@@ -147,6 +148,7 @@ static unsigned int psf2log_peops2_pitch_lock_values[MAXCHAN];
 static unsigned int psf2log_peops2_volume_lock_masks[2][2];
 static unsigned int psf2log_peops2_volume_lock_values[2][MAXCHAN];
 static int psf2log_peops2_mute_gain[MAXCHAN];
+static int psf2log_peops2_song_started;
 static int psf2log_peops2_mute_gain_init;
 static unsigned int psf2log_peops2_timbre_solo_enabled;
 static unsigned int psf2log_peops2_timbre_solo_starts[64];
@@ -834,6 +836,8 @@ static void *MAINThread(void (*update)(const void *, int))
  unsigned char * start;unsigned int nSample;
  int ch,predict_nr,shift_factor,flags,d,d2,s;
  int gpos,bIRQReturn=0;
+ int song_l=0,song_r=0;
+ const int detect_song_start=!psf2log_peops2_song_started;
 
 // while(!bEndThread)                                    // until we are shutting down
   {
@@ -1170,6 +1174,13 @@ GOON: ;
 
            {
             int old_sval=s_chan[ch].sval;
+            if(detect_song_start)
+             {
+              if(s_chan[ch].bVolumeL || s_chan[ch].bReverbL)
+               song_l+=(old_sval*s_chan[ch].iLeftVolume)/0x4000L;
+              if(s_chan[ch].bVolumeR || s_chan[ch].bReverbR)
+               song_r+=(old_sval*s_chan[ch].iRightVolume)/0x4000L;
+             }
             int mute_gain=psf2log_peops2_next_mute_gain(ch,s_chan[ch].iMute);
             int timbre_gain=psf2log_peops2_next_timbre_gain(ch);
             s_chan[ch].sval=(s_chan[ch].sval*mute_gain)>>12;
@@ -1209,6 +1220,11 @@ ENDX:   ;
   ///////////////////////////////////////////////////////
   // mix all channels (including reverb) into one buffer
 
+    if(detect_song_start && (song_l || song_r))
+     {
+      spu2log_audacious_note_song_output(song_l,song_r);
+      psf2log_peops2_song_started=1;
+     }
     SSumL[0]+=MixREVERBLeft(0,0);
     SSumL[0]+=MixREVERBLeft(0,1);
     SSumR[0]+=MixREVERBRight(0);
@@ -1335,6 +1351,7 @@ EXPORT_GCC long CALLBACK SPU2init(void)
  iSecureStart=0;
 
  sampcount = 0;
+ psf2log_peops2_song_started=0;
  seektime = 0;
 
  InitADSR();
@@ -1544,4 +1561,4 @@ EXPORT_GCC void CALLBACK SPU2registerCDDAVolume(void (CALLBACK *CDDAVcallback)(u
  cddavCallback = CDDAVcallback;
 }
 #endif
-/* Modified by brr890 for PSF SPU Player through 2026-07-21. */
+/* Modified by brr890 for PSF SPU Player through 2026-11-14. */
